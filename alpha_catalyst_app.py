@@ -184,13 +184,48 @@ def fetch_fred_series(series_id: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=CACHE_TTL_INDICATORS)
 def fetch_yf_series(symbol: str, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
-    px = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False, threads=False)
+    """
+    Returns dataframe with columns: ['date','value'].
+    Defensive: handles empty frames and missing 'Close' (prevents KeyError).
+    """
+    try:
+        px = yf.download(
+            symbol,
+            period=period,
+            interval=interval,
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
+    except Exception:
+        return pd.DataFrame(columns=["date", "value"])
+
     if px is None or px.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["date", "value"])
+
+    # Sometimes yfinance returns columns without 'Close' (e.g., invalid symbols)
+    cols = [str(c) for c in px.columns]
+    if "Close" not in cols:
+        # Try to recover if close-like columns exist
+        for alt in ["Adj Close", "AdjClose", "close", "CLOSE"]:
+            if alt in cols:
+                px = px.rename(columns={alt: "Close"})
+                break
+
+    if "Close" not in px.columns:
+        return pd.DataFrame(columns=["date", "value"])
+
     px = px.dropna(subset=["Close"])
+    if px.empty:
+        return pd.DataFrame(columns=["date", "value"])
+
     out = px[["Close"]].copy()
     out = out.reset_index()
-    out.columns = ["date", "value"]
+
+    # yfinance usually uses DatetimeIndex named 'Date'
+    date_col = "Date" if "Date" in out.columns else out.columns[0]
+    out = out.rename(columns={date_col: "date", "Close": "value"})
+
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
     out["value"] = pd.to_numeric(out["value"], errors="coerce")
     return out.dropna(subset=["date"]).sort_values("date")
