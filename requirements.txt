@@ -9,3 +9,14 @@ beautifulsoup4>=4.12
 lxml>=5.1
 python-dateutil>=2.8
 textblob>=0.18
+streamlit
+pandas
+numpy
+requests
+yfinance
+feedparser
+plotly
+beautifulsoup4
+lxml
+textblob
+python-dateutil
