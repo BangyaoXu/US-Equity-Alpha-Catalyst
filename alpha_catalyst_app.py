@@ -493,13 +493,5 @@ else:
             st.write("No obvious IR/news links found on that page (site may be JS-rendered).")
         else:
             st.markdown("**Latest IR / Press / News links (best-effort extraction):**")
-            summarize_ir = st.checkbox("Try summarizing IR links too (best-effort)", value=False)
             for txt, href in links:
                 st.markdown(f"- [{txt}]({href})")
-                if summarize_ir:
-                    with st.spinner("Fetching & summarizing…"):
-                        summ = summarize_url(href)
-                    if summ:
-                        st.caption(summ)
-                    else:
-                        st.caption("Summary unavailable (blocked / JS-rendered / parsing failed).")
