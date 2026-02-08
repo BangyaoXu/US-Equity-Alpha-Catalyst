@@ -165,10 +165,7 @@ def _fred_csv_url(series_id: str) -> str:
 
 @st.cache_data(ttl=CACHE_TTL_INDICATORS)
 def fetch_fred_series(series_id: str) -> pd.DataFrame:
-    """
-    Free, no-key: FRED CSV endpoint.
-    Defensive: never raises; returns empty df on HTTP errors/throttling.
-    """
+    """Free, no-key: FRED CSV endpoint. Defensive: never raises; returns empty on HTTP errors."""
     url = _fred_csv_url(series_id)
     try:
         r = requests.get(
@@ -183,7 +180,6 @@ def fetch_fred_series(series_id: str) -> pd.DataFrame:
         if not (200 <= r.status_code < 300):
             return pd.DataFrame(columns=["date", "value"])
 
-        # Parse CSV text robustly
         from io import StringIO
         df = pd.read_csv(StringIO(r.text))
         if df is None or df.empty:
@@ -200,7 +196,6 @@ def fetch_fred_series(series_id: str) -> pd.DataFrame:
         return out
     except Exception:
         return pd.DataFrame(columns=["date", "value"])
-
 
 @st.cache_data(ttl=CACHE_TTL_INDICATORS)
 def fetch_yf_series(symbol: str, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
@@ -320,7 +315,7 @@ INDICATORS: Dict[str, Dict] = {
     # General / cross-sector
     "SP500": {"name": "S&P 500 (proxy)", "source": "yfinance", "id": "^GSPC", "bullish": "higher"},
     "VIX": {"name": "VIX", "source": "yfinance", "id": "^VIX", "bullish": "lower"},
-    "DXY": {"name": "US Dollar Index (DXY)", "source": "yfinance", "id": "DX-Y.NYB", "bullish": "lower"},
+    "DXY": {"name": "Broad USD Index (FRED)", "source": "fred", "id": "DTWEXBGS", "bullish": "lower"},
     "UST10Y": {"name": "10Y Treasury Yield", "source": "fred", "id": "DGS10", "bullish": "lower"},
     "UST2Y": {"name": "2Y Treasury Yield", "source": "fred", "id": "DGS2", "bullish": "lower"},
     "YC_10_2": {"name": "Yield Curve (10Y-2Y, bp)", "source": "computed", "id": "DGS10-DGS2", "bullish": "higher"},
@@ -340,15 +335,14 @@ INDICATORS: Dict[str, Dict] = {
     "HOUST": {"name": "Housing Starts", "source": "fred", "id": "HOUST", "bullish": "higher"},
     "CSUSHPINSA": {"name": "Case-Shiller Home Price Index", "source": "fred", "id": "CSUSHPINSA", "bullish": "higher"},
 
-    # Energy / Materials (commodity proxies) — prefer FRED for Cloud reliability
+    # Energy / Materials (commodity proxies) — prefer FRED for hosted reliability (no key required)
     "WTI": {"name": "WTI Spot ($/bbl) (FRED)", "source": "fred", "id": "DCOILWTICO", "bullish": "higher"},
     "BRENT": {"name": "Brent Spot ($/bbl) (FRED)", "source": "fred", "id": "DCOILBRENTEU", "bullish": "higher"},
     "NATGAS": {"name": "Nat Gas Henry Hub ($/MMBtu) (FRED)", "source": "fred", "id": "DHHNGSP", "bullish": "higher"},
     "COPPER": {"name": "Copper Global ($/mt) (FRED)", "source": "fred", "id": "PCOPPUSDM", "bullish": "higher"},
     "ALUMINUM": {"name": "Aluminum Global ($/mt) (FRED)", "source": "fred", "id": "PALUMUSDM", "bullish": "higher"},
-    
-    # Gold: FRED LBMA series removed; use an alternate proxy
-    "GOLD": {"name": "Gold proxy (GLD ETF)", "source": "yfinance", "id": "GLD", "bullish": "higher"},
+    # Gold: classic FRED LBMA series were discontinued; use an ETF proxy instead
+    "GOLD": {"name": "Gold proxy (GLD)", "source": "yfinance", "id": "GLD", "bullish": "higher"}
 
     # Financials
     "CREDIT_SPREAD": {"name": "BBB Corporate Spread (proxy)", "source": "fred", "id": "BAA10Y", "bullish": "lower"},
@@ -577,6 +571,163 @@ def extract_ir_news_links(ir_url: str, max_links=10) -> List[Tuple[str, str]]:
         if len(out) >= max_links:
             break
     return out
+
+
+# =========================
+# SEC EDGAR (latest filings) + EARNINGS CALENDAR (best-effort)
+# =========================
+SEC_BASE = "https://data.sec.gov"
+SEC_TICKER_MAP_URLS = [
+    "https://www.sec.gov/files/company_tickers.json",
+    "https://www.sec.gov/files/company_tickers_exchange.json",
+]
+
+def _sec_headers() -> Dict[str, str]:
+    # SEC asks for a descriptive User-Agent. Put an email in secrets if you want:
+    # st.secrets.get("SEC_CONTACT","you@example.com")
+    contact = ""
+    try:
+        contact = st.secrets.get("SEC_CONTACT", "")
+    except Exception:
+        contact = ""
+    ua = USER_AGENT
+    if contact and contact not in ua:
+        ua = f"{USER_AGENT} ({contact})"
+    return {
+        "User-Agent": ua,
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "application/json,text/html,*/*",
+    }
+
+@st.cache_data(ttl=24 * 60 * 60)
+def fetch_sec_ticker_map() -> pd.DataFrame:
+    """
+    Fetch SEC ticker->CIK mapping (no key). Returns columns: ticker, cik, title.
+    """
+    for url in SEC_TICKER_MAP_URLS:
+        try:
+            r = requests.get(url, headers=_sec_headers(), timeout=20)
+            if not (200 <= r.status_code < 300):
+                continue
+            data = r.json()
+            # company_tickers.json: dict of {0:{cik_str, ticker, title}, ...}
+            rows = []
+            if isinstance(data, dict):
+                for _, obj in data.items():
+                    t = str(obj.get("ticker", "")).upper().strip()
+                    cik = obj.get("cik_str", obj.get("cik", None))
+                    title = obj.get("title", obj.get("name", ""))
+                    if t and cik is not None:
+                        rows.append({"ticker": t, "cik": int(cik), "title": title})
+            elif isinstance(data, list):
+                for obj in data:
+                    t = str(obj.get("ticker", "")).upper().strip()
+                    cik = obj.get("cik_str", obj.get("cik", None))
+                    title = obj.get("title", obj.get("name", ""))
+                    if t and cik is not None:
+                        rows.append({"ticker": t, "cik": int(cik), "title": title})
+            df = pd.DataFrame(rows).drop_duplicates(subset=["ticker"])
+            if not df.empty:
+                return df
+        except Exception:
+            continue
+    return pd.DataFrame(columns=["ticker", "cik", "title"])
+
+def cik10(cik_int: int) -> str:
+    return str(int(cik_int)).zfill(10)
+
+@st.cache_data(ttl=CACHE_TTL_META)
+def fetch_sec_submissions(cik_int: int) -> Dict:
+    url = f"{SEC_BASE}/submissions/CIK{cik10(cik_int)}.json"
+    try:
+        r = requests.get(url, headers=_sec_headers(), timeout=20)
+        if not (200 <= r.status_code < 300):
+            return {}
+        return r.json() or {}
+    except Exception:
+        return {}
+
+def _filing_doc_url(cik_int: int, accession: str, primary_doc: str) -> str:
+    acc_nodash = accession.replace("-", "")
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{primary_doc}"
+
+def _ixviewer_url(doc_url: str) -> str:
+    # SEC inline XBRL viewer is convenient for reading
+    return f"https://www.sec.gov/ixviewer/documents/?doc={requests.utils.quote(doc_url)}"
+
+def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None, limit: int = 8) -> pd.DataFrame:
+    """
+    Returns a small table of recent filings with links.
+    """
+    m = fetch_sec_ticker_map()
+    if m.empty:
+        return pd.DataFrame()
+    hit = m[m["ticker"] == ticker.upper()].head(1)
+    if hit.empty:
+        return pd.DataFrame()
+    cik_int = int(hit["cik"].iloc[0])
+    sub = fetch_sec_submissions(cik_int)
+    recent = (((sub or {}).get("filings") or {}).get("recent") or {})
+    if not recent:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(recent)
+    if df.empty:
+        return pd.DataFrame()
+
+    keep = [c for c in ["filingDate", "reportDate", "acceptanceDateTime", "form", "accessionNumber", "primaryDocument"] if c in df.columns]
+    df = df[keep].copy()
+    df["filingDate"] = pd.to_datetime(df.get("filingDate"), errors="coerce")
+    if forms:
+        df = df[df["form"].isin(forms)]
+    df = df.sort_values("filingDate", ascending=False).head(limit)
+
+    # build links
+    def make_link(row):
+        doc = str(row.get("primaryDocument", "") or "")
+        acc = str(row.get("accessionNumber", "") or "")
+        if not doc or not acc:
+            return ""
+        doc_url = _filing_doc_url(cik_int, acc, doc)
+        return _ixviewer_url(doc_url)
+
+    df["link"] = df.apply(make_link, axis=1)
+    df.insert(0, "ticker", ticker.upper())
+    df.insert(1, "cik", cik_int)
+    return df
+
+@st.cache_data(ttl=CACHE_TTL_META)
+def fetch_earnings_calendar_yf(ticker: str, limit: int = 8) -> pd.DataFrame:
+    """
+    Best-effort: yfinance earnings dates. Returns columns: earnings_date, eps_estimate, reported_eps, surprise(%), revenue_estimate, reported_revenue
+    """
+    try:
+        t = yf.Ticker(ticker)
+        df = t.get_earnings_dates(limit=limit)
+        if df is None or isinstance(df, dict) or df.empty:
+            return pd.DataFrame()
+        out = df.reset_index()
+        # yfinance uses index name "Earnings Date"
+        if "Earnings Date" in out.columns:
+            out = out.rename(columns={"Earnings Date": "earnings_date"})
+        elif out.columns[0] not in ("earnings_date",):
+            out = out.rename(columns={out.columns[0]: "earnings_date"})
+        out["earnings_date"] = pd.to_datetime(out["earnings_date"], errors="coerce")
+        return out.sort_values("earnings_date", ascending=False)
+    except Exception:
+        return pd.DataFrame()
+
+def nearest_earnings_catalyst(df: pd.DataFrame) -> Optional[pd.Timestamp]:
+    if df is None or df.empty or "earnings_date" not in df.columns:
+        return None
+    now = pd.Timestamp.utcnow().tz_localize(None)
+    dts = pd.to_datetime(df["earnings_date"], errors="coerce").dropna()
+    if dts.empty:
+        return None
+    future = dts[dts >= now]
+    if not future.empty:
+        return future.min()
+    return dts.max()
 
 # =========================
 # TECHNICAL SIGNALS (scored)
@@ -911,6 +1062,51 @@ else:
 # =========================
 # Investor Relations (renamed)
 # =========================
+
+# =========================
+# SEC Filings & Earnings Catalysts
+# =========================
+st.subheader("SEC Filings & Earnings Catalysts")
+
+c_sec1, c_sec2 = st.columns([1.3, 1])
+with c_sec1:
+    forms_sel = st.multiselect("Filings to show", ["10-K", "10-Q", "8-K", "S-1", "DEF 14A"], default=["10-Q", "10-K", "8-K"])
+with c_sec2:
+    filings_limit = st.slider("Max filings", min_value=3, max_value=20, value=8, step=1)
+
+filings_df = get_latest_filings_for_ticker(ticker_sel, forms=forms_sel, limit=filings_limit)
+if filings_df.empty:
+    st.info("SEC filings unavailable (ticker->CIK mapping or submissions fetch failed).")
+else:
+    # clickable links
+    show_df = filings_df.copy()
+    show_df["filingDate"] = pd.to_datetime(show_df["filingDate"], errors="coerce").dt.date
+    st.dataframe(
+        show_df[["ticker", "form", "filingDate", "reportDate", "accessionNumber", "link"]],
+        use_container_width=True,
+        height=260,
+        column_config={
+            "link": st.column_config.LinkColumn("Filing (SEC ixviewer)"),
+        },
+    )
+    st.caption("Tip: open the latest 10-Q/10-K and jump to Items like 1A (Risk Factors), 2 (MD&A), 7 (MD&A), 8 (Financials), or scan for 'guidance', 'outlook', 'restructuring', 'impairment', 'material weakness', etc.")
+
+st.markdown("#### Earnings Calendar (best-effort)")
+earn_df = fetch_earnings_calendar_yf(ticker_sel, limit=12)
+if earn_df.empty:
+    st.info("Earnings dates not available via yfinance on this host/IP (best-effort source).")
+else:
+    # Keep key columns if present
+    cols = [c for c in ["earnings_date", "EPS Estimate", "Reported EPS", "Surprise(%)", "Revenue Estimate", "Reported Revenue"] if c in earn_df.columns]
+    if "earnings_date" in earn_df.columns:
+        earn_df["earnings_date"] = pd.to_datetime(earn_df["earnings_date"], errors="coerce")
+    show_cols = cols if cols else earn_df.columns[:6].tolist()
+    st.dataframe(earn_df[show_cols].head(12), use_container_width=True, height=260)
+
+    nxt = nearest_earnings_catalyst(earn_df)
+    if nxt is not None:
+        st.success(f"Nearest earnings catalyst (UTC): {nxt.strftime('%Y-%m-%d %H:%M')}")
+
 st.subheader("Investor Relations")
 
 website = info.get("website", "")
