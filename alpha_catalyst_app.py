@@ -317,7 +317,7 @@ def earnings_proximity_score(next_earn_date: Optional[datetime]) -> float:
 def analyst_revision_score(recs: pd.DataFrame) -> float:
     """
     Convert upgrades/downgrades/recommendation changes to a simple net score last 30 days.
-    Different yfinance schemas exist. We'll attempt to infer.
+    Robust to tz-naive vs tz-aware datetime issues and yfinance schema differences.
 
     Output roughly in [-1, +1].
     """
@@ -326,40 +326,69 @@ def analyst_revision_score(recs: pd.DataFrame) -> float:
 
     df = recs.copy()
 
-    # Ensure datetime index/column
-    if df.index.dtype == "datetime64[ns]" or "datetime" in str(df.index.dtype):
+    # -------------------------
+    # Build a UTC-aware datetime column df["dt"]
+    # -------------------------
+    dt_col = None
+
+    # If index is datetime-like
+    if isinstance(df.index, pd.DatetimeIndex):
         df["dt"] = df.index
     else:
         # try common columns
-        for c in ["Date", "date", "datetime", "EpochGradeDate"]:
+        for c in ["Date", "date", "datetime", "Datetime", "EpochGradeDate", "epochGradeDate"]:
             if c in df.columns:
-                try:
-                    df["dt"] = pd.to_datetime(df[c], unit="s", errors="coerce") if "Epoch" in c else pd.to_datetime(df[c], errors="coerce")
-                    break
-                except Exception:
-                    pass
-        if "dt" not in df.columns:
+                dt_col = c
+                break
+        if dt_col is not None:
+            # EpochGradeDate is often seconds since epoch
+            if "epoch" in dt_col.lower():
+                df["dt"] = pd.to_datetime(df[dt_col], unit="s", errors="coerce", utc=True)
+            else:
+                df["dt"] = pd.to_datetime(df[dt_col], errors="coerce", utc=True)
+        else:
             df["dt"] = pd.NaT
 
-    cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=30)
+    # Normalize timezone: make everything UTC-aware
+    # - If tz-naive, localize to UTC
+    # - If tz-aware, convert to UTC
+    df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
+    try:
+        if hasattr(df["dt"].dt, "tz") and df["dt"].dt.tz is None:
+            df["dt"] = df["dt"].dt.tz_localize("UTC")
+        else:
+            df["dt"] = df["dt"].dt.tz_convert("UTC")
+    except Exception:
+        # If conversion fails, coerce to UTC-naive and compare to naive cutoff below
+        df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
+
+    # -------------------------
+    # Cutoff (match tz-ness)
+    # -------------------------
+    cutoff_aware = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=30)
+
+    # If dt ended up tz-naive, make cutoff naive too
+    if isinstance(df["dt"].dtype, pd.DatetimeTZDtype):
+        cutoff = cutoff_aware
+    else:
+        cutoff = cutoff_aware.tz_localize(None)
+
     df = df[df["dt"] >= cutoff]
     if df.empty:
         return 0.0
 
-    # Schema A: upgrades_downgrades often has columns like:
-    # 'Firm','ToGrade','FromGrade','Action'
-    cols = set(df.columns.str.lower())
-    score = 0.0
-    n = 0
-
+    # -------------------------
+    # Grade mapping -> numeric
+    # -------------------------
     def grade_to_num(g: str) -> Optional[float]:
         if not isinstance(g, str):
             return None
         g = g.lower()
-        # coarse mapping
-        pos = ["buy", "outperform", "overweight", "strong buy", "accumulate"]
-        neu = ["hold", "neutral", "market perform", "equal-weight", "sector weight"]
-        neg = ["sell", "underperform", "underweight", "strong sell", "reduce"]
+
+        pos = ["strong buy", "buy", "outperform", "overweight", "accumulate"]
+        neu = ["hold", "neutral", "market perform", "equal-weight", "equal weight", "sector weight"]
+        neg = ["strong sell", "sell", "underperform", "underweight", "reduce"]
+
         if any(p in g for p in pos):
             return 1.0
         if any(p in g for p in neu):
@@ -368,21 +397,25 @@ def analyst_revision_score(recs: pd.DataFrame) -> float:
             return -1.0
         return None
 
-    if "tograde" in cols or "fromgrade" in cols:
-        to_col = next((c for c in df.columns if c.lower() == "tograde"), None)
-        fr_col = next((c for c in df.columns if c.lower() == "fromgrade"), None)
-        if to_col and fr_col:
-            for _, r in df.iterrows():
-                to_v = grade_to_num(r.get(to_col))
-                fr_v = grade_to_num(r.get(fr_col))
-                if to_v is None or fr_v is None:
-                    continue
-                score += (to_v - fr_v)
-                n += 1
+    cols = {c.lower(): c for c in df.columns}
 
-    # Schema B: recommendations history might have "To Grade" only; use counts
+    score = 0.0
+    n = 0
+
+    # upgrades_downgrades style
+    to_col = cols.get("tograde")
+    fr_col = cols.get("fromgrade")
+    if to_col and fr_col:
+        for _, r in df.iterrows():
+            to_v = grade_to_num(r.get(to_col))
+            fr_v = grade_to_num(r.get(fr_col))
+            if to_v is None or fr_v is None:
+                continue
+            score += (to_v - fr_v)
+            n += 1
+
+    # fallback: single grade column
     if n == 0:
-        # try to find any grade-like column
         grade_col = None
         for c in df.columns:
             if "grade" in c.lower():
@@ -399,7 +432,7 @@ def analyst_revision_score(recs: pd.DataFrame) -> float:
     if n == 0:
         return np.nan
 
-    # normalize into [-1, +1] with tanh
+    # normalize [-1, +1]
     return float(np.tanh(score / max(1.0, n)))
 
 
