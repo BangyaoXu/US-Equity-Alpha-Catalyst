@@ -341,8 +341,7 @@ INDICATORS: Dict[str, Dict] = {
     "NATGAS": {"name": "Nat Gas Henry Hub ($/MMBtu) (FRED)", "source": "fred", "id": "DHHNGSP", "bullish": "higher"},
     "COPPER": {"name": "Copper Global ($/mt) (FRED)", "source": "fred", "id": "PCOPPUSDM", "bullish": "higher"},
     "ALUMINUM": {"name": "Aluminum Global ($/mt) (FRED)", "source": "fred", "id": "PALUMUSDM", "bullish": "higher"},
-    # Gold: classic FRED LBMA series were discontinued; use an ETF proxy instead
-    "GOLD": {"name": "Gold proxy (GLD)", "source": "yfinance", "id": "GLD", "bullish": "higher"}
+    "GOLD": {"name": "Gold proxy (GLD)", "source": "yfinance", "id": "GLD", "bullish": "higher"},
 
     # Financials
     "CREDIT_SPREAD": {"name": "BBB Corporate Spread (proxy)", "source": "fred", "id": "BAA10Y", "bullish": "lower"},
