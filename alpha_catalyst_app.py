@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import re
-import math
 import glob
-import time
-from dataclasses import dataclass
+import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -16,42 +14,45 @@ import streamlit as st
 import yfinance as yf
 import feedparser
 import plotly.express as px
+import plotly.graph_objects as go
+from bs4 import BeautifulSoup
 from dateutil.parser import parse as dt_parse
 from textblob import TextBlob
 
 # =========================
 # APP CONFIG
 # =========================
-st.set_page_config(layout="wide", page_title="Equity Alpha & Catalyst Dashboard")
+st.set_page_config(layout="wide", page_title="US Equity Performance & Catalyst Dashboard")
 
 UNIVERSE_GLOB = "selected_universe_*.csv"
-DEFAULT_PRICE_PERIOD = "1y"        # enough for MA/vol + 3M momentum
-NEWS_WINDOW_DAYS = 30             # for intensity zscore
-NEWS_RECENT_DAYS = 7              # for current catalysts/sentiment
-CACHE_TTL_PRICES = 60 * 60        # 1h
-CACHE_TTL_META = 60 * 60          # 1h
-CACHE_TTL_NEWS = 30 * 60          # 30m
+DEFAULT_PRICE_PERIOD = "1y"
+NEWS_WINDOW_DAYS = 30
+NEWS_RECENT_DAYS = 7
 
-# Sector ETF mapping (US-centric; you can extend later)
-SECTOR_ETF_MAP = {
-    "Technology": "XLK",
-    "Information Technology": "XLK",
-    "Financials": "XLF",
-    "Health Care": "XLV",
-    "Healthcare": "XLV",
-    "Consumer Discretionary": "XLY",
-    "Consumer Staples": "XLP",
-    "Energy": "XLE",
-    "Industrials": "XLI",
-    "Materials": "XLB",
-    "Utilities": "XLU",
-    "Communication Services": "XLC",
-    "Real Estate": "XLRE",
-}
+CACHE_TTL_PRICES = 60 * 60
+CACHE_TTL_META = 60 * 60
+CACHE_TTL_NEWS = 30 * 60
+CACHE_TTL_WEBPAGE = 30 * 60
+
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
 
 # =========================
 # UTILITIES
 # =========================
+def parse_universe_date_from_filename(fn: str) -> Optional[str]:
+    m = re.search(r"selected_universe_(\d{4}-\d{2}-\d{2})\.csv$", fn)
+    return m.group(1) if m else None
+
+def pick_universe_files() -> List[Tuple[str, str]]:
+    files = sorted(glob.glob(UNIVERSE_GLOB))
+    out = []
+    for f in files:
+        d = parse_universe_date_from_filename(Path(f).name)
+        if d:
+            out.append((d, f))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out
+
 def _safe_float(x):
     try:
         if x is None:
@@ -63,52 +64,11 @@ def _safe_float(x):
     except Exception:
         return np.nan
 
-
-def zscore(series: pd.Series) -> pd.Series:
-    s = pd.to_numeric(series, errors="coerce")
-    mu = s.mean(skipna=True)
-    sd = s.std(skipna=True)
-    if sd == 0 or np.isnan(sd):
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    return (s - mu) / sd
-
-
-def clamp(x, lo=-3.0, hi=3.0):
-    if pd.isna(x):
-        return np.nan
-    return max(lo, min(hi, x))
-
-
-def sigmoid(x):
-    if pd.isna(x):
-        return np.nan
-    return 1 / (1 + math.exp(-x))
-
-
-def parse_universe_date_from_filename(fn: str) -> Optional[str]:
-    m = re.search(r"selected_universe_(\d{4}-\d{2}-\d{2})\.csv$", fn)
-    return m.group(1) if m else None
-
-
-def pick_universe_files() -> List[Tuple[str, str]]:
-    files = sorted(glob.glob(UNIVERSE_GLOB))
-    out = []
-    for f in files:
-        d = parse_universe_date_from_filename(Path(f).name)
-        if d:
-            out.append((d, f))
-    # sort by date desc
-    out.sort(key=lambda x: x[0], reverse=True)
-    return out
-
-
 def sentiment_polarity(text: str) -> float:
-    # TextBlob polarity in [-1, 1]
     try:
         return float(TextBlob(text).sentiment.polarity)
     except Exception:
         return 0.0
-
 
 def compute_rsi(close: pd.Series, window=14) -> float:
     close = close.dropna()
@@ -121,6 +81,31 @@ def compute_rsi(close: pd.Series, window=14) -> float:
     rsi = 100 - (100 / (1 + rs))
     return float(rsi.iloc[-1])
 
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+def macd(close: pd.Series, fast=12, slow=26, signal=9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    macd_line = ema(close, fast) - ema(close, slow)
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+def kdj(high: pd.Series, low: pd.Series, close: pd.Series, n=9, k=3, d=3) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    KDJ from stochastic RSV:
+      RSV = (C - Ln) / (Hn - Ln) * 100
+      K = EMA(RSV, k) (commonly SMA; EMA works and is stable)
+      D = EMA(K, d)
+      J = 3K - 2D
+    """
+    ln = low.rolling(n).min()
+    hn = high.rolling(n).max()
+    rsv = (close - ln) / (hn - ln) * 100
+    rsv = rsv.replace([np.inf, -np.inf], np.nan).fillna(method="ffill")
+    k_line = rsv.ewm(span=k, adjust=False).mean()
+    d_line = k_line.ewm(span=d, adjust=False).mean()
+    j_line = 3 * k_line - 2 * d_line
+    return k_line, d_line, j_line
 
 def compute_returns(close: pd.Series) -> Dict[str, float]:
     close = close.dropna()
@@ -138,14 +123,12 @@ def compute_returns(close: pd.Series) -> Dict[str, float]:
         out["ret_6m"] = close.iloc[-1] / close.iloc[-126] - 1
     return out
 
-
 def realized_vol(close: pd.Series, window=20) -> float:
     close = close.dropna()
     if len(close) < window + 5:
         return np.nan
     r = close.pct_change()
     return float(r.rolling(window).std().iloc[-1] * np.sqrt(252))
-
 
 def volume_surge(vol: pd.Series, window=20) -> float:
     vol = vol.dropna()
@@ -157,13 +140,54 @@ def volume_surge(vol: pd.Series, window=20) -> float:
         return np.nan
     return float(v_now / v_avg)
 
+def normalize_universe_keep_original(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Keep original columns; only add normalized helper columns:
+      - ticker_norm
+      - company_norm
+      - sector_norm
+      - industry_norm
+    Also returns a list of 'preferred original key columns' present.
+    """
+
+    df = df.copy()
+    lower_map = {c.lower(): c for c in df.columns}
+
+    def pick(*names):
+        for n in names:
+            if n.lower() in lower_map:
+                return lower_map[n.lower()]
+        return None
+
+    # Your preferred schema
+    company_col = pick("Company Name", "Company", "Name", "company_name")
+    ticker_col = pick("Ticker", "ticker", "Symbol", "symbol")
+    sector_col = pick("Sector", "sector")
+    industry_col = pick("Industry", "industry")
+
+    if ticker_col is None:
+        raise ValueError("Universe CSV must have a ticker column (Ticker/ticker/Symbol/symbol).")
+
+    df["ticker_norm"] = df[ticker_col].astype(str).str.upper().str.strip()
+    df["company_norm"] = df[company_col].astype(str) if company_col else df["ticker_norm"]
+    df["sector_norm"] = df[sector_col].astype(str) if sector_col else "Unknown"
+    df["industry_norm"] = df[industry_col].astype(str) if industry_col else ""
+
+    # key columns list (only those present)
+    want = ["Company Name", "Ticker", "Industry", "Sector", "PE1", "PE2", "EG1", "EG2", "PEG1", "PEG2"]
+    present = []
+    for w in want:
+        c = pick(w)
+        if c and c not in present:
+            present.append(c)
+
+    return df, present
 
 # =========================
 # DATA FETCH
 # =========================
 @st.cache_data(ttl=CACHE_TTL_PRICES)
 def fetch_prices_panel(tickers: List[str], period: str = DEFAULT_PRICE_PERIOD) -> pd.DataFrame:
-    # MultiIndex columns: (Ticker, Field)
     px = yf.download(
         tickers=tickers,
         period=period,
@@ -174,7 +198,6 @@ def fetch_prices_panel(tickers: List[str], period: str = DEFAULT_PRICE_PERIOD) -
     )
     return px
 
-
 @st.cache_data(ttl=CACHE_TTL_META)
 def fetch_info_one(ticker: str) -> Dict:
     try:
@@ -182,73 +205,15 @@ def fetch_info_one(ticker: str) -> Dict:
     except Exception:
         return {}
 
-
-@st.cache_data(ttl=CACHE_TTL_META)
-def fetch_recs_one(ticker: str) -> pd.DataFrame:
-    """
-    Analyst revision proxy:
-    Try yfinance 'upgrades_downgrades' (preferred). If unavailable, try 'recommendations' history.
-    We'll derive a simple net score over last 30 days.
-    """
-    t = yf.Ticker(ticker)
-    # yfinance versions differ; try multiple attributes
-    for attr in ["upgrades_downgrades", "recommendations"]:
-        try:
-            df = getattr(t, attr)
-            if df is None:
-                continue
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                df = df.copy()
-                return df
-        except Exception:
-            pass
-
-    # try getter methods
-    for fn in ["get_upgrades_downgrades", "get_recommendations"]:
-        try:
-            f = getattr(t, fn)
-            df = f()
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                return df.copy()
-        except Exception:
-            pass
-
-    return pd.DataFrame()
-
-
-@st.cache_data(ttl=CACHE_TTL_META)
-def fetch_earnings_dates_one(ticker: str) -> pd.DataFrame:
-    """
-    Earnings proximity score:
-    yfinance provides earnings dates table for many tickers via get_earnings_dates().
-    We'll grab next upcoming date if present.
-    """
-    t = yf.Ticker(ticker)
-    try:
-        df = t.get_earnings_dates(limit=12)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            return df.copy()
-    except Exception:
-        pass
-    return pd.DataFrame()
-
-
 @st.cache_data(ttl=CACHE_TTL_NEWS)
 def fetch_google_news_rss(ticker: str, days: int = NEWS_WINDOW_DAYS) -> pd.DataFrame:
-    """
-    Free, no API key:
-    Google News RSS query: "{ticker} stock"
-    Returns: published datetime (UTC-ish), title, link, source
-    """
     q = f"{ticker} stock"
     url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl=en-US&gl=US&ceid=US:en"
-
     try:
         feed = feedparser.parse(url)
         rows = []
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         for e in feed.entries:
-            # Parse published
             pub = None
             if "published" in e:
                 try:
@@ -259,18 +224,17 @@ def fetch_google_news_rss(ticker: str, days: int = NEWS_WINDOW_DAYS) -> pd.DataF
                         pub = pub.astimezone(timezone.utc)
                 except Exception:
                     pub = None
+
             if pub and pub < cutoff:
                 continue
 
             title = getattr(e, "title", "")
             link = getattr(e, "link", "")
             source = ""
-            # Some entries embed source in title "Headline - Source"
             if " - " in title:
                 parts = title.rsplit(" - ", 1)
                 if len(parts) == 2:
                     title, source = parts[0], parts[1]
-
             rows.append({"time": pub, "title": title, "link": link, "source": source})
         df = pd.DataFrame(rows)
         if not df.empty:
@@ -279,480 +243,205 @@ def fetch_google_news_rss(ticker: str, days: int = NEWS_WINDOW_DAYS) -> pd.DataF
     except Exception:
         return pd.DataFrame()
 
-
 # =========================
-# FEATURE ENGINEERING
+# WEBPAGE FETCH + SUMMARIZE (best-effort, free)
 # =========================
-def sector_etf_for(sector: str) -> Optional[str]:
-    if not isinstance(sector, str):
-        return None
-    return SECTOR_ETF_MAP.get(sector.strip())
-
-
-def earnings_proximity_score(next_earn_date: Optional[datetime]) -> float:
-    """
-    Score higher when earnings is closer (but not same-day hype):
-    - Peak score around 7–14 days before earnings (common run-up window)
-    - Decays outside [0, 45] days
-    """
-    if next_earn_date is None:
-        return np.nan
-    now = datetime.now(timezone.utc)
-    if next_earn_date.tzinfo is None:
-        next_earn_date = next_earn_date.replace(tzinfo=timezone.utc)
-    d = (next_earn_date - now).days
-
-    if d < 0:
-        return 0.0
-    if d > 45:
-        return 0.0
-
-    # triangular peak at 10 days
-    peak = 10.0
-    width = 20.0
-    score = max(0.0, 1.0 - abs(d - peak) / width)
-    return float(score)
-
-
-def analyst_revision_score(recs: pd.DataFrame) -> float:
-    """
-    Convert upgrades/downgrades/recommendation changes to a simple net score last 30 days.
-    Robust to tz-naive vs tz-aware datetime issues and yfinance schema differences.
-
-    Output roughly in [-1, +1].
-    """
-    if recs is None or recs.empty:
-        return np.nan
-
-    df = recs.copy()
-
-    # -------------------------
-    # Build a UTC-aware datetime column df["dt"]
-    # -------------------------
-    dt_col = None
-
-    # If index is datetime-like
-    if isinstance(df.index, pd.DatetimeIndex):
-        df["dt"] = df.index
-    else:
-        # try common columns
-        for c in ["Date", "date", "datetime", "Datetime", "EpochGradeDate", "epochGradeDate"]:
-            if c in df.columns:
-                dt_col = c
-                break
-        if dt_col is not None:
-            # EpochGradeDate is often seconds since epoch
-            if "epoch" in dt_col.lower():
-                df["dt"] = pd.to_datetime(df[dt_col], unit="s", errors="coerce", utc=True)
-            else:
-                df["dt"] = pd.to_datetime(df[dt_col], errors="coerce", utc=True)
-        else:
-            df["dt"] = pd.NaT
-
-    # Normalize timezone: make everything UTC-aware
-    # - If tz-naive, localize to UTC
-    # - If tz-aware, convert to UTC
-    df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
+@st.cache_data(ttl=CACHE_TTL_WEBPAGE)
+def fetch_html(url: str, timeout=10) -> Optional[str]:
     try:
-        if hasattr(df["dt"].dt, "tz") and df["dt"].dt.tz is None:
-            df["dt"] = df["dt"].dt.tz_localize("UTC")
-        else:
-            df["dt"] = df["dt"].dt.tz_convert("UTC")
+        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+        if r.status_code >= 200 and r.status_code < 300 and "text/html" in r.headers.get("Content-Type", ""):
+            return r.text
+        return None
     except Exception:
-        # If conversion fails, coerce to UTC-naive and compare to naive cutoff below
-        df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
-
-    # -------------------------
-    # Cutoff (match tz-ness)
-    # -------------------------
-    cutoff_aware = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=30)
-
-    # If dt ended up tz-naive, make cutoff naive too
-    if isinstance(df["dt"].dtype, pd.DatetimeTZDtype):
-        cutoff = cutoff_aware
-    else:
-        cutoff = cutoff_aware.tz_localize(None)
-
-    df = df[df["dt"] >= cutoff]
-    if df.empty:
-        return 0.0
-
-    # -------------------------
-    # Grade mapping -> numeric
-    # -------------------------
-    def grade_to_num(g: str) -> Optional[float]:
-        if not isinstance(g, str):
-            return None
-        g = g.lower()
-
-        pos = ["strong buy", "buy", "outperform", "overweight", "accumulate"]
-        neu = ["hold", "neutral", "market perform", "equal-weight", "equal weight", "sector weight"]
-        neg = ["strong sell", "sell", "underperform", "underweight", "reduce"]
-
-        if any(p in g for p in pos):
-            return 1.0
-        if any(p in g for p in neu):
-            return 0.0
-        if any(p in g for p in neg):
-            return -1.0
         return None
 
-    cols = {c.lower(): c for c in df.columns}
+def extract_main_text(html: str, max_chars: int = 20000) -> str:
+    soup = BeautifulSoup(html, "lxml")
+    # remove junk
+    for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside"]):
+        tag.decompose()
+    text = soup.get_text(separator="\n")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    text = "\n".join(lines)
+    return text[:max_chars]
 
-    score = 0.0
-    n = 0
-
-    # upgrades_downgrades style
-    to_col = cols.get("tograde")
-    fr_col = cols.get("fromgrade")
-    if to_col and fr_col:
-        for _, r in df.iterrows():
-            to_v = grade_to_num(r.get(to_col))
-            fr_v = grade_to_num(r.get(fr_col))
-            if to_v is None or fr_v is None:
-                continue
-            score += (to_v - fr_v)
-            n += 1
-
-    # fallback: single grade column
-    if n == 0:
-        grade_col = None
-        for c in df.columns:
-            if "grade" in c.lower():
-                grade_col = c
-                break
-        if grade_col:
-            for _, r in df.iterrows():
-                v = grade_to_num(r.get(grade_col))
-                if v is None:
-                    continue
-                score += v
-                n += 1
-
-    if n == 0:
-        return np.nan
-
-    # normalize [-1, +1]
-    return float(np.tanh(score / max(1.0, n)))
-
-
-def news_intensity_features(news_df: pd.DataFrame) -> Tuple[float, float, float]:
+def summarize_text_simple(text: str, max_sentences: int = 5) -> str:
     """
-    Returns:
-      - recent_count_7d
-      - intensity_z (7d count vs daily counts over 30d)
-      - avg_sent_7d
+    Lightweight extractive summarizer (no paid NLP):
+    - split into sentences
+    - score sentences by word frequency excluding very short tokens
     """
-    if news_df is None or news_df.empty or "time" not in news_df.columns:
-        return 0.0, np.nan, 0.0
+    if not text or len(text) < 200:
+        return ""
 
-    df = news_df.dropna(subset=["time"]).copy()
-    if df.empty:
-        return 0.0, np.nan, 0.0
+    # crude sentence split
+    sents = re.split(r"(?<=[\.\!\?])\s+", text)
+    sents = [s.strip() for s in sents if len(s.strip()) > 40]
+    if not sents:
+        return ""
 
-    # Ensure UTC datetimes
-    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-    df = df.dropna(subset=["time"])
-    if df.empty:
-        return 0.0, np.nan, 0.0
+    # word freq
+    words = re.findall(r"[A-Za-z]{3,}", text.lower())
+    if not words:
+        return ""
+    freq = {}
+    for w in words:
+        freq[w] = freq.get(w, 0) + 1
 
-    now = pd.Timestamp.utcnow()
-    df30 = df[df["time"] >= (now - pd.Timedelta(days=NEWS_WINDOW_DAYS))]
-    df7 = df[df["time"] >= (now - pd.Timedelta(days=NEWS_RECENT_DAYS))]
+    # score each sentence
+    scores = []
+    for i, s in enumerate(sents[:200]):  # limit
+        ws = re.findall(r"[A-Za-z]{3,}", s.lower())
+        score = sum(freq.get(w, 0) for w in ws) / (1 + len(ws))
+        scores.append((score, i, s))
 
-    recent_count_7d = float(len(df7))
+    scores.sort(reverse=True, key=lambda x: x[0])
+    chosen = sorted(scores[:max_sentences], key=lambda x: x[1])
+    return " ".join([c[2] for c in chosen])
 
-    # Daily counts over 30d for zscore baseline
-    if df30.empty:
-        intensity_z = np.nan
-    else:
-        daily = df30.set_index("time").resample("D").size()
-        # compare 7d count to expected 7d from daily mean/std
-        mu = daily.mean()
-        sd = daily.std()
-        if sd == 0 or np.isnan(sd):
-            intensity_z = 0.0
-        else:
-            intensity_z = float((recent_count_7d / 7.0 - mu) / sd)
-
-    # Average sentiment over last 7d
-    if df7.empty:
-        avg_sent = 0.0
-    else:
-        sents = [sentiment_polarity(t) for t in df7["title"].astype(str).tolist()]
-        avg_sent = float(np.mean(sents)) if sents else 0.0
-
-    return recent_count_7d, intensity_z, avg_sent
-
-
-def catalyst_flags_from_titles(titles: List[str]) -> str:
-    txt = " ".join([t.lower() for t in titles[:50]])
-    flags = []
-    # Earnings / guidance
-    if any(k in txt for k in ["earnings", "results", "q1", "q2", "q3", "q4", "quarter", "revenue", "eps"]):
-        flags.append("Earnings/Results")
-    if any(k in txt for k in ["guidance", "outlook", "forecast", "raises", "cuts"]):
-        flags.append("Guidance/Outlook")
-    # M&A / corporate
-    if any(k in txt for k in ["acquire", "acquisition", "merger", "buyout", "takeover", "spin-off", "spinoff"]):
-        flags.append("M&A/Corp")
-    # Analyst
-    if any(k in txt for k in ["upgrade", "downgrade", "initiated", "raises target", "price target", "pt"]):
-        flags.append("Analyst")
-    # Legal / regulatory
-    if any(k in txt for k in ["sec", "doj", "regulator", "lawsuit", "probe", "antitrust", "ban"]):
-        flags.append("Reg/Legal")
-    # Macro/sector shocks
-    if any(k in txt for k in ["tariff", "sanction", "oil", "rates", "inflation", "fed", "opec", "chip", "ai"]):
-        flags.append("Macro/Sector")
-    return ", ".join(flags) if flags else ""
-
+def summarize_url(url: str) -> str:
+    html = fetch_html(url)
+    if not html:
+        return ""
+    text = extract_main_text(html)
+    return summarize_text_simple(text, max_sentences=5)
 
 # =========================
-# LOAD UNIVERSE
+# IR DISCOVERY (heuristic)
 # =========================
-def normalize_universe(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Expect at least ticker/sector/company. We’ll tolerate different column names.
-    """
-    df = df.copy()
-
-    colmap = {c.lower(): c for c in df.columns}
-    def pick(*names):
-        for n in names:
-            if n in colmap:
-                return colmap[n]
+def normalize_base_url(website: str) -> Optional[str]:
+    if not website or not isinstance(website, str):
         return None
+    website = website.strip()
+    if not website:
+        return None
+    if not website.startswith("http"):
+        website = "https://" + website
+    return website.rstrip("/")
 
-    tcol = pick("ticker", "symbol")
-    ccol = pick("company", "name", "company_name")
-    scol = pick("sector", "gics_sector")
-    icol = pick("industry", "subindustry", "gics_industry")
+def try_urls_exist(urls: List[str]) -> Optional[str]:
+    for u in urls:
+        html = fetch_html(u)
+        if html and len(html) > 2000:
+            return u
+    return None
 
-    if tcol is None:
-        raise ValueError("Universe CSV must contain a ticker/symbol column.")
+def find_investor_relations_url(website: str) -> Optional[str]:
+    base = normalize_base_url(website)
+    if not base:
+        return None
+    candidates = [
+        f"{base}/investors",
+        f"{base}/investor-relations",
+        f"{base}/investors-relations",
+        f"{base}/investor",
+        f"{base}/investors-and-media",
+        f"{base}/news",
+        f"{base}/press-releases",
+        f"{base}/press",
+    ]
+    found = try_urls_exist(candidates)
+    return found
 
-    df["ticker"] = df[tcol].astype(str).str.upper().str.strip()
-    df["company"] = df[ccol].astype(str) if ccol else df["ticker"]
-    df["sector"] = df[scol].astype(str) if scol else "Unknown"
-    df["industry"] = df[icol].astype(str) if icol else ""
-
-    # keep originals too
-    return df
-
+def extract_ir_news_links(ir_url: str, max_links=8) -> List[Tuple[str, str]]:
+    html = fetch_html(ir_url)
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "lxml")
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        txt = (a.get_text(" ", strip=True) or "").strip()
+        if not txt or len(txt) < 8:
+            continue
+        # filter to likely news items
+        key = (txt + " " + href).lower()
+        if any(k in key for k in ["press", "release", "news", "investor", "results", "earnings", "quarter"]):
+            # make absolute
+            if href.startswith("/"):
+                base = normalize_base_url(ir_url)
+                href = base + href if base else href
+            if href.startswith("http"):
+                links.append((txt, href))
+    # de-dup
+    seen = set()
+    out = []
+    for t, h in links:
+        if h in seen:
+            continue
+        seen.add(h)
+        out.append((t, h))
+        if len(out) >= max_links:
+            break
+    return out
 
 # =========================
-# BUILD FEATURES TABLE
+# BUILD RAW PERFORMANCE TABLE
 # =========================
-def build_feature_table(universe: pd.DataFrame, prices_panel: pd.DataFrame, sector_px: pd.DataFrame) -> pd.DataFrame:
+def build_raw_performance(universe: pd.DataFrame, prices_panel: pd.DataFrame) -> pd.DataFrame:
     rows = []
-
     for _, u in universe.iterrows():
-        ticker = u["ticker"]
-        sector = u["sector"]
-        company = u["company"]
-
-        # Price series
+        ticker = u["ticker_norm"]
         if isinstance(prices_panel.columns, pd.MultiIndex) and ticker in prices_panel.columns.levels[0]:
-            close = prices_panel[ticker]["Close"].dropna()
-            vol = prices_panel[ticker]["Volume"].dropna() if "Volume" in prices_panel[ticker].columns else pd.Series(dtype=float)
+            df = prices_panel[ticker]
         else:
             continue
 
+        close = df["Close"].dropna() if "Close" in df.columns else pd.Series(dtype=float)
         if close.empty:
             continue
 
+        vol = df["Volume"].dropna() if "Volume" in df.columns else pd.Series(dtype=float)
+        high = df["High"].dropna() if "High" in df.columns else pd.Series(dtype=float)
+        low = df["Low"].dropna() if "Low" in df.columns else pd.Series(dtype=float)
+
         rets = compute_returns(close)
-        vol20 = realized_vol(close, 20)
-        vol60 = realized_vol(close, 60)
+        v20 = realized_vol(close, 20)
+        v60 = realized_vol(close, 60)
+        vsurge = volume_surge(vol, 20) if not vol.empty else np.nan
         rsi14 = compute_rsi(close, 14)
 
         ma50 = close.rolling(50).mean().iloc[-1] if len(close) >= 50 else np.nan
         ma200 = close.rolling(200).mean().iloc[-1] if len(close) >= 200 else np.nan
-        dist_50 = (close.iloc[-1] / ma50 - 1) if not pd.isna(ma50) else np.nan
-        dist_200 = (close.iloc[-1] / ma200 - 1) if not pd.isna(ma200) else np.nan
-        vol_surge_20 = volume_surge(vol, 20) if not vol.empty else np.nan
+        dist50 = (close.iloc[-1] / ma50 - 1) if not pd.isna(ma50) else np.nan
+        dist200 = (close.iloc[-1] / ma200 - 1) if not pd.isna(ma200) else np.nan
 
-        # Fundamentals
+        # minimal fundamentals from yfinance
         info = fetch_info_one(ticker)
         mkt_cap = _safe_float(info.get("marketCap"))
         pe = _safe_float(info.get("trailingPE"))
         fwd_pe = _safe_float(info.get("forwardPE"))
         beta = _safe_float(info.get("beta"))
 
-        # News + sentiment + catalysts + intensity
-        news = fetch_google_news_rss(ticker, days=NEWS_WINDOW_DAYS)
-        titles7 = []
-        if news is not None and not news.empty:
-            news["time"] = pd.to_datetime(news["time"], utc=True, errors="coerce")
-            cutoff7 = pd.Timestamp.utcnow() - pd.Timedelta(days=NEWS_RECENT_DAYS)
-            titles7 = news.loc[news["time"] >= cutoff7, "title"].astype(str).tolist()
-
-        news_count_7d, news_int_z, sent_7d = news_intensity_features(news)
-        catalysts = catalyst_flags_from_titles(titles7)
-
-        # Earnings proximity
-        earn_df = fetch_earnings_dates_one(ticker)
-        next_earn = None
-        if earn_df is not None and not earn_df.empty:
-            # index often is DatetimeIndex
-            try:
-                idx = pd.to_datetime(earn_df.index, utc=True, errors="coerce")
-                idx = idx[idx >= pd.Timestamp.utcnow()]
-                if len(idx) > 0:
-                    next_earn = idx.min().to_pydatetime()
-            except Exception:
-                next_earn = None
-        earn_score = earnings_proximity_score(next_earn)
-
-        # Analyst revisions proxy
-        recs = fetch_recs_one(ticker)
-        analyst_score = analyst_revision_score(recs)
-
-        # Relative strength vs sector ETF
-        sec_etf = sector_etf_for(sector)
-        rs_excess_1m = np.nan
-        rs_excess_3m = np.nan
-        if sec_etf and isinstance(sector_px.columns, pd.MultiIndex) and sec_etf in sector_px.columns.levels[0]:
-            sec_close = sector_px[sec_etf]["Close"].dropna()
-            if len(sec_close) > 70 and len(close) > 70:
-                # align dates
-                aligned = pd.concat([close, sec_close], axis=1, join="inner").dropna()
-                if aligned.shape[0] > 70:
-                    s_close = aligned.iloc[:, 0]
-                    s_sec = aligned.iloc[:, 1]
-                    # excess returns
-                    if len(aligned) >= 21:
-                        rs_excess_1m = (s_close.iloc[-1] / s_close.iloc[-21] - 1) - (s_sec.iloc[-1] / s_sec.iloc[-21] - 1)
-                    if len(aligned) >= 63:
-                        rs_excess_3m = (s_close.iloc[-1] / s_close.iloc[-63] - 1) - (s_sec.iloc[-1] / s_sec.iloc[-63] - 1)
-
-        # Breadth feature: above 50DMA / 200DMA
-        above_50 = 1.0 if (not pd.isna(ma50) and close.iloc[-1] > ma50) else 0.0 if not pd.isna(ma50) else np.nan
-        above_200 = 1.0 if (not pd.isna(ma200) and close.iloc[-1] > ma200) else 0.0 if not pd.isna(ma200) else np.nan
-
         rows.append({
             "Ticker": ticker,
-            "Company": company,
-            "Sector": sector,
-            "Industry": u.get("industry", ""),
-
+            "Company": u.get("company_norm", ticker),
+            "Sector": u.get("sector_norm", ""),
+            "Industry": u.get("industry_norm", ""),
             "Price": float(close.iloc[-1]),
             "Ret 1D": rets["ret_1d"],
             "Ret 1W": rets["ret_5d"],
             "Ret 1M": rets["ret_1m"],
             "Ret 3M": rets["ret_3m"],
             "Ret 6M": rets["ret_6m"],
-
-            "Vol 20D": vol20,
-            "Vol 60D": vol60,
+            "Vol 20D": v20,
+            "Vol 60D": v60,
             "RSI 14": rsi14,
-            "VolSurge 20D": vol_surge_20,
-            "Dist 50DMA": dist_50,
-            "Dist 200DMA": dist_200,
-            "Above 50DMA": above_50,
-            "Above 200DMA": above_200,
-
+            "VolSurge 20D": vsurge,
+            "Dist 50DMA": dist50,
+            "Dist 200DMA": dist200,
             "MktCap": mkt_cap,
-            "PE": pe,
-            "Fwd PE": fwd_pe,
-            "Beta": beta,
-
-            "NewsCount 7D": news_count_7d,
-            "NewsIntensity Z": news_int_z,
-            "Sentiment 7D": sent_7d,
-            "Catalysts": catalysts,
-
-            "Next Earnings (UTC)": next_earn.strftime("%Y-%m-%d") if next_earn else "",
-            "Earnings Prox Score": earn_score,
-            "Analyst Rev Score": analyst_score,
-
-            "Sector ETF": sec_etf or "",
-            "RS Excess 1M": rs_excess_1m,
-            "RS Excess 3M": rs_excess_3m,
+            "PE (yf)": pe,
+            "Fwd PE (yf)": fwd_pe,
+            "Beta (yf)": beta,
         })
-
-    df = pd.DataFrame(rows)
-    return df
-
-
-def build_alpha_score(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Enhanced alpha view:
-    - Momentum (1M, 3M, 6M)
-    - Relative strength vs sector (excess 1M, 3M)
-    - Vol-adjusted momentum: (1M / Vol60)
-    - News intensity zscore + sentiment
-    - Earnings proximity (run-up)
-    - Analyst revisions
-    - Volume surge (attention)
-    - Penalize overly extended + overbought (very high RSI + far above 50DMA)
-    """
-
-    out = df.copy()
-
-    # Core derived features
-    out["Mom 1M z"] = zscore(out["Ret 1M"])
-    out["Mom 3M z"] = zscore(out["Ret 3M"])
-    out["Mom 6M z"] = zscore(out["Ret 6M"])
-
-    out["RSEx 1M z"] = zscore(out["RS Excess 1M"])
-    out["RSEx 3M z"] = zscore(out["RS Excess 3M"])
-
-    out["VolAdj 1M"] = pd.to_numeric(out["Ret 1M"], errors="coerce") / pd.to_numeric(out["Vol 60D"], errors="coerce")
-    out["VolAdj 1M z"] = zscore(out["VolAdj 1M"])
-
-    out["NewsInt z"] = pd.to_numeric(out["NewsIntensity Z"], errors="coerce").clip(-3, 3)
-    out["NewsInt z"] = out["NewsInt z"].fillna(0.0)
-
-    out["Sent z"] = zscore(out["Sentiment 7D"]).fillna(0.0)
-    out["Analyst z"] = zscore(out["Analyst Rev Score"]).fillna(0.0)
-
-    # Earnings proximity already [0,1], keep but zscore for mixing
-    out["Earn z"] = zscore(out["Earnings Prox Score"]).fillna(0.0)
-
-    out["VolSurge z"] = zscore(out["VolSurge 20D"]).fillna(0.0)
-
-    # Mean reversion risk penalty: too hot
-    # RSI above ~75 and far above 50DMA tends to mean short-term pullback risk
-    rsi = pd.to_numeric(out["RSI 14"], errors="coerce")
-    dist50 = pd.to_numeric(out["Dist 50DMA"], errors="coerce")
-    penalty = np.maximum(0, (rsi - 75) / 10) + np.maximum(0, (dist50 - 0.08) / 0.05)
-    out["Overheat Penalty"] = pd.Series(penalty, index=out.index).fillna(0.0).clip(0, 3)
-
-    # Composite weights (tuned for 1–3 month horizon)
-    # You can adjust easily in sidebar later
-    w = {
-        "Mom 1M z": 0.30,
-        "Mom 3M z": 0.20,
-        "Mom 6M z": 0.10,
-        "RSEx 1M z": 0.12,
-        "RSEx 3M z": 0.08,
-        "VolAdj 1M z": 0.08,
-        "NewsInt z": 0.05,
-        "Sent z": 0.03,
-        "Earn z": 0.03,
-        "Analyst z": 0.04,
-        "VolSurge z": 0.02,
-        "Overheat Penalty": -0.10,
-    }
-
-    score = np.zeros(len(out))
-    for k, wk in w.items():
-        score += wk * pd.to_numeric(out[k], errors="coerce").fillna(0.0).values
-
-    out["AlphaScore"] = score
-    out["AlphaRank"] = out["AlphaScore"].rank(ascending=False, method="min").astype(int)
-
-    # A more interpretable 0-100
-    out["AlphaScore 0-100"] = 100 * (pd.Series(score).rank(pct=True).values)
-    return out
-
+    return pd.DataFrame(rows)
 
 # =========================
 # UI
 # =========================
-st.title("📈 Equity Alpha & Catalyst Dashboard")
+st.title("📊 Stock Performance, Technicals, News & IR Monitor (Raw)")
 
 files = pick_universe_files()
 if not files:
@@ -762,13 +451,13 @@ if not files:
 date_options = [d for d, _ in files]
 file_map = {d: f for d, f in files}
 
-colA, colB, colC = st.columns([1.2, 1, 1])
-with colA:
+c1, c2, c3 = st.columns([1.2, 1, 1])
+with c1:
     date_sel = st.selectbox("Universe date", date_options, index=0)
-with colB:
-    max_stocks = st.number_input("Max tickers to load", min_value=10, max_value=2000, value=300, step=10)
-with colC:
-    refresh = st.button("Refresh caches", help="Force refresh cached data (prices/news/meta).")
+with c2:
+    max_stocks = st.number_input("Max tickers to load", min_value=10, max_value=3000, value=300, step=10)
+with c3:
+    refresh = st.button("Refresh caches")
 
 if refresh:
     st.cache_data.clear()
@@ -778,204 +467,292 @@ universe_path = file_map[date_sel]
 st.caption(f"Using: `{Path(universe_path).name}`")
 
 uni_raw = pd.read_csv(universe_path)
-universe = normalize_universe(uni_raw)
+uni, key_cols_present = normalize_universe_keep_original(uni_raw)
 
-# Optional filters
+# Sidebar filters (Zacks sector = your Sector column)
 st.sidebar.header("Filters")
-sector_list = sorted(universe["sector"].dropna().unique().tolist())
+sector_list = sorted(uni["sector_norm"].dropna().unique().tolist())
 sector_sel = st.sidebar.multiselect("Sector", sector_list, default=sector_list)
-universe = universe[universe["sector"].isin(sector_sel)]
+uni_f = uni[uni["sector_norm"].isin(sector_sel)].copy()
 
-# Limit tickers for performance
-tickers = universe["ticker"].dropna().astype(str).str.upper().unique().tolist()
-tickers = tickers[: int(max_stocks)]
+# Ticker cap
+tickers = uni_f["ticker_norm"].dropna().unique().tolist()[: int(max_stocks)]
 
-# Prepare sector ETF list for RS calc
-sector_etfs = sorted({sector_etf_for(s) for s in universe["sector"].unique().tolist() if sector_etf_for(s)})
-sector_etfs = [e for e in sector_etfs if e]
+# -------------------------
+# (1) Your original key columns table
+# -------------------------
+st.subheader("Universe (Original CSV Key Columns)")
+if key_cols_present:
+    st.dataframe(uni_f[key_cols_present].copy(), use_container_width=True, height=320)
+else:
+    st.info("None of the preferred key columns were found. Showing the first 12 columns instead.")
+    st.dataframe(uni_f.iloc[:, :12], use_container_width=True, height=320)
 
-with st.spinner("Fetching prices (tickers + sector ETFs)…"):
+# -------------------------
+# Prices download + raw perf table
+# -------------------------
+with st.spinner("Fetching prices…"):
     px_panel = fetch_prices_panel(tickers, period=DEFAULT_PRICE_PERIOD)
-    sec_panel = fetch_prices_panel(sector_etfs, period=DEFAULT_PRICE_PERIOD) if sector_etfs else pd.DataFrame()
 
-with st.spinner("Building features (fundamentals, earnings, analyst proxy, news, sentiment)…"):
-    feats = build_feature_table(universe[universe["ticker"].isin(tickers)], px_panel, sec_panel)
+with st.spinner("Building raw performance table…"):
+    perf = build_raw_performance(uni_f[uni_f["ticker_norm"].isin(tickers)], px_panel)
 
-if feats.empty:
-    st.warning("No usable tickers found (check CSV tickers).")
+st.subheader("Performance & Basic Metrics (Raw, sortable)")
+if perf.empty:
+    st.warning("No usable tickers found (check tickers are valid for yfinance).")
     st.stop()
 
-alpha = build_alpha_score(feats)
-
-# =========================
-# TOP SUMMARY
-# =========================
-st.subheader("Alpha Leaderboard")
-
-# quick sector KPI panel
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-kpi1.metric("Universe Size", f"{len(alpha)}")
-kpi2.metric("Avg 1M Return", f"{(alpha['Ret 1M'].mean(skipna=True) * 100):.2f}%")
-kpi3.metric("Avg News Intensity Z", f"{alpha['NewsIntensity Z'].mean(skipna=True):.2f}")
-kpi4.metric("Avg AlphaScore", f"{alpha['AlphaScore'].mean(skipna=True):.2f}")
-
-# main ranking table
-display_cols = [
-    "AlphaRank", "Ticker", "Company", "Sector",
-    "AlphaScore 0-100",
-    "Ret 1M", "Ret 3M", "RS Excess 1M", "Vol 60D",
-    "NewsCount 7D", "NewsIntensity Z", "Sentiment 7D",
-    "Next Earnings (UTC)", "Analyst Rev Score",
-    "RSI 14", "Dist 50DMA",
-    "Catalysts",
-]
-table = alpha.sort_values(["AlphaRank"]).reset_index(drop=True)[display_cols]
-
-# formatting
-fmt_pct = lambda x: f"{x*100:.2f}%" if pd.notna(x) else ""
-fmt_float = lambda x: f"{x:.2f}" if pd.notna(x) else ""
+# Let user choose sort column
+sort_col = st.selectbox("Sort by", perf.columns.tolist(), index=perf.columns.get_loc("Ret 1M") if "Ret 1M" in perf.columns else 0)
+sort_asc = st.checkbox("Ascending", value=False)
+perf_view = perf.sort_values(sort_col, ascending=sort_asc).reset_index(drop=True)
 
 st.dataframe(
-    table.style.format({
-        "AlphaScore 0-100": "{:.1f}",
-        "Ret 1M": fmt_pct, "Ret 3M": fmt_pct, "RS Excess 1M": fmt_pct,
+    perf_view.style.format({
+        "Price": "{:.2f}",
+        "Ret 1D": lambda x: f"{x*100:.2f}%" if pd.notna(x) else "",
+        "Ret 1W": lambda x: f"{x*100:.2f}%" if pd.notna(x) else "",
+        "Ret 1M": lambda x: f"{x*100:.2f}%" if pd.notna(x) else "",
+        "Ret 3M": lambda x: f"{x*100:.2f}%" if pd.notna(x) else "",
+        "Ret 6M": lambda x: f"{x*100:.2f}%" if pd.notna(x) else "",
+        "Vol 20D": "{:.2f}",
         "Vol 60D": "{:.2f}",
-        "NewsIntensity Z": "{:.2f}",
-        "Sentiment 7D": "{:.2f}",
-        "Analyst Rev Score": "{:.2f}",
         "RSI 14": "{:.1f}",
-        "Dist 50DMA": fmt_pct,
+        "VolSurge 20D": "{:.2f}",
+        "Dist 50DMA": lambda x: f"{x*100:.2f}%" if pd.notna(x) else "",
+        "Dist 200DMA": lambda x: f"{x*100:.2f}%" if pd.notna(x) else "",
+        "MktCap": lambda x: f"{x/1e9:.2f}B" if pd.notna(x) else "",
+        "PE (yf)": "{:.2f}",
+        "Fwd PE (yf)": "{:.2f}",
+        "Beta (yf)": "{:.2f}",
     }),
     use_container_width=True,
     height=520
 )
 
-# =========================
-# SECTOR ANALYTICS
-# =========================
-st.subheader("Sector Analytics")
-
+# -------------------------
+# Sector analytics WITHOUT SPDR ETFs
+# -------------------------
+st.subheader("Sector Snapshot (within your universe)")
 sector_agg = (
-    alpha.groupby("Sector")
+    perf.groupby("Sector")
     .agg(
         n=("Ticker", "count"),
-        avg_alpha=("AlphaScore", "mean"),
         avg_1m=("Ret 1M", "mean"),
-        avg_news=("NewsIntensity Z", "mean"),
-        breadth_50=("Above 50DMA", "mean"),
+        avg_3m=("Ret 3M", "mean"),
+        avg_vol60=("Vol 60D", "mean"),
+        median_rsi=("RSI 14", "median"),
     )
     .reset_index()
-    .sort_values("avg_alpha", ascending=False)
+    .sort_values("avg_1m", ascending=False)
 )
 
-c1, c2 = st.columns([1, 1])
-with c1:
-    fig = px.bar(sector_agg, x="Sector", y="avg_alpha", title="Average AlphaScore by Sector")
+s1, s2 = st.columns(2)
+with s1:
+    fig = px.bar(sector_agg, x="Sector", y="avg_1m", title="Average 1M Return by Sector (Universe)")
     st.plotly_chart(fig, use_container_width=True)
-with c2:
-    fig2 = px.bar(sector_agg, x="Sector", y="avg_1m", title="Average 1M Return by Sector")
+with s2:
+    fig2 = px.bar(sector_agg, x="Sector", y="avg_vol60", title="Average 60D Vol by Sector (Universe)")
     st.plotly_chart(fig2, use_container_width=True)
 
 st.dataframe(
     sector_agg.style.format({
-        "avg_alpha": "{:.2f}",
         "avg_1m": lambda x: f"{x*100:.2f}%" if pd.notna(x) else "",
-        "avg_news": "{:.2f}",
-        "breadth_50": lambda x: f"{x*100:.1f}%" if pd.notna(x) else "",
+        "avg_3m": lambda x: f"{x*100:.2f}%" if pd.notna(x) else "",
+        "avg_vol60": "{:.2f}",
+        "median_rsi": "{:.1f}",
     }),
     use_container_width=True
 )
 
 # =========================
-# DEEP DIVE
+# DEEP DIVE: TECHNICALS + NEWS + IR
 # =========================
-st.subheader("Stock Deep Dive")
+st.subheader("Stock Deep Dive (Technicals + News + Investor Relations)")
 
-left, right = st.columns([1.2, 1])
-with left:
-    ticker_sel = st.selectbox("Select ticker", alpha.sort_values("AlphaRank")["Ticker"].tolist())
-with right:
-    st.write("")
+ticker_sel = st.selectbox("Select ticker", perf.sort_values("Ret 1M", ascending=False)["Ticker"].tolist())
+info = fetch_info_one(ticker_sel)
 
-row = alpha[alpha["Ticker"] == ticker_sel].iloc[0].to_dict()
-
-# Price chart
-close = None
+# Extract OHLCV
+df_t = None
 if isinstance(px_panel.columns, pd.MultiIndex) and ticker_sel in px_panel.columns.levels[0]:
-    close = px_panel[ticker_sel]["Close"].dropna()
+    df_t = px_panel[ticker_sel].copy()
+if df_t is None or df_t.empty:
+    st.warning("No price data for selected ticker.")
+    st.stop()
 
-if close is not None and not close.empty:
-    cdf = close.reset_index()
-    cdf.columns = ["Date", "Close"]
-    figp = px.line(cdf, x="Date", y="Close", title=f"{ticker_sel} — Price (Adj)")
-    st.plotly_chart(figp, use_container_width=True)
+df_t = df_t.dropna(subset=["Close"])
+close = df_t["Close"]
+high = df_t["High"] if "High" in df_t.columns else close
+low = df_t["Low"] if "Low" in df_t.columns else close
+vol = df_t["Volume"] if "Volume" in df_t.columns else pd.Series(index=df_t.index, dtype=float)
 
-# Feature cards
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("AlphaScore (0-100)", f"{row.get('AlphaScore 0-100', np.nan):.1f}")
-m2.metric("1M Return", f"{row.get('Ret 1M', np.nan) * 100:.2f}%")
-m3.metric("News Intensity Z", f"{row.get('NewsIntensity Z', np.nan):.2f}")
-m4.metric("Earnings Prox Score", f"{row.get('Earnings Prox Score', np.nan):.2f}")
+# Compute technical indicators
+ema12 = ema(close, 12)
+ema26 = ema(close, 26)
+ema50 = ema(close, 50)
+ema200 = ema(close, 200)
 
-d1, d2 = st.columns([1, 1])
+rsi14 = close.rolling(1).apply(lambda _: np.nan)  # placeholder
+rsi14 = pd.Series(index=close.index, dtype=float)
+# compute RSI as series
+delta = close.diff()
+gain = delta.clip(lower=0).rolling(14).mean()
+loss = (-delta.clip(upper=0)).rolling(14).mean()
+rs = gain / loss
+rsi14 = 100 - (100 / (1 + rs))
 
-with d1:
-    st.markdown("**Key Signals**")
-    sig = pd.DataFrame([{
-        "RS Excess 1M": row.get("RS Excess 1M"),
-        "RS Excess 3M": row.get("RS Excess 3M"),
-        "Vol 60D": row.get("Vol 60D"),
-        "RSI 14": row.get("RSI 14"),
-        "Dist 50DMA": row.get("Dist 50DMA"),
-        "VolSurge 20D": row.get("VolSurge 20D"),
-        "Analyst Rev Score": row.get("Analyst Rev Score"),
-        "Sentiment 7D": row.get("Sentiment 7D"),
-        "NewsCount 7D": row.get("NewsCount 7D"),
-        "Next Earnings (UTC)": row.get("Next Earnings (UTC)"),
-        "Catalysts": row.get("Catalysts"),
-    }])
-    st.dataframe(sig.style.format({
-        "RS Excess 1M": lambda x: f"{x*100:.2f}%" if pd.notna(x) else "",
-        "RS Excess 3M": lambda x: f"{x*100:.2f}%" if pd.notna(x) else "",
-        "Vol 60D": "{:.2f}",
-        "RSI 14": "{:.1f}",
-        "Dist 50DMA": lambda x: f"{x*100:.2f}%" if pd.notna(x) else "",
-        "VolSurge 20D": "{:.2f}",
-        "Analyst Rev Score": "{:.2f}",
-        "Sentiment 7D": "{:.2f}",
-        "NewsCount 7D": "{:.0f}",
-    }), use_container_width=True)
+macd_line, signal_line, hist = macd(close, 12, 26, 9)
+k_line, d_line, j_line = kdj(high, low, close, n=9, k=3, d=3)
 
-with d2:
-    st.markdown("**Recent News (Google News RSS)**")
-    news_df = fetch_google_news_rss(ticker_sel, days=NEWS_WINDOW_DAYS)
-    if news_df is None or news_df.empty:
-        st.write("No recent RSS news found.")
+# --- Price chart with EMAs
+price_df = pd.DataFrame({
+    "Date": close.index,
+    "Close": close.values,
+    "EMA12": ema12.values,
+    "EMA26": ema26.values,
+    "EMA50": ema50.values,
+    "EMA200": ema200.values,
+}).dropna()
+
+fig_price = go.Figure()
+fig_price.add_trace(go.Scatter(x=price_df["Date"], y=price_df["Close"], name="Close"))
+fig_price.add_trace(go.Scatter(x=price_df["Date"], y=price_df["EMA12"], name="EMA12"))
+fig_price.add_trace(go.Scatter(x=price_df["Date"], y=price_df["EMA26"], name="EMA26"))
+fig_price.add_trace(go.Scatter(x=price_df["Date"], y=price_df["EMA50"], name="EMA50"))
+fig_price.add_trace(go.Scatter(x=price_df["Date"], y=price_df["EMA200"], name="EMA200"))
+fig_price.update_layout(title=f"{ticker_sel} Price + EMAs", height=420, legend=dict(orientation="h"))
+st.plotly_chart(fig_price, use_container_width=True)
+
+# --- RSI chart
+rsi_df = pd.DataFrame({"Date": rsi14.index, "RSI14": rsi14.values}).dropna()
+fig_rsi = px.line(rsi_df, x="Date", y="RSI14", title="RSI(14)")
+fig_rsi.update_layout(height=260)
+st.plotly_chart(fig_rsi, use_container_width=True)
+
+# --- MACD chart
+macd_df = pd.DataFrame({
+    "Date": close.index,
+    "MACD": macd_line.values,
+    "Signal": signal_line.values,
+    "Hist": hist.values,
+}).dropna()
+
+fig_macd = go.Figure()
+fig_macd.add_trace(go.Scatter(x=macd_df["Date"], y=macd_df["MACD"], name="MACD"))
+fig_macd.add_trace(go.Scatter(x=macd_df["Date"], y=macd_df["Signal"], name="Signal"))
+fig_macd.add_trace(go.Bar(x=macd_df["Date"], y=macd_df["Hist"], name="Hist"))
+fig_macd.update_layout(title="MACD(12,26,9)", height=320, legend=dict(orientation="h"))
+st.plotly_chart(fig_macd, use_container_width=True)
+
+# --- KDJ chart
+kdj_df = pd.DataFrame({
+    "Date": close.index,
+    "K": k_line.values,
+    "D": d_line.values,
+    "J": j_line.values,
+}).dropna()
+
+fig_kdj = px.line(kdj_df, x="Date", y=["K", "D", "J"], title="KDJ(9,3,3)")
+fig_kdj.update_layout(height=320)
+st.plotly_chart(fig_kdj, use_container_width=True)
+
+# --- Technical snapshot table (latest values)
+snap = {
+    "Close": float(close.iloc[-1]),
+    "EMA12": float(ema12.iloc[-1]),
+    "EMA26": float(ema26.iloc[-1]),
+    "EMA50": float(ema50.iloc[-1]) if not pd.isna(ema50.iloc[-1]) else np.nan,
+    "EMA200": float(ema200.iloc[-1]) if not pd.isna(ema200.iloc[-1]) else np.nan,
+    "RSI14": float(rsi14.iloc[-1]) if not pd.isna(rsi14.iloc[-1]) else np.nan,
+    "MACD": float(macd_line.iloc[-1]),
+    "MACD Signal": float(signal_line.iloc[-1]),
+    "MACD Hist": float(hist.iloc[-1]),
+    "K": float(k_line.iloc[-1]) if not pd.isna(k_line.iloc[-1]) else np.nan,
+    "D": float(d_line.iloc[-1]) if not pd.isna(d_line.iloc[-1]) else np.nan,
+    "J": float(j_line.iloc[-1]) if not pd.isna(j_line.iloc[-1]) else np.nan,
+    "Vol 60D": realized_vol(close, 60),
+    "VolSurge 20D": volume_surge(vol, 20) if vol is not None and not vol.empty else np.nan,
+}
+st.markdown("### Latest Technical Snapshot")
+st.dataframe(pd.DataFrame([snap]).T.rename(columns={0: "Value"}), use_container_width=True)
+
+# =========================
+# Recent news (RSS) + best-effort content summary
+# =========================
+st.markdown("### Recent Company News (Google News RSS)")
+
+news_df = fetch_google_news_rss(ticker_sel, days=NEWS_WINDOW_DAYS)
+if news_df is None or news_df.empty:
+    st.write("No recent RSS news found.")
+else:
+    news_df["time"] = pd.to_datetime(news_df["time"], utc=True, errors="coerce")
+    cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=NEWS_RECENT_DAYS)
+    recent = news_df[news_df["time"] >= cutoff].copy()
+    if recent.empty:
+        recent = news_df.head(12).copy()
     else:
-        news_df["time"] = pd.to_datetime(news_df["time"], utc=True, errors="coerce")
-        cutoff7 = pd.Timestamp.utcnow() - pd.Timedelta(days=NEWS_RECENT_DAYS)
-        recent = news_df[news_df["time"] >= cutoff7].copy()
-        if recent.empty:
-            recent = news_df.head(12).copy()
         recent = recent.head(12)
 
-        for _, n in recent.iterrows():
-            t = n.get("time")
-            t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
-            title = str(n.get("title", ""))
-            link = str(n.get("link", ""))
-            src = str(n.get("source", ""))
-            sent = sentiment_polarity(title)
-            st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_ | sentiment: `{sent:+.2f}`")
+    summarize = st.checkbox("Try summarizing linked articles (best-effort, can be slow / blocked)", value=False)
+
+    for _, n in recent.iterrows():
+        t = n.get("time")
+        t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+        title = str(n.get("title", ""))
+        link = str(n.get("link", ""))
+        src = str(n.get("source", ""))
+        pol = sentiment_polarity(title)
+
+        st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_ | headline polarity: `{pol:+.2f}`")
+
+        if summarize and link.startswith("http"):
+            with st.spinner("Fetching & summarizing…"):
+                summ = summarize_url(link)
+            if summ:
+                st.caption(summ)
+            else:
+                st.caption("Summary unavailable (site blocked / non-HTML / parsing failed).")
 
 # =========================
-# EXPORT
+# Investor Relations discovery + latest updates
+# =========================
+st.markdown("### Investor Relations (Official Site)")
+
+website = info.get("website", "")
+base = normalize_base_url(website)
+if not base:
+    st.write("Official website not available via yfinance for this ticker.")
+else:
+    st.write(f"Official website (from yfinance): {base}")
+
+    ir_url = find_investor_relations_url(base)
+    if not ir_url:
+        st.write("Could not auto-locate an Investor Relations page (heuristic).")
+        st.write("Try manually: usually `/investors` or `/investor-relations` on the official domain.")
+    else:
+        st.write(f"Detected IR / News page: {ir_url}")
+
+        # Try to surface latest IR/press links
+        links = extract_ir_news_links(ir_url, max_links=8)
+        if not links:
+            st.write("No obvious IR/news links found on that page (site structure may be JS-rendered).")
+        else:
+            st.markdown("**Latest IR / Press / News links (best-effort extraction):**")
+            summarize_ir = st.checkbox("Try summarizing IR links too (best-effort)", value=False)
+            for txt, href in links:
+                st.markdown(f"- [{txt}]({href})")
+                if summarize_ir:
+                    with st.spinner("Fetching & summarizing…"):
+                        summ = summarize_url(href)
+                    if summ:
+                        st.caption(summ)
+                    else:
+                        st.caption("Summary unavailable (blocked / JS-rendered / parsing failed).")
+
+# =========================
+# Export
 # =========================
 st.subheader("Export")
-csv_out = alpha.sort_values("AlphaRank").to_csv(index=False).encode("utf-8")
-st.download_button("Download ranked table (CSV)", data=csv_out, file_name=f"alpha_rank_{date_sel}.csv", mime="text/csv")
-
-st.caption(
-    "Notes: Analyst/Earnings availability varies by ticker; free sources can be sparse. "
-    "This app is designed to degrade gracefully and can be upgraded to premium APIs later."
-)
+csv_out = perf_view.to_csv(index=False).encode("utf-8")
+st.download_button("Download performance table (CSV)", data=csv_out, file_name=f"performance_{date_sel}.csv", mime="text/csv")
