@@ -166,21 +166,41 @@ def _fred_csv_url(series_id: str) -> str:
 @st.cache_data(ttl=CACHE_TTL_INDICATORS)
 def fetch_fred_series(series_id: str) -> pd.DataFrame:
     """
-    Returns dataframe with columns: date, value
+    Free, no-key: FRED CSV endpoint.
+    Defensive: never raises; returns empty df on HTTP errors/throttling.
     """
     url = _fred_csv_url(series_id)
-    r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=15)
-    r.raise_for_status()
-    df = pd.read_csv(pd.compat.StringIO(r.text)) if hasattr(pd, "compat") and hasattr(pd.compat, "StringIO") else pd.read_csv(pd.io.common.StringIO(r.text))
-    # Columns usually DATE, <series_id>
-    date_col = "DATE" if "DATE" in df.columns else df.columns[0]
-    val_col = series_id if series_id in df.columns else df.columns[1]
-    out = df[[date_col, val_col]].copy()
-    out.columns = ["date", "value"]
-    out["date"] = pd.to_datetime(out["date"], errors="coerce")
-    out["value"] = pd.to_numeric(out["value"], errors="coerce")
-    out = out.dropna(subset=["date"])
-    return out.sort_values("date")
+    try:
+        r = requests.get(
+            url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "text/csv,*/*",
+                "Referer": "https://fred.stlouisfed.org/",
+            },
+            timeout=20,
+        )
+        if not (200 <= r.status_code < 300):
+            return pd.DataFrame(columns=["date", "value"])
+
+        # Parse CSV text robustly
+        from io import StringIO
+        df = pd.read_csv(StringIO(r.text))
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["date", "value"])
+
+        date_col = "DATE" if "DATE" in df.columns else df.columns[0]
+        val_col = series_id if series_id in df.columns else df.columns[1]
+
+        out = df[[date_col, val_col]].copy()
+        out.columns = ["date", "value"]
+        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+        out["value"] = pd.to_numeric(out["value"], errors="coerce")
+        out = out.dropna(subset=["date"]).sort_values("date")
+        return out
+    except Exception:
+        return pd.DataFrame(columns=["date", "value"])
+
 
 @st.cache_data(ttl=CACHE_TTL_INDICATORS)
 def fetch_yf_series(symbol: str, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
@@ -320,13 +340,15 @@ INDICATORS: Dict[str, Dict] = {
     "HOUST": {"name": "Housing Starts", "source": "fred", "id": "HOUST", "bullish": "higher"},
     "CSUSHPINSA": {"name": "Case-Shiller Home Price Index", "source": "fred", "id": "CSUSHPINSA", "bullish": "higher"},
 
-    # Energy / Materials (commodity proxies)
-    "WTI": {"name": "WTI Crude Oil", "source": "yfinance", "id": "CL=F", "bullish": "higher"},
-    "BRENT": {"name": "Brent Crude Oil", "source": "yfinance", "id": "BZ=F", "bullish": "higher"},
-    "NATGAS": {"name": "Natural Gas", "source": "yfinance", "id": "NG=F", "bullish": "higher"},
-    "COPPER": {"name": "Copper", "source": "yfinance", "id": "HG=F", "bullish": "higher"},
-    "GOLD": {"name": "Gold", "source": "yfinance", "id": "GC=F", "bullish": "higher"},
-    "ALUMINUM": {"name": "Aluminum (proxy)", "source": "yfinance", "id": "ALI=F", "bullish": "higher"},  # may be empty; best-effort
+    # Energy / Materials (commodity proxies) — prefer FRED for Cloud reliability
+    "WTI": {"name": "WTI Spot ($/bbl) (FRED)", "source": "fred", "id": "DCOILWTICO", "bullish": "higher"},
+    "BRENT": {"name": "Brent Spot ($/bbl) (FRED)", "source": "fred", "id": "DCOILBRENTEU", "bullish": "higher"},
+    "NATGAS": {"name": "Nat Gas Henry Hub ($/MMBtu) (FRED)", "source": "fred", "id": "DHHNGSP", "bullish": "higher"},
+    "COPPER": {"name": "Copper Global ($/mt) (FRED)", "source": "fred", "id": "PCOPPUSDM", "bullish": "higher"},
+    "ALUMINUM": {"name": "Aluminum Global ($/mt) (FRED)", "source": "fred", "id": "PALUMUSDM", "bullish": "higher"},
+    
+    # Gold: FRED LBMA series removed; use an alternate proxy
+    "GOLD": {"name": "Gold proxy (GLD ETF)", "source": "yfinance", "id": "GLD", "bullish": "higher"},
 
     # Financials
     "CREDIT_SPREAD": {"name": "BBB Corporate Spread (proxy)", "source": "fred", "id": "BAA10Y", "bullish": "lower"},
