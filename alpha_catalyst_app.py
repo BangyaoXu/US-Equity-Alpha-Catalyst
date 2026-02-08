@@ -25,8 +25,6 @@ st.set_page_config(layout="wide", page_title="US Equity Alpha & Catalyst Dashboa
 
 UNIVERSE_GLOB = "selected_universe_*.csv"
 DEFAULT_PRICE_PERIOD = "1y"
-NEWS_WINDOW_DAYS = 30
-NEWS_RECENT_DAYS = 7
 
 CACHE_TTL_PRICES = 60 * 60
 CACHE_TTL_META = 60 * 60
@@ -77,13 +75,56 @@ def kdj(high: pd.Series, low: pd.Series, close: pd.Series, n=9, k=3, d=3):
     j_line = 3 * k_line - 2 * d_line
     return k_line, d_line, j_line
 
-# RSI series (not just last point)
 def rsi_series(close: pd.Series, window=14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(window).mean()
     loss = (-delta.clip(upper=0)).rolling(window).mean()
     rs = gain / loss
     return 100 - (100 / (1 + rs))
+
+def bollinger(close: pd.Series, window=20, num_std=2.0):
+    mid = close.rolling(window).mean()
+    sd = close.rolling(window).std()
+    upper = mid + num_std * sd
+    lower = mid - num_std * sd
+    return mid, upper, lower
+
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1
+    ).max(axis=1)
+    return tr
+
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, n=14):
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr = true_range(high, low, close)
+    atr = tr.ewm(alpha=1 / n, adjust=False).mean()
+
+    plus_di = 100 * pd.Series(plus_dm, index=close.index).ewm(alpha=1 / n, adjust=False).mean() / atr
+    minus_di = 100 * pd.Series(minus_dm, index=close.index).ewm(alpha=1 / n, adjust=False).mean() / atr
+
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).replace([np.inf, -np.inf], np.nan)
+    adx_line = dx.ewm(alpha=1 / n, adjust=False).mean()
+    return adx_line, plus_di, minus_di
+
+def clamp_score(x: float, lo=-1.0, hi=1.0) -> float:
+    if pd.isna(x):
+        return 0.0
+    return float(max(lo, min(hi, x)))
+
+def score_to_label(score: float) -> str:
+    if score >= 0.5:
+        return "Buy"
+    if score <= -0.5:
+        return "Sell"
+    return "Neutral"
 
 def normalize_universe_keep_original(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     df = df.copy()
@@ -140,7 +181,7 @@ def fetch_info_one(ticker: str) -> Dict:
         return {}
 
 @st.cache_data(ttl=CACHE_TTL_NEWS)
-def fetch_google_news_rss(ticker: str, days: int = NEWS_WINDOW_DAYS) -> pd.DataFrame:
+def fetch_google_news_rss(ticker: str, days: int = 30) -> pd.DataFrame:
     q = f"{ticker} stock"
     url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl=en-US&gl=US&ceid=US:en"
     try:
@@ -177,7 +218,7 @@ def fetch_google_news_rss(ticker: str, days: int = NEWS_WINDOW_DAYS) -> pd.DataF
         return pd.DataFrame()
 
 # =========================
-# WEBPAGE FETCH + SUMMARIZE (best-effort, free)
+# IR DISCOVERY (heuristic)
 # =========================
 @st.cache_data(ttl=CACHE_TTL_WEBPAGE)
 def fetch_html(url: str, timeout=10) -> Optional[str]:
@@ -190,47 +231,6 @@ def fetch_html(url: str, timeout=10) -> Optional[str]:
     except Exception:
         return None
 
-def extract_main_text(html: str, max_chars: int = 20000) -> str:
-    soup = BeautifulSoup(html, "lxml")
-    for tag in soup(["script", "style", "noscript", "svg", "header", "footer", "nav", "aside"]):
-        tag.decompose()
-    text = soup.get_text(separator="\n")
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    text = "\n".join(lines)
-    return text[:max_chars]
-
-def summarize_text_simple(text: str, max_sentences: int = 5) -> str:
-    if not text or len(text) < 200:
-        return ""
-    sents = re.split(r"(?<=[\.\!\?])\s+", text)
-    sents = [s.strip() for s in sents if len(s.strip()) > 40]
-    if not sents:
-        return ""
-    words = re.findall(r"[A-Za-z]{3,}", text.lower())
-    if not words:
-        return ""
-    freq = {}
-    for w in words:
-        freq[w] = freq.get(w, 0) + 1
-    scores = []
-    for i, s in enumerate(sents[:200]):
-        ws = re.findall(r"[A-Za-z]{3,}", s.lower())
-        score = sum(freq.get(w, 0) for w in ws) / (1 + len(ws))
-        scores.append((score, i, s))
-    scores.sort(reverse=True, key=lambda x: x[0])
-    chosen = sorted(scores[:max_sentences], key=lambda x: x[1])
-    return " ".join([c[2] for c in chosen])
-
-def summarize_url(url: str) -> str:
-    html = fetch_html(url)
-    if not html:
-        return ""
-    text = extract_main_text(html)
-    return summarize_text_simple(text, max_sentences=5)
-
-# =========================
-# IR DISCOVERY (heuristic)
-# =========================
 def normalize_base_url(website: str) -> Optional[str]:
     if not website or not isinstance(website, str):
         return None
@@ -323,18 +323,15 @@ st.caption(f"Using: `{Path(universe_path).name}`")
 uni_raw = pd.read_csv(universe_path)
 uni, key_cols_present = normalize_universe_keep_original(uni_raw)
 
-# Sidebar filters
-st.sidebar.header("Filters")
-sector_list = sorted(uni["sector_norm"].dropna().unique().tolist())
-sector_sel = st.sidebar.multiselect("Sector", sector_list, default=sector_list)
-uni_f = uni[uni["sector_norm"].isin(sector_sel)].copy()
+# NOTE: removed the left sidebar filter entirely
+uni_f = uni.copy()
 
 tickers = uni_f["ticker_norm"].dropna().unique().tolist()[: int(max_stocks)]
 
 # =========================
-# 1) Universe key columns table
+# 1) Opportunity Set
 # =========================
-st.subheader("Universe (Your CSV Key Columns)")
+st.subheader("Opportunity Set")
 if key_cols_present:
     st.dataframe(uni_f[key_cols_present].copy(), use_container_width=True, height=320)
 else:
@@ -342,9 +339,9 @@ else:
     st.dataframe(uni_f.iloc[:, :12], use_container_width=True, height=320)
 
 # =========================
-# 2) Deep dive: indicators + catalysts ONLY
+# 2) Technical Analysis
 # =========================
-st.subheader("Deep Dive: Buy/Sell Indicators & Catalysts")
+st.subheader("Technical Analysis")
 
 ticker_sel = st.selectbox(
     "Select ticker",
@@ -370,33 +367,30 @@ close = df_t["Close"]
 high = df_t["High"] if "High" in df_t.columns else close
 low = df_t["Low"] if "Low" in df_t.columns else close
 
-# Technicals
-ema12 = ema(close, 12)
-ema26 = ema(close, 26)
-ema50 = ema(close, 50)
-ema200 = ema(close, 200)
+EMA_LIST = [5, 10, 20, 60, 120, 250]
+emas = {n: ema(close, n) for n in EMA_LIST}
 
 rsi14 = rsi_series(close, 14)
 macd_line, signal_line, hist = macd(close, 12, 26, 9)
 k_line, d_line, j_line = kdj(high, low, close, n=9, k=3, d=3)
+bb_mid, bb_up, bb_low = bollinger(close, window=20, num_std=2.0)
+adx_line, plus_di, minus_di = adx(high, low, close, n=14)
 
 # --- Price + EMAs
-price_df = pd.DataFrame({
-    "Date": close.index,
-    "Close": close.values,
-    "EMA12": ema12.values,
-    "EMA26": ema26.values,
-    "EMA50": ema50.values,
-    "EMA200": ema200.values,
-}).dropna()
+price_df = pd.DataFrame({"Date": close.index, "Close": close.values})
+for n in EMA_LIST:
+    price_df[f"EMA{n}"] = emas[n].values
+price_df = price_df.dropna()
 
 fig_price = go.Figure()
 fig_price.add_trace(go.Scatter(x=price_df["Date"], y=price_df["Close"], name="Close"))
-fig_price.add_trace(go.Scatter(x=price_df["Date"], y=price_df["EMA12"], name="EMA12"))
-fig_price.add_trace(go.Scatter(x=price_df["Date"], y=price_df["EMA26"], name="EMA26"))
-fig_price.add_trace(go.Scatter(x=price_df["Date"], y=price_df["EMA50"], name="EMA50"))
-fig_price.add_trace(go.Scatter(x=price_df["Date"], y=price_df["EMA200"], name="EMA200"))
-fig_price.update_layout(title=f"{ticker_sel} — Price & EMAs", height=420, legend=dict(orientation="h"))
+for n in EMA_LIST:
+    fig_price.add_trace(go.Scatter(x=price_df["Date"], y=price_df[f"EMA{n}"], name=f"EMA{n}"))
+fig_price.update_layout(
+    title=f"{ticker_sel} — Price & EMAs (5/10/20/60/120/250)",
+    height=440,
+    legend=dict(orientation="h")
+)
 st.plotly_chart(fig_price, use_container_width=True)
 
 # --- RSI
@@ -432,24 +426,156 @@ fig_kdj = px.line(kdj_df, x="Date", y=["K", "D", "J"], title="KDJ(9,3,3)")
 fig_kdj.update_layout(height=320)
 st.plotly_chart(fig_kdj, use_container_width=True)
 
-# =========================
-# Catalysts: News + summaries
-# =========================
-st.markdown("### Catalysts: Recent News")
+# --- Bollinger Bands
+bb_df = pd.DataFrame({
+    "Date": close.index,
+    "Close": close.values,
+    "BB_Mid": bb_mid.values,
+    "BB_Up": bb_up.values,
+    "BB_Low": bb_low.values,
+}).dropna()
 
-news_df = fetch_google_news_rss(ticker_sel, days=NEWS_WINDOW_DAYS)
-summarize = st.checkbox("Try summarizing linked articles (best-effort; can be slow / blocked)", value=False)
+fig_bb = go.Figure()
+fig_bb.add_trace(go.Scatter(x=bb_df["Date"], y=bb_df["Close"], name="Close"))
+fig_bb.add_trace(go.Scatter(x=bb_df["Date"], y=bb_df["BB_Mid"], name="BB Mid"))
+fig_bb.add_trace(go.Scatter(x=bb_df["Date"], y=bb_df["BB_Up"], name="BB Upper"))
+fig_bb.add_trace(go.Scatter(x=bb_df["Date"], y=bb_df["BB_Low"], name="BB Lower"))
+fig_bb.update_layout(title="Bollinger Bands (20, 2)", height=320, legend=dict(orientation="h"))
+st.plotly_chart(fig_bb, use_container_width=True)
+
+# --- ADX + DI
+adx_df = pd.DataFrame({
+    "Date": close.index,
+    "ADX": adx_line.values,
+    "DI+": plus_di.values,
+    "DI-": minus_di.values,
+}).dropna()
+
+fig_adx = px.line(adx_df, x="Date", y=["ADX", "DI+", "DI-"], title="ADX(14) + DI+/DI-")
+fig_adx.update_layout(height=320)
+st.plotly_chart(fig_adx, use_container_width=True)
+
+# =========================
+# Indicator Scoring Table (below charts)
+# =========================
+def _last(s: pd.Series) -> float:
+    s2 = s.dropna()
+    return float(s2.iloc[-1]) if len(s2) else np.nan
+
+last_close = float(close.iloc[-1])
+ema_vals = {n: _last(emas[n]) for n in EMA_LIST}
+
+stack_ok = (all(pd.notna(ema_vals[n]) for n in EMA_LIST) and
+            (ema_vals[5] > ema_vals[10] > ema_vals[20] > ema_vals[60] > ema_vals[120] > ema_vals[250]))
+stack_bad = (all(pd.notna(ema_vals[n]) for n in EMA_LIST) and
+             (ema_vals[5] < ema_vals[10] < ema_vals[20] < ema_vals[60] < ema_vals[120] < ema_vals[250]))
+ema_stack_score = 1.0 if stack_ok else (-1.0 if stack_bad else 0.0)
+
+ema_cross_score = 0.0
+if pd.notna(ema_vals[5]) and pd.notna(ema_vals[20]):
+    ema_cross_score = 1.0 if ema_vals[5] > ema_vals[20] else -1.0
+
+rsi_last = _last(rsi14)
+rsi_score = 0.0
+if pd.notna(rsi_last):
+    if rsi_last <= 30:
+        rsi_score = 1.0
+    elif rsi_last >= 70:
+        rsi_score = -1.0
+    else:
+        rsi_score = clamp_score((50 - rsi_last) / 20.0)
+
+macd_last = _last(macd_line)
+sig_last = _last(signal_line)
+hist_last = _last(hist)
+macd_score = 0.0
+if pd.notna(macd_last) and pd.notna(sig_last):
+    direction = 1.0 if macd_last > sig_last else -1.0
+    denom = (abs(macd_last) + 1e-9)
+    macd_score = clamp_score(direction * min(1.0, abs(hist_last) / denom))
+
+k_last, d_last = _last(k_line), _last(d_line)
+kdj_score = 0.0
+if pd.notna(k_last) and pd.notna(d_last):
+    base = 1.0 if k_last > d_last else -1.0
+    if k_last < 20 and base > 0:
+        kdj_score = 1.0
+    elif k_last > 80 and base < 0:
+        kdj_score = -1.0
+    else:
+        kdj_score = 0.5 * base
+
+bb_up_last, bb_low_last = _last(bb_up), _last(bb_low)
+bb_score = 0.0
+if pd.notna(bb_up_last) and pd.notna(bb_low_last):
+    if last_close < bb_low_last:
+        bb_score = 1.0
+    elif last_close > bb_up_last:
+        bb_score = -1.0
+    else:
+        bb_score = 0.0
+
+adx_last = _last(adx_line)
+pdi_last, mdi_last = _last(plus_di), _last(minus_di)
+adx_score = 0.0
+if pd.notna(adx_last) and pd.notna(pdi_last) and pd.notna(mdi_last):
+    if adx_last >= 25:
+        adx_score = 1.0 if pdi_last > mdi_last else -1.0
+    else:
+        adx_score = 0.0
+
+scores = [
+    ("EMA Stack (5>10>20>60>120>250)", ema_stack_score),
+    ("EMA Cross (5 vs 20)", ema_cross_score),
+    ("RSI(14)", rsi_score),
+    ("MACD(12,26,9)", macd_score),
+    ("KDJ(9,3,3)", kdj_score),
+    ("Bollinger(20,2)", bb_score),
+    ("ADX(14) + DI", adx_score),
+]
+composite = float(np.mean([s for _, s in scores])) if scores else 0.0
+
+st.markdown("### Indicator Scores (Buy/Sell)")
+score_table = pd.DataFrame(
+    [{"Indicator": name, "Score (-1..+1)": float(sc), "Signal": score_to_label(float(sc))} for name, sc in scores]
+)
+score_table = pd.concat(
+    [score_table, pd.DataFrame([{
+        "Indicator": "Composite (mean of above)",
+        "Score (-1..+1)": composite,
+        "Signal": score_to_label(composite),
+    }])],
+    ignore_index=True
+)
+
+st.dataframe(
+    score_table.style.format({"Score (-1..+1)": "{:.2f}"}),
+    use_container_width=True
+)
+
+# =========================
+# News Sentiment (no summarization)
+# =========================
+st.markdown("### News Sentiment")
+
+window_label = st.selectbox("News window", ["1w", "2w", "1m", "3m"], index=0)
+window_days = {"1w": 7, "2w": 14, "1m": 30, "3m": 90}[window_label]
+
+news_df = fetch_google_news_rss(ticker_sel, days=window_days)
 
 if news_df is None or news_df.empty:
     st.write("No recent RSS news found.")
 else:
     news_df["time"] = pd.to_datetime(news_df["time"], utc=True, errors="coerce")
-    cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=NEWS_RECENT_DAYS)
-    recent = news_df[news_df["time"] >= cutoff].copy()
-    if recent.empty:
-        recent = news_df.head(12).copy()
-    else:
-        recent = recent.head(12)
+    cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=window_days)
+    recent = news_df[news_df["time"] >= cutoff].copy().head(30)
+
+    pols = [sentiment_polarity(str(t)) for t in recent["title"].tolist()]
+    avg_pol = float(np.mean(pols)) if pols else 0.0
+
+    n1, n2 = st.columns(2)
+    n1.metric("Headline count", f"{len(recent)}")
+    n2.metric("Avg headline polarity (TextBlob)", f"{avg_pol:+.2f}")
 
     for _, n in recent.iterrows():
         t = n.get("time")
@@ -458,21 +584,12 @@ else:
         link = str(n.get("link", ""))
         src = str(n.get("source", ""))
         pol = sentiment_polarity(title)
-
-        st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_ | headline polarity: `{pol:+.2f}`")
-
-        if summarize and link.startswith("http"):
-            with st.spinner("Fetching & summarizing…"):
-                summ = summarize_url(link)
-            if summ:
-                st.caption(summ)
-            else:
-                st.caption("Summary unavailable (blocked / non-HTML / parsing failed).")
+        st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_ | polarity: `{pol:+.2f}`")
 
 # =========================
-# Catalysts: Investor Relations
+# Investor Relations (no summarization)
 # =========================
-st.markdown("### Catalysts: Investor Relations (Official Site)")
+st.markdown("### Investor Relations")
 
 website = info.get("website", "")
 base = normalize_base_url(website)
