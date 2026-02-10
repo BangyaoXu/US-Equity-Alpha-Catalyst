@@ -27,7 +27,7 @@ from textblob import TextBlob
 st.set_page_config(layout="wide", page_title="US Equity Alpha & Catalyst Dashboard")
 
 UNIVERSE_GLOB = "selected_universe_*.csv"
-DEFAULT_PRICE_PERIOD = "2y"   # for tech indicators like EMA250
+DEFAULT_PRICE_PERIOD = "2y"
 DEFAULT_PRICE_INTERVAL = "1d"
 
 CACHE_TTL_PRICES = 60 * 60
@@ -35,190 +35,17 @@ CACHE_TTL_META = 60 * 60
 CACHE_TTL_NEWS = 30 * 60
 CACHE_TTL_INDICATORS = 60 * 60
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome Safari"
+)
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": USER_AGENT})
 
 # =========================
 # UTILITIES
 # =========================
-
-def normalize_sec_ticker(t: str) -> str:
-    t = (t or "").upper().strip()
-    return t.replace(".", "-")  # BRK.B -> BRK-B
-
-def _sec_headers() -> Dict[str, str]:
-    """
-    SEC requires a descriptive User-Agent. On Streamlit Cloud, you MUST include an email.
-    Put SEC_CONTACT in Streamlit secrets.
-    """
-    contact = ""
-    try:
-        contact = st.secrets.get("SEC_CONTACT", "")
-    except Exception:
-        contact = ""
-
-    ua = USER_AGENT
-    if contact and contact not in ua:
-        ua = f"{USER_AGENT} ({contact})"
-    return {
-        "User-Agent": ua,
-        "Accept-Encoding": "gzip, deflate",
-        "Accept": "application/json,text/html,*/*",
-    }
-
-@st.cache_data(ttl=24 * 60 * 60)
-def fetch_sec_ticker_map_safe() -> pd.DataFrame:
-    """
-    Same as before but returns empty DataFrame on any failure.
-    """
-    SEC_TICKER_MAP_URLS = [
-        "https://www.sec.gov/files/company_tickers.json",
-        "https://www.sec.gov/files/company_tickers_exchange.json",
-    ]
-    for url in SEC_TICKER_MAP_URLS:
-        try:
-            r = requests.get(url, headers=_sec_headers(), timeout=25)
-            if not (200 <= r.status_code < 300):
-                continue
-            data = r.json()
-            rows = []
-            if isinstance(data, dict):
-                for _, obj in data.items():
-                    t = str(obj.get("ticker", "")).upper().strip()
-                    cik = obj.get("cik_str", obj.get("cik", None))
-                    title = obj.get("title", obj.get("name", ""))
-                    if t and cik is not None:
-                        rows.append({"ticker": t, "cik": int(cik), "title": title})
-            elif isinstance(data, list):
-                for obj in data:
-                    t = str(obj.get("ticker", "")).upper().strip()
-                    cik = obj.get("cik_str", obj.get("cik", None))
-                    title = obj.get("title", obj.get("name", ""))
-                    if t and cik is not None:
-                        rows.append({"ticker": t, "cik": int(cik), "title": title})
-            df = pd.DataFrame(rows).drop_duplicates(subset=["ticker"])
-            if not df.empty:
-                return df
-        except Exception:
-            continue
-    return pd.DataFrame(columns=["ticker", "cik", "title"])
-
-def cik10(cik_int: int) -> str:
-    return str(int(cik_int)).zfill(10)
-
-@st.cache_data(ttl=CACHE_TTL_META)
-def fetch_sec_submissions_safe(cik_int: int) -> Dict:
-    url = f"https://data.sec.gov/submissions/CIK{cik10(cik_int)}.json"
-    try:
-        r = requests.get(url, headers=_sec_headers(), timeout=25)
-        if not (200 <= r.status_code < 300):
-            return {"_http_status": r.status_code, "_url": url}
-        return r.json() or {}
-    except Exception as e:
-        return {"_error": str(e), "_url": url}
-
-def _filing_doc_url(cik_int: int, accession: str, primary_doc: str) -> str:
-    acc_nodash = accession.replace("-", "")
-    return f"https://www.sec.gov/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{primary_doc}"
-
-def _ixviewer_url(doc_url: str) -> str:
-    return f"https://www.sec.gov/ixviewer/documents/?doc={requests.utils.quote(doc_url)}"
-
-@st.cache_data(ttl=CACHE_TTL_META)
-def sec_lookup_cik_fallback_companyfacts(ticker: str) -> Optional[int]:
-    """
-    Fallback CIK lookup: queries SEC companyfacts using CIK candidates from ticker map
-    is NOT possible without a CIK, so this is a weak fallback; we instead try:
-      - use ticker map first
-      - if ticker map fails, return None (cannot infer CIK reliably without external DB)
-    Kept for structure; most fixes come from proper UA + normalization.
-    """
-    return None
-
-def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None, limit: int = 8) -> pd.DataFrame:
-    """
-    Robust version:
-      - normalizes ticker (BRK.B -> BRK-B)
-      - uses safe map/submissions fetch
-      - returns empty DF on any failure (no exceptions)
-    """
-    t_norm = normalize_sec_ticker(ticker)
-    m = fetch_sec_ticker_map_safe()
-    if m.empty:
-        return pd.DataFrame()
-
-    hit = m[m["ticker"] == t_norm].head(1)
-    if hit.empty and t_norm != ticker.upper():
-        hit = m[m["ticker"] == ticker.upper()].head(1)
-    if hit.empty:
-        return pd.DataFrame()
-
-    cik_int = int(hit["cik"].iloc[0])
-
-    # polite throttle to reduce 429s on Cloud
-    time.sleep(0.15)
-
-    sub = fetch_sec_submissions_safe(cik_int)
-    recent = (((sub or {}).get("filings") or {}).get("recent") or {})
-    if not recent:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(recent)
-    if df.empty:
-        return pd.DataFrame()
-
-    keep = [c for c in ["filingDate", "reportDate", "acceptanceDateTime", "form", "accessionNumber", "primaryDocument"] if c in df.columns]
-    df = df[keep].copy()
-    df["filingDate"] = pd.to_datetime(df.get("filingDate"), errors="coerce")
-
-    if forms:
-        df = df[df["form"].isin(forms)]
-
-    df = df.sort_values("filingDate", ascending=False).head(limit)
-
-    def make_link(row):
-        doc = str(row.get("primaryDocument", "") or "")
-        acc = str(row.get("accessionNumber", "") or "")
-        if not doc or not acc:
-            return ""
-        doc_url = _filing_doc_url(cik_int, acc, doc)
-        return _ixviewer_url(doc_url)
-
-    df["link"] = df.apply(make_link, axis=1)
-    df.insert(0, "ticker", ticker.upper())
-    df.insert(1, "cik", cik_int)
-    return df
-
-def nearest_earnings_catalyst(df: pd.DataFrame) -> Optional[pd.Timestamp]:
-    """
-    Bulletproof tz handling:
-    - Parses to UTC-aware
-    - Converts to UTC-naive
-    - Compares using numpy datetime64[ns]
-    """
-    if df is None or df.empty or "earnings_date" not in df.columns:
-        return None
-
-    dts = pd.to_datetime(df["earnings_date"], errors="coerce", utc=True).dropna()
-    if len(dts) == 0:
-        return None
-
-    # Series -> tz-naive UTC
-    try:
-        dts = dts.dt.tz_convert("UTC").dt.tz_localize(None)
-    except Exception:
-        dts = pd.to_datetime(dts, errors="coerce").dropna()
-
-    if len(dts) == 0:
-        return None
-
-    dts64 = dts.astype("datetime64[ns]").to_numpy()
-    now64 = np.datetime64(pd.Timestamp.utcnow().to_datetime64())
-
-    future = dts64[dts64 >= now64]
-    if future.size > 0:
-        return pd.Timestamp(future.min())
-    return pd.Timestamp(dts64.max())
-
 def parse_universe_date_from_filename(fn: str) -> Optional[str]:
     m = re.search(r"selected_universe_(\d{4}-\d{2}-\d{2})\.csv$", fn)
     return m.group(1) if m else None
@@ -273,14 +100,8 @@ def safe_last(x: pd.Series) -> float:
         return float("nan")
 
 def get_ohlc_from_panel(px_panel: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """
-    yfinance.download with group_by='ticker' returns MultiIndex columns:
-      first level ticker, second level OHLCV.
-    For single ticker, sometimes it returns single-index OHLCV.
-    """
     if px_panel is None or getattr(px_panel, "empty", True):
         return pd.DataFrame()
-
     if isinstance(px_panel.columns, pd.MultiIndex):
         if ticker in px_panel.columns.levels[0]:
             df = px_panel[ticker].copy()
@@ -292,7 +113,6 @@ def get_ohlc_from_panel(px_panel: pd.DataFrame, ticker: str) -> pd.DataFrame:
                 df.columns = [str(c) for c in df.columns]
                 return df
         return pd.DataFrame()
-
     df = px_panel.copy()
     df.columns = [str(c) for c in df.columns]
     return df
@@ -327,44 +147,61 @@ def normalize_universe_keep_original(df: pd.DataFrame) -> Tuple[pd.DataFrame, Li
         if c and c not in present:
             present.append(c)
 
-    canonical = {
-        "company": company_col or "",
-        "ticker": ticker_col,
-        "sector": sector_col or "",
-        "industry": industry_col or "",
-    }
+    canonical = {"company": company_col or "", "ticker": ticker_col, "sector": sector_col or "", "industry": industry_col or ""}
     return df, present, canonical
 
 # =========================
-# FREE SECTOR-INDICATOR ENGINE (best-effort)
+# SECTOR INDICATORS (FRED + market proxies)
 # =========================
 def _fred_csv_url(series_id: str) -> str:
     return f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={requests.utils.quote(series_id)}"
 
+def _get_text(url: str, timeout: int = 25, retries: int = 3) -> Optional[str]:
+    """
+    Robust GET for CSV-ish endpoints on Streamlit Cloud.
+    Avoids strict Content-Type checks. Retries on 403/429/5xx.
+    """
+    last = None
+    for i in range(retries):
+        try:
+            r = SESSION.get(url, timeout=timeout, headers={"Accept": "text/csv,*/*"})
+            last = r
+            if 200 <= r.status_code < 300 and r.text and len(r.text) > 20:
+                return r.text
+            if r.status_code in (403, 429, 500, 502, 503, 504):
+                time.sleep(0.6 * (2 ** i))
+                continue
+            return None
+        except Exception:
+            time.sleep(0.6 * (2 ** i))
+            continue
+    # last resort: one plain requests.get without our session
+    try:
+        r = requests.get(url, timeout=timeout)
+        if 200 <= r.status_code < 300 and r.text and len(r.text) > 20:
+            return r.text
+    except Exception:
+        pass
+    return None
+
 @st.cache_data(ttl=CACHE_TTL_INDICATORS)
 def fetch_fred_series(series_id: str) -> pd.DataFrame:
-    """Free, no-key: FRED CSV endpoint. Defensive: returns empty on HTTP errors."""
-    url = _fred_csv_url(series_id)
+    """
+    Free, no-key FRED via fredgraph.csv.
+    This version is hardened for Streamlit Cloud:
+      - no Content-Type gating
+      - retries on throttling
+      - na_values '.' support
+    """
+    text = _get_text(_fred_csv_url(series_id))
+    if not text:
+        return pd.DataFrame(columns=["date", "value"])
     try:
-        r = requests.get(
-            url,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": "text/csv,*/*",
-                "Referer": "https://fred.stlouisfed.org/",
-            },
-            timeout=20,
-        )
-        if not (200 <= r.status_code < 300):
-            return pd.DataFrame(columns=["date", "value"])
-
-        df = pd.read_csv(StringIO(r.text), na_values=["."])
+        df = pd.read_csv(StringIO(text), na_values=["."])
         if df is None or df.empty:
             return pd.DataFrame(columns=["date", "value"])
-
         date_col = "DATE" if "DATE" in df.columns else df.columns[0]
         val_col = series_id if series_id in df.columns else df.columns[1]
-
         out = df[[date_col, val_col]].copy()
         out.columns = ["date", "value"]
         out["date"] = pd.to_datetime(out["date"], errors="coerce")
@@ -376,10 +213,6 @@ def fetch_fred_series(series_id: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=CACHE_TTL_INDICATORS)
 def fetch_yf_series(symbol: str, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
-    """
-    yfinance (best-effort). Returns columns: ['date','value'].
-    If yfinance is blocked/rate-limited on Streamlit Cloud, caller should fallback (Stooq).
-    """
     try:
         px = yf.download(
             symbol,
@@ -387,14 +220,12 @@ def fetch_yf_series(symbol: str, period: str = "5y", interval: str = "1d") -> pd
             interval=interval,
             auto_adjust=True,
             progress=False,
-            threads=False,  # more stable on Streamlit Cloud
+            threads=False,
         )
     except Exception:
         return pd.DataFrame(columns=["date", "value"])
-
     if px is None or px.empty:
         return pd.DataFrame(columns=["date", "value"])
-
     px.columns = [str(c) for c in px.columns]
     if "Close" not in px.columns:
         for alt in ["Adj Close", "AdjClose", "close", "CLOSE"]:
@@ -403,36 +234,32 @@ def fetch_yf_series(symbol: str, period: str = "5y", interval: str = "1d") -> pd
                 break
     if "Close" not in px.columns:
         return pd.DataFrame(columns=["date", "value"])
-
     px = px.dropna(subset=["Close"])
     if px.empty:
         return pd.DataFrame(columns=["date", "value"])
-
     out = px[["Close"]].copy().reset_index()
     date_col = "Date" if "Date" in out.columns else out.columns[0]
     out = out.rename(columns={date_col: "date", "Close": "value"})
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
     out["value"] = pd.to_numeric(out["value"], errors="coerce")
-    return out.dropna(subset=["date"]).sort_values("date")
+    return out.dropna(subset=["date", "value"]).sort_values("date")
 
 @st.cache_data(ttl=CACHE_TTL_INDICATORS)
 def fetch_stooq_series(symbol: str) -> pd.DataFrame:
     """
-    Free, no-key fallback via Stooq daily CSV.
-    Stooq symbols look like: 'spy.us', 'qqq.us', 'soxx.us', 'vixy.us', 'gld.us'
-    Returns columns: ['date','value'].
+    Free fallback (daily) from Stooq for ETF proxies (works well on Streamlit Cloud).
     """
+    url = f"https://stooq.com/q/d/l/?s={requests.utils.quote(symbol.lower())}&i=d"
+    text = _get_text(url)
+    if not text:
+        return pd.DataFrame(columns=["date", "value"])
     try:
-        url = f"https://stooq.com/q/d/l/?s={requests.utils.quote(symbol.lower())}&i=d"
-        r = requests.get(url, headers={"User-Agent": USER_AGENT, "Accept": "text/csv,*/*"}, timeout=20)
-        if not (200 <= r.status_code < 300):
-            return pd.DataFrame(columns=["date", "value"])
-        df = pd.read_csv(StringIO(r.text))
+        df = pd.read_csv(StringIO(text))
         if df is None or df.empty:
             return pd.DataFrame(columns=["date", "value"])
         cols = {c.lower(): c for c in df.columns}
         date_c = cols.get("date", df.columns[0])
-        close_c = cols.get("close", None)
+        close_c = cols.get("close")
         if close_c is None:
             return pd.DataFrame(columns=["date", "value"])
         out = df[[date_c, close_c]].copy()
@@ -448,102 +275,64 @@ def infer_sector_bucket(zacks_sector: str) -> str:
     s = (zacks_sector or "").strip().lower()
     if not s:
         return "General"
-
     rules = [
-        ("health", "Healthcare"),
-        ("medical", "Healthcare"),
-        ("bio", "Healthcare"),
-
-        ("tech", "Technology"),
-        ("computer", "Technology"),
-        ("software", "Technology"),
-        ("semiconductor", "Technology"),
-
-        ("energy", "Energy"),
-        ("oil", "Energy"),
-        ("gas", "Energy"),
-
-        ("basic", "Basic Materials"),
-        ("material", "Basic Materials"),
-        ("metal", "Basic Materials"),
-        ("mining", "Basic Materials"),
-        ("chemical", "Basic Materials"),
-
-        ("finance", "Financials"),
-        ("bank", "Financials"),
-        ("insurance", "Financials"),
-
+        ("health", "Healthcare"), ("medical", "Healthcare"), ("bio", "Healthcare"),
+        ("tech", "Technology"), ("computer", "Technology"), ("software", "Technology"), ("semiconductor", "Technology"),
+        ("energy", "Energy"), ("oil", "Energy"), ("gas", "Energy"),
+        ("basic", "Basic Materials"), ("material", "Basic Materials"), ("metal", "Basic Materials"),
+        ("mining", "Basic Materials"), ("chemical", "Basic Materials"),
+        ("finance", "Financials"), ("bank", "Financials"), ("insurance", "Financials"),
         ("utility", "Utilities"),
-
-        ("real estate", "Real Estate"),
-        ("reit", "Real Estate"),
-
-        ("consumer staples", "Consumer Staples"),
-        ("staples", "Consumer Staples"),
-
-        ("consumer discretionary", "Consumer Discretionary"),
-        ("retail", "Consumer Discretionary"),
-        ("wholesale", "Consumer Discretionary"),
-        ("auto", "Consumer Discretionary"),
-
-        ("industrial", "Industrials"),
-        ("transport", "Industrials"),
-        ("construction", "Industrials"),
-        ("aerospace", "Industrials"),
-
-        ("telecom", "Communication Services"),
-        ("communication", "Communication Services"),
-        ("media", "Communication Services"),
-        ("entertain", "Communication Services"),
+        ("real estate", "Real Estate"), ("reit", "Real Estate"),
+        ("consumer staples", "Consumer Staples"), ("staples", "Consumer Staples"),
+        ("consumer discretionary", "Consumer Discretionary"), ("retail", "Consumer Discretionary"),
+        ("wholesale", "Consumer Discretionary"), ("auto", "Consumer Discretionary"),
+        ("industrial", "Industrials"), ("transport", "Industrials"), ("construction", "Industrials"), ("aerospace", "Industrials"),
+        ("telecom", "Communication Services"), ("communication", "Communication Services"), ("media", "Communication Services"), ("entertain", "Communication Services"),
     ]
     for key, bucket in rules:
         if key in s:
             return bucket
     return "General"
 
-# Indicator catalog:
-# - source: "fred" or "yfinance" or "computed"
-# - id: series id / symbol
-# - stooq: stooq symbol for fallback where possible
-# - bullish: "higher" or "lower"
 INDICATORS: Dict[str, Dict] = {
-    # General / cross-sector (avoid caret indices; use ETF proxies + Stooq fallback)
+    # Proxies use ETFs (more reliable than ^GSPC/^NDX on Cloud) + Stooq fallback
     "SP500": {"name": "S&P 500 (SPY)", "source": "yfinance", "id": "SPY", "stooq": "spy.us", "bullish": "higher"},
-    "VIX": {"name": "VIX (VIXY proxy)", "source": "yfinance", "id": "VIXY", "stooq": "vixy.us", "bullish": "lower"},
+    "VIX": {"name": "VIX proxy (VIXY)", "source": "yfinance", "id": "VIXY", "stooq": "vixy.us", "bullish": "lower"},
     "DXY": {"name": "Broad USD Index (FRED)", "source": "fred", "id": "DTWEXBGS", "bullish": "lower"},
-    "UST10Y": {"name": "10Y Treasury Yield", "source": "fred", "id": "DGS10", "bullish": "lower"},
-    "UST2Y": {"name": "2Y Treasury Yield", "source": "fred", "id": "DGS2", "bullish": "lower"},
+    "UST10Y": {"name": "10Y Treasury Yield (FRED)", "source": "fred", "id": "DGS10", "bullish": "lower"},
+    "UST2Y": {"name": "2Y Treasury Yield (FRED)", "source": "fred", "id": "DGS2", "bullish": "lower"},
     "YC_10_2": {"name": "Yield Curve (10Y-2Y, bp)", "source": "computed", "id": "DGS10-DGS2", "bullish": "higher"},
 
     # Industrials
-    "ISM_PMI": {"name": "ISM Manufacturing PMI", "source": "fred", "id": "NAPM", "bullish": "higher"},
-    "INDPRO": {"name": "Industrial Production Index", "source": "fred", "id": "INDPRO", "bullish": "higher"},
-    "DGORDER": {"name": "Durable Goods Orders", "source": "fred", "id": "DGORDER", "bullish": "higher"},
+    "ISM_PMI": {"name": "ISM Manufacturing PMI (FRED NAPM)", "source": "fred", "id": "NAPM", "bullish": "higher"},
+    "INDPRO": {"name": "Industrial Production Index (FRED)", "source": "fred", "id": "INDPRO", "bullish": "higher"},
+    "DGORDER": {"name": "Durable Goods Orders (FRED)", "source": "fred", "id": "DGORDER", "bullish": "higher"},
 
     # Consumer
-    "UMCSENT": {"name": "U. Michigan Consumer Sentiment", "source": "fred", "id": "UMCSENT", "bullish": "higher"},
-    "RSAFS": {"name": "Retail Sales (Total)", "source": "fred", "id": "RSAFS", "bullish": "higher"},
-    "CPIAUCSL": {"name": "CPI (Inflation)", "source": "fred", "id": "CPIAUCSL", "bullish": "lower"},
+    "UMCSENT": {"name": "U. Michigan Consumer Sentiment (FRED)", "source": "fred", "id": "UMCSENT", "bullish": "higher"},
+    "RSAFS": {"name": "Retail Sales (FRED)", "source": "fred", "id": "RSAFS", "bullish": "higher"},
+    "CPIAUCSL": {"name": "CPI (FRED)", "source": "fred", "id": "CPIAUCSL", "bullish": "lower"},
 
     # Real estate
-    "MORTGAGE30US": {"name": "30Y Mortgage Rate", "source": "fred", "id": "MORTGAGE30US", "bullish": "lower"},
-    "HOUST": {"name": "Housing Starts", "source": "fred", "id": "HOUST", "bullish": "higher"},
-    "CSUSHPINSA": {"name": "Case-Shiller Home Price Index", "source": "fred", "id": "CSUSHPINSA", "bullish": "higher"},
+    "MORTGAGE30US": {"name": "30Y Mortgage Rate (FRED)", "source": "fred", "id": "MORTGAGE30US", "bullish": "lower"},
+    "HOUST": {"name": "Housing Starts (FRED)", "source": "fred", "id": "HOUST", "bullish": "higher"},
+    "CSUSHPINSA": {"name": "Case-Shiller HPI (FRED)", "source": "fred", "id": "CSUSHPINSA", "bullish": "higher"},
 
-    # Energy / Materials (FRED commodities)
-    "WTI": {"name": "WTI Spot ($/bbl) (FRED)", "source": "fred", "id": "DCOILWTICO", "bullish": "higher"},
-    "BRENT": {"name": "Brent Spot ($/bbl) (FRED)", "source": "fred", "id": "DCOILBRENTEU", "bullish": "higher"},
-    "NATGAS": {"name": "Nat Gas Henry Hub ($/MMBtu) (FRED)", "source": "fred", "id": "DHHNGSP", "bullish": "higher"},
-    "COPPER": {"name": "Copper Global ($/mt) (FRED)", "source": "fred", "id": "PCOPPUSDM", "bullish": "higher"},
-    "ALUMINUM": {"name": "Aluminum Global ($/mt) (FRED)", "source": "fred", "id": "PALUMUSDM", "bullish": "higher"},
+    # Commodities (FRED)
+    "WTI": {"name": "WTI Spot (FRED)", "source": "fred", "id": "DCOILWTICO", "bullish": "higher"},
+    "BRENT": {"name": "Brent Spot (FRED)", "source": "fred", "id": "DCOILBRENTEU", "bullish": "higher"},
+    "NATGAS": {"name": "Nat Gas (FRED)", "source": "fred", "id": "DHHNGSP", "bullish": "higher"},
+    "COPPER": {"name": "Copper (FRED)", "source": "fred", "id": "PCOPPUSDM", "bullish": "higher"},
+    "ALUMINUM": {"name": "Aluminum (FRED)", "source": "fred", "id": "PALUMUSDM", "bullish": "higher"},
     "GOLD": {"name": "Gold (GLD)", "source": "yfinance", "id": "GLD", "stooq": "gld.us", "bullish": "higher"},
 
     # Financials
-    "CREDIT_SPREAD": {"name": "BBB Corporate Spread (proxy)", "source": "fred", "id": "BAA10Y", "bullish": "lower"},
-    "UNRATE": {"name": "Unemployment Rate", "source": "fred", "id": "UNRATE", "bullish": "lower"},
-    "FEDFUNDS": {"name": "Fed Funds Rate", "source": "fred", "id": "FEDFUNDS", "bullish": "lower"},
+    "CREDIT_SPREAD": {"name": "BAA-10Y (FRED)", "source": "fred", "id": "BAA10Y", "bullish": "lower"},
+    "UNRATE": {"name": "Unemployment Rate (FRED)", "source": "fred", "id": "UNRATE", "bullish": "lower"},
+    "FEDFUNDS": {"name": "Fed Funds (FRED)", "source": "fred", "id": "FEDFUNDS", "bullish": "lower"},
 
-    # Tech / chip cycle proxies
+    # Tech proxies
     "SOX": {"name": "Semis (SOXX)", "source": "yfinance", "id": "SOXX", "stooq": "soxx.us", "bullish": "higher"},
     "NDX": {"name": "Nasdaq-100 (QQQ)", "source": "yfinance", "id": "QQQ", "stooq": "qqq.us", "bullish": "higher"},
 }
@@ -567,10 +356,10 @@ def compute_curve_10_2() -> pd.DataFrame:
     d10 = fetch_fred_series("DGS10")
     d2 = fetch_fred_series("DGS2")
     if d10.empty or d2.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["date", "value"])
     df = pd.merge(d10, d2, on="date", how="inner", suffixes=("_10", "_2"))
-    df["value"] = (df["value_10"] - df["value_2"]) * 100.0  # bp
-    return df[["date", "value"]]
+    df["value"] = (df["value_10"] - df["value_2"]) * 100.0
+    return df[["date", "value"]].dropna()
 
 @st.cache_data(ttl=CACHE_TTL_INDICATORS)
 def fetch_indicator_series(ind_key: str) -> pd.DataFrame:
@@ -590,24 +379,20 @@ def fetch_indicator_series(ind_key: str) -> pd.DataFrame:
         stooq_id = cfg.get("stooq", "")
         if stooq_id:
             return fetch_stooq_series(stooq_id)
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["date", "value"])
 
-    return pd.DataFrame()
+    return pd.DataFrame(columns=["date", "value"])
 
 def indicator_snapshot(df: pd.DataFrame) -> Dict[str, float]:
-    """latest, 1w change, 1m change, zscore(≈1y)"""
     if df is None or df.empty:
         return {"latest": np.nan, "chg_1w": np.nan, "chg_1m": np.nan, "z_1y": np.nan}
-
-    s = df.dropna(subset=["date", "value"]).copy().sort_values("date")
+    s = df.dropna(subset=["date", "value"]).sort_values("date")
     if s.empty:
         return {"latest": np.nan, "chg_1w": np.nan, "chg_1m": np.nan, "z_1y": np.nan}
-
     latest = float(s["value"].iloc[-1])
     v = s["value"].values
     chg_1w = latest - float(v[-6]) if len(v) >= 6 else np.nan
     chg_1m = latest - float(v[-22]) if len(v) >= 22 else np.nan
-
     tail = s.tail(260)
     mu = tail["value"].mean()
     sd = tail["value"].std(ddof=0)
@@ -625,21 +410,20 @@ def indicator_signal(cfg: Dict, snap: Dict[str, float]) -> Tuple[str, float]:
     return (label, float(score))
 
 # =========================
-# DATA FETCH
+# DATA FETCH (prices/meta/news)
 # =========================
 @st.cache_data(ttl=CACHE_TTL_PRICES)
 def fetch_prices_panel(tickers: List[str], period: str = DEFAULT_PRICE_PERIOD, interval: str = DEFAULT_PRICE_INTERVAL) -> pd.DataFrame:
     try:
-        px_panel = yf.download(
+        return yf.download(
             tickers=tickers,
             period=period,
             interval=interval,
             auto_adjust=True,
             group_by="ticker",
-            threads=False,  # Cloud stability
+            threads=False,
             progress=False,
         )
-        return px_panel
     except Exception:
         return pd.DataFrame()
 
@@ -649,34 +433,6 @@ def fetch_info_one(ticker: str) -> Dict:
         return yf.Ticker(ticker).info or {}
     except Exception:
         return {}
-
-@st.cache_data(ttl=CACHE_TTL_META)
-def fetch_earnings_calendar_fallback_info(ticker: str) -> pd.DataFrame:
-    """
-    Fallback: try earningsTimestamp / earningsTimestampStart / earningsTimestampEnd from yfinance .info.
-    Returns a df with 'earnings_date' column.
-    """
-    try:
-        info = fetch_info_one(ticker) or {}
-        keys = ["earningsTimestamp", "earningsTimestampStart", "earningsTimestampEnd"]
-        dts = []
-        for k in keys:
-            v = info.get(k, None)
-            if v is None:
-                continue
-            if isinstance(v, (list, tuple)):
-                for vv in v:
-                    if isinstance(vv, (int, float)) and vv > 0:
-                        dts.append(pd.to_datetime(int(vv), unit="s", utc=True))
-            else:
-                if isinstance(v, (int, float)) and v > 0:
-                    dts.append(pd.to_datetime(int(v), unit="s", utc=True))
-        if not dts:
-            return pd.DataFrame()
-        out = pd.DataFrame({"earnings_date": sorted(set(dts))})
-        return out.sort_values("earnings_date", ascending=False).reset_index(drop=True)
-    except Exception:
-        return pd.DataFrame()
 
 @st.cache_data(ttl=CACHE_TTL_NEWS)
 def fetch_google_news_rss(ticker: str, days: int) -> pd.DataFrame:
@@ -691,15 +447,12 @@ def fetch_google_news_rss(ticker: str, days: int) -> pd.DataFrame:
             if "published" in e:
                 try:
                     pub = dt_parse(e.published)
-                    if pub.tzinfo is None:
-                        pub = pub.replace(tzinfo=timezone.utc)
-                    else:
-                        pub = pub.astimezone(timezone.utc)
+                    pub = pub if pub.tzinfo else pub.replace(tzinfo=timezone.utc)
+                    pub = pub.astimezone(timezone.utc)
                 except Exception:
                     pub = None
             if pub and pub < cutoff:
                 continue
-
             title = getattr(e, "title", "")
             link = getattr(e, "link", "")
             source = ""
@@ -729,11 +482,13 @@ def normalize_base_url(website: str) -> Optional[str]:
     return website.rstrip("/")
 
 @st.cache_data(ttl=CACHE_TTL_META)
-def fetch_html(url: str, timeout=10) -> Optional[str]:
+def fetch_html(url: str, timeout=12) -> Optional[str]:
     try:
-        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
-        ct = r.headers.get("Content-Type", "")
-        if 200 <= r.status_code < 300 and "text/html" in ct:
+        r = SESSION.get(url, timeout=timeout)
+        if 200 <= r.status_code < 300 and r.text and "html" in (r.headers.get("Content-Type", "").lower()):
+            return r.text
+        # still return html even if content-type is wrong (some CDNs)
+        if 200 <= r.status_code < 300 and r.text and len(r.text) > 2000:
             return r.text
         return None
     except Exception:
@@ -791,22 +546,9 @@ def extract_ir_news_links(ir_url: str, max_links=10) -> List[Tuple[str, str]]:
     return out
 
 # =========================
-# SEC EDGAR (latest filings) + EARNINGS CALENDAR
+# SEC EDGAR (robust + status surfacing)
 # =========================
-SEC_BASE = "https://data.sec.gov"
-SEC_TICKER_MAP_URLS = [
-    "https://www.sec.gov/files/company_tickers.json",
-    "https://www.sec.gov/files/company_tickers_exchange.json",
-]
-
-def normalize_sec_ticker(t: str) -> str:
-    t = (t or "").upper().strip()
-    # SEC often uses dash for class shares
-    return t.replace(".", "-")
-
 def _sec_headers() -> Dict[str, str]:
-    # Put this in Streamlit secrets to reduce SEC blocking:
-    # SEC_CONTACT = "you@example.com"
     contact = ""
     try:
         contact = st.secrets.get("SEC_CONTACT", "")
@@ -817,87 +559,103 @@ def _sec_headers() -> Dict[str, str]:
         ua = f"{USER_AGENT} ({contact})"
     return {
         "User-Agent": ua,
-        "Accept-Encoding": "gzip, deflate",
         "Accept": "application/json,text/html,*/*",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
     }
 
-@st.cache_data(ttl=24 * 60 * 60)
-def fetch_sec_ticker_map() -> pd.DataFrame:
-    for url in SEC_TICKER_MAP_URLS:
+def _sec_get_json(url: str, timeout: int = 25, retries: int = 4) -> Tuple[Optional[Dict], Dict]:
+    meta = {"url": url, "status": None, "error": None}
+    for i in range(retries):
         try:
-            r = requests.get(url, headers=_sec_headers(), timeout=20)
-            if not (200 <= r.status_code < 300):
+            r = requests.get(url, headers=_sec_headers(), timeout=timeout)
+            meta["status"] = r.status_code
+            if 200 <= r.status_code < 300:
+                return (r.json(), meta)
+            if r.status_code in (403, 429, 500, 502, 503, 504):
+                time.sleep(0.6 * (2 ** i))
                 continue
-            data = r.json()
-            rows = []
-            if isinstance(data, dict):
-                for _, obj in data.items():
-                    t = str(obj.get("ticker", "")).upper().strip()
-                    cik = obj.get("cik_str", obj.get("cik", None))
-                    title = obj.get("title", obj.get("name", ""))
-                    if t and cik is not None:
-                        rows.append({"ticker": t, "cik": int(cik), "title": title})
-            elif isinstance(data, list):
-                for obj in data:
-                    t = str(obj.get("ticker", "")).upper().strip()
-                    cik = obj.get("cik_str", obj.get("cik", None))
-                    title = obj.get("title", obj.get("name", ""))
-                    if t and cik is not None:
-                        rows.append({"ticker": t, "cik": int(cik), "title": title})
-            df = pd.DataFrame(rows).drop_duplicates(subset=["ticker"])
-            if not df.empty:
-                return df
-        except Exception:
+            meta["error"] = f"HTTP {r.status_code}"
+            return (None, meta)
+        except Exception as e:
+            meta["error"] = str(e)
+            time.sleep(0.6 * (2 ** i))
             continue
-    return pd.DataFrame(columns=["ticker", "cik", "title"])
+    return (None, meta)
+
+def normalize_sec_ticker(t: str) -> str:
+    return (t or "").upper().strip().replace(".", "-")
+
+@st.cache_data(ttl=24 * 60 * 60)
+def fetch_sec_ticker_map() -> Tuple[pd.DataFrame, Dict]:
+    urls = [
+        "https://www.sec.gov/files/company_tickers.json",
+        "https://www.sec.gov/files/company_tickers_exchange.json",
+    ]
+    last_meta = {}
+    for url in urls:
+        data, meta = _sec_get_json(url)
+        last_meta = meta
+        if not data:
+            continue
+        rows = []
+        if isinstance(data, dict):
+            for _, obj in data.items():
+                t = str(obj.get("ticker", "")).upper().strip()
+                cik = obj.get("cik_str", obj.get("cik", None))
+                title = obj.get("title", obj.get("name", ""))
+                if t and cik is not None:
+                    rows.append({"ticker": t, "cik": int(cik), "title": title})
+        elif isinstance(data, list):
+            for obj in data:
+                t = str(obj.get("ticker", "")).upper().strip()
+                cik = obj.get("cik_str", obj.get("cik", None))
+                title = obj.get("title", obj.get("name", ""))
+                if t and cik is not None:
+                    rows.append({"ticker": t, "cik": int(cik), "title": title})
+        df = pd.DataFrame(rows).drop_duplicates(subset=["ticker"])
+        if not df.empty:
+            return df, meta
+    return pd.DataFrame(columns=["ticker", "cik", "title"]), last_meta
 
 def cik10(cik_int: int) -> str:
     return str(int(cik_int)).zfill(10)
 
 @st.cache_data(ttl=CACHE_TTL_META)
-def fetch_sec_submissions(cik_int: int) -> Dict:
-    url = f"{SEC_BASE}/submissions/CIK{cik10(cik_int)}.json"
-    try:
-        r = requests.get(url, headers=_sec_headers(), timeout=20)
-        if not (200 <= r.status_code < 300):
-            return {}
-        return r.json() or {}
-    except Exception:
-        return {}
+def fetch_sec_submissions(cik_int: int) -> Tuple[Optional[Dict], Dict]:
+    url = f"https://data.sec.gov/submissions/CIK{cik10(cik_int)}.json"
+    data, meta = _sec_get_json(url)
+    return data, meta
 
-def _filing_doc_url(cik_int: int, accession: str, primary_doc: str) -> str:
-    acc_nodash = accession.replace("-", "")
-    return f"https://www.sec.gov/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{primary_doc}"
-
-def _ixviewer_url(doc_url: str) -> str:
-    return f"https://www.sec.gov/ixviewer/documents/?doc={requests.utils.quote(doc_url)}"
-
-def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None, limit: int = 8) -> pd.DataFrame:
-    m = fetch_sec_ticker_map()
-    if m.empty:
-        return pd.DataFrame()
-
+def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None, limit: int = 8) -> Tuple[pd.DataFrame, Dict]:
     t_norm = normalize_sec_ticker(ticker)
+    m, meta_map = fetch_sec_ticker_map()
+    if m.empty:
+        return pd.DataFrame(), {"stage": "ticker_map", **meta_map}
+
     hit = m[m["ticker"] == t_norm].head(1)
     if hit.empty and t_norm != ticker.upper():
         hit = m[m["ticker"] == ticker.upper()].head(1)
-
     if hit.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), {"stage": "ticker_lookup", "error": f"{t_norm} not found in SEC map"}
 
     cik_int = int(hit["cik"].iloc[0])
-    sub = fetch_sec_submissions(cik_int)
+    sub, meta_sub = fetch_sec_submissions(cik_int)
+    if not sub:
+        return pd.DataFrame(), {"stage": "submissions", "cik": cik_int, **meta_sub}
+
     recent = (((sub or {}).get("filings") or {}).get("recent") or {})
     if not recent:
-        return pd.DataFrame()
+        return pd.DataFrame(), {"stage": "recent_empty", "cik": cik_int}
 
     df = pd.DataFrame(recent)
     if df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), {"stage": "recent_df_empty", "cik": cik_int}
 
     keep = [c for c in ["filingDate", "reportDate", "acceptanceDateTime", "form", "accessionNumber", "primaryDocument"] if c in df.columns]
     df = df[keep].copy()
     df["filingDate"] = pd.to_datetime(df.get("filingDate"), errors="coerce")
+
     if forms:
         df = df[df["form"].isin(forms)]
     df = df.sort_values("filingDate", ascending=False).head(limit)
@@ -907,19 +665,20 @@ def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None
         acc = str(row.get("accessionNumber", "") or "")
         if not doc or not acc:
             return ""
-        doc_url = _filing_doc_url(cik_int, acc, doc)
-        return _ixviewer_url(doc_url)
+        acc_nodash = acc.replace("-", "")
+        doc_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{doc}"
+        return f"https://www.sec.gov/ixviewer/documents/?doc={requests.utils.quote(doc_url)}"
 
     df["link"] = df.apply(make_link, axis=1)
     df.insert(0, "ticker", ticker.upper())
     df.insert(1, "cik", cik_int)
-    return df
+    return df, {"stage": "ok", "cik": cik_int}
 
+# =========================
+# Earnings (robust)
+# =========================
 @st.cache_data(ttl=CACHE_TTL_META)
 def fetch_earnings_calendar_yf(ticker: str, limit: int = 8) -> pd.DataFrame:
-    """
-    Best-effort: yfinance earnings dates table.
-    """
     try:
         t = yf.Ticker(ticker)
         df = t.get_earnings_dates(limit=limit)
@@ -928,169 +687,99 @@ def fetch_earnings_calendar_yf(ticker: str, limit: int = 8) -> pd.DataFrame:
         out = df.reset_index()
         if "Earnings Date" in out.columns:
             out = out.rename(columns={"Earnings Date": "earnings_date"})
-        elif out.columns[0] not in ("earnings_date",):
+        elif out.columns[0] != "earnings_date":
             out = out.rename(columns={out.columns[0]: "earnings_date"})
         out["earnings_date"] = pd.to_datetime(out["earnings_date"], errors="coerce", utc=True)
         return out.sort_values("earnings_date", ascending=False)
     except Exception:
         return pd.DataFrame()
 
+@st.cache_data(ttl=CACHE_TTL_META)
+def fetch_earnings_calendar_fallback_info(ticker: str) -> pd.DataFrame:
+    try:
+        info = fetch_info_one(ticker) or {}
+        keys = ["earningsTimestamp", "earningsTimestampStart", "earningsTimestampEnd"]
+        dts = []
+        for k in keys:
+            v = info.get(k, None)
+            if v is None:
+                continue
+            if isinstance(v, (list, tuple)):
+                for vv in v:
+                    if isinstance(vv, (int, float)) and vv > 0:
+                        dts.append(pd.to_datetime(int(vv), unit="s", utc=True))
+            else:
+                if isinstance(v, (int, float)) and v > 0:
+                    dts.append(pd.to_datetime(int(v), unit="s", utc=True))
+        if not dts:
+            return pd.DataFrame()
+        return pd.DataFrame({"earnings_date": sorted(set(dts))}).sort_values("earnings_date", ascending=False).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
 def nearest_earnings_catalyst(df: pd.DataFrame) -> Optional[pd.Timestamp]:
     """
-    Robust against tz-aware vs tz-naive comparisons.
-    Always returns tz-naive UTC Timestamp.
+    Never does tz-aware vs tz-naive comparisons.
+    Compares only numpy datetime64[ns].
     """
     if df is None or df.empty or "earnings_date" not in df.columns:
         return None
-
     dts = pd.to_datetime(df["earnings_date"], errors="coerce", utc=True).dropna()
     if len(dts) == 0:
         return None
-
-    # Series -> tz-naive
-    try:
-        dts = dts.dt.tz_localize(None)
-    except Exception:
-        # fallback if already naive or not Series
-        dts = pd.to_datetime(dts, errors="coerce").dropna()
-
-    now = pd.Timestamp.utcnow()  # tz-naive UTC
-    future = dts[dts >= now]
-    if len(future) > 0:
-        return future.min()
-    return dts.max()
+    # strip tz -> naive UTC
+    dts = dts.dt.tz_convert("UTC").dt.tz_localize(None)
+    dts64 = dts.astype("datetime64[ns]").to_numpy()
+    now64 = np.datetime64(pd.Timestamp.utcnow().to_datetime64())
+    future = dts64[dts64 >= now64]
+    return pd.Timestamp(future.min()) if future.size > 0 else pd.Timestamp(dts64.max())
 
 # =========================
-# TECHNICAL SIGNALS (scored)
+# Technical scoring + extras
 # =========================
-def score_ema_trend(close: pd.Series, ema_s: pd.Series) -> Tuple[str, float]:
+def score_ema_trend(close: pd.Series, ema_s: pd.Series) -> float:
     c = safe_last(close)
     e = safe_last(ema_s)
     if not np.isfinite(c) or not np.isfinite(e):
-        return ("N/A", 0.0)
+        return 0.0
     slope = safe_last(ema_s.diff())
     if c > e and slope >= 0:
-        return ("Buy (above rising EMA)", 1.0)
+        return 1.0
     if c < e and slope <= 0:
-        return ("Sell (below falling EMA)", -1.0)
-    return ("Neutral", 0.0)
+        return -1.0
+    return 0.0
 
-def score_rsi(rsi: pd.Series) -> Tuple[str, float]:
+def score_rsi_value(rsi: pd.Series) -> float:
     v = safe_last(rsi)
     if not np.isfinite(v):
-        return ("N/A", 0.0)
+        return 0.0
     if v <= 30:
-        return ("Buy (oversold)", 1.0)
+        return 1.0
     if v >= 70:
-        return ("Sell (overbought)", -1.0)
+        return -1.0
     dv = safe_last(rsi.diff())
     if np.isfinite(dv) and dv > 0:
-        return ("Neutral (RSI rising)", 0.25)
+        return 0.25
     if np.isfinite(dv) and dv < 0:
-        return ("Neutral (RSI falling)", -0.25)
-    return ("Neutral", 0.0)
+        return -0.25
+    return 0.0
 
-def score_macd(macd_line: pd.Series, signal_line: pd.Series, hist: pd.Series) -> Tuple[str, float]:
+def score_macd_value(macd_line: pd.Series, signal_line: pd.Series, hist: pd.Series) -> float:
     m = safe_last(macd_line)
     s = safe_last(signal_line)
     h = safe_last(hist)
     if not np.isfinite(m) or not np.isfinite(s) or not np.isfinite(h):
-        return ("N/A", 0.0)
+        return 0.0
     cross = 1.0 if m > s else (-1.0 if m < s else 0.0)
     accel = safe_last(hist.diff())
     bonus = 0.25 if np.isfinite(accel) and accel > 0 else (-0.25 if np.isfinite(accel) and accel < 0 else 0.0)
-    score = float(np.clip(cross + bonus, -1.0, 1.0))
-    label = "Buy (MACD>Signal)" if score > 0 else ("Sell (MACD<Signal)" if score < 0 else "Neutral")
-    return (label, score)
+    return float(np.clip(cross + bonus, -1.0, 1.0))
 
-def score_kdj(k: pd.Series, d: pd.Series, j: pd.Series) -> Tuple[str, float]:
-    kv, dv, jv = safe_last(k), safe_last(d), safe_last(j)
-    if not np.isfinite(kv) or not np.isfinite(dv) or not np.isfinite(jv):
-        return ("N/A", 0.0)
-    dk = safe_last((k - d))
-    dk_prev = safe_last((k - d).shift(1))
-    cross_up = np.isfinite(dk_prev) and dk_prev <= 0 and dk > 0
-    cross_dn = np.isfinite(dk_prev) and dk_prev >= 0 and dk < 0
-    if cross_up and kv < 20:
-        return ("Buy (K/D cross up, oversold)", 1.0)
-    if cross_dn and kv > 80:
-        return ("Sell (K/D cross down, overbought)", -1.0)
-    if kv > dv:
-        return ("Neutral (K above D)", 0.25)
-    if kv < dv:
-        return ("Neutral (K below D)", -0.25)
-    return ("Neutral", 0.0)
-
-# ---- additional indicators (best-effort)
-def bollinger_bands(close: pd.Series, window: int = 20, n_std: float = 2.0):
-    mid = close.rolling(window).mean()
-    sd = close.rolling(window).std(ddof=0)
-    upper = mid + n_std * sd
-    lower = mid - n_std * sd
-    return mid, upper, lower
-
-def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
-    prev = close.shift(1)
-    tr = pd.concat([(high - low).abs(), (high - prev).abs(), (low - prev).abs()], axis=1).max(axis=1)
-    return tr
-
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
-    return true_range(high, low, close).rolling(window).mean()
-
-def obv(close: pd.Series, volume: pd.Series) -> pd.Series:
-    direction = np.sign(close.diff()).fillna(0.0)
-    return (direction * volume.fillna(0.0)).cumsum()
-
-def score_momentum(close: pd.Series, lookback: int) -> Tuple[str, float]:
-    if close is None or close.dropna().shape[0] < lookback + 2:
-        return ("N/A", 0.0)
-    ret = float(close.iloc[-1] / close.iloc[-(lookback + 1)] - 1.0)
-    if ret > 0.03:
-        return (f"Buy ({lookback}d momentum)", 1.0)
-    if ret < -0.03:
-        return (f"Sell ({lookback}d momentum)", -1.0)
-    return (f"Neutral ({lookback}d momentum)", 0.0)
-
-def score_bollinger(close: pd.Series) -> Tuple[str, float]:
-    mid, up, lo = bollinger_bands(close, 20, 2.0)
-    c = safe_last(close)
-    u = safe_last(up)
-    l = safe_last(lo)
-    m = safe_last(mid)
-    if not np.isfinite(c) or not np.isfinite(u) or not np.isfinite(l) or not np.isfinite(m):
-        return ("N/A", 0.0)
-    denom = (u - l)
-    if not np.isfinite(denom) or denom == 0:
-        return ("N/A", 0.0)
-    pos = (c - l) / denom
-    if pos <= 0.1:
-        return ("Buy (near lower band)", 0.75)
-    if pos >= 0.9:
-        return ("Sell (near upper band)", -0.75)
-    return ("Neutral (within bands)", 0.25 if c >= m else -0.25)
-
-def score_atr_pct(high: pd.Series, low: pd.Series, close: pd.Series) -> Tuple[str, float]:
-    a = atr(high, low, close, 14)
-    c = safe_last(close)
-    ap = safe_last(a) / c if np.isfinite(c) and c != 0 else np.nan
-    if not np.isfinite(ap):
-        return ("N/A", 0.0)
-    if ap > 0.06:
-        return ("Neutral (high volatility)", -0.25)
-    return ("Neutral (vol normal)", 0.0)
-
-def score_obv_trend(close: pd.Series, volume: Optional[pd.Series]) -> Tuple[str, float]:
-    if volume is None or volume.dropna().empty:
-        return ("N/A", 0.0)
-    o = obv(close, volume)
-    slope = safe_last(o.diff().rolling(5).mean())
-    if not np.isfinite(slope):
-        return ("N/A", 0.0)
-    if slope > 0:
-        return ("Neutral (OBV rising)", 0.25)
-    if slope < 0:
-        return ("Neutral (OBV falling)", -0.25)
-    return ("Neutral", 0.0)
+def score_kdj_value(k: pd.Series, d: pd.Series) -> float:
+    kv, dv = safe_last(k), safe_last(d)
+    if not np.isfinite(kv) or not np.isfinite(dv):
+        return 0.0
+    return 0.25 if kv > dv else (-0.25 if kv < dv else 0.0)
 
 # =========================
 # UI
@@ -1119,22 +808,15 @@ universe_path = file_map[date_sel]
 st.caption(f"Using: `{Path(universe_path).name}`")
 
 uni_raw = pd.read_csv(universe_path)
-uni, key_cols_present, canonical_cols = normalize_universe_keep_original(uni_raw)
+uni, key_cols_present, _ = normalize_universe_keep_original(uni_raw)
 
-# =========================
-# Opportunity Set
-# =========================
 st.subheader("Opportunity Set")
-
 if key_cols_present:
     st.dataframe(uni[key_cols_present].copy(), use_container_width=True, height=320)
 else:
-    st.info("Preferred key columns not found. Showing the first 12 columns instead.")
     st.dataframe(uni.iloc[:, :12], use_container_width=True, height=320)
 
-tickers_all = uni["ticker_norm"].dropna().unique().tolist()
-tickers_all = sorted([t for t in tickers_all if t])
-
+tickers_all = sorted([t for t in uni["ticker_norm"].dropna().unique().tolist() if t])
 ticker_sel = st.selectbox("Select ticker", tickers_all, index=0 if tickers_all else None)
 if not ticker_sel:
     st.stop()
@@ -1144,7 +826,7 @@ sector_zacks = str(row["sector_norm"].iloc[0]) if not row.empty else "Unknown"
 industry = str(row["industry_norm"].iloc[0]) if not row.empty else ""
 sector_bucket = infer_sector_bucket(sector_zacks)
 
-st.caption(f"Selected: **{ticker_sel}** | Sector (Zacks): **{sector_zacks}** | Bucket: **{sector_bucket}** | Industry: **{industry}**")
+st.caption(f"Selected: **{ticker_sel}** | Sector: **{sector_zacks}** | Bucket: **{sector_bucket}** | Industry: **{industry}**")
 
 # =========================
 # Sector-Specific Indicators
@@ -1152,54 +834,61 @@ st.caption(f"Selected: **{ticker_sel}** | Sector (Zacks): **{sector_zacks}** | B
 st.subheader("Sector-Specific Indicators")
 
 inds = SECTOR_TO_INDICATORS.get(sector_bucket, SECTOR_TO_INDICATORS["General"])
-if not inds:
-    st.info("No indicators configured for this sector bucket.")
-else:
-    rows = []
-    for k in inds:
-        cfg = INDICATORS.get(k, {})
-        ser = fetch_indicator_series(k)
-        snap = indicator_snapshot(ser)
-        label, score = indicator_signal(cfg, snap)
-        rows.append({
-            "Indicator": cfg.get("name", k),
-            "Key": k,
-            "Source": cfg.get("source", ""),
-            "Series/Symbol": cfg.get("id", ""),
-            "Latest": snap["latest"],
-            "Δ 1w": snap["chg_1w"],
-            "Δ 1m": snap["chg_1m"],
-            "Z(≈1y)": snap["z_1y"],
-            "Signal": label,
-            "Score": score,
-        })
-    snap_df = pd.DataFrame(rows)
-    st.dataframe(
-        snap_df,
-        use_container_width=True,
-        height=260,
-        column_config={
-            "Latest": st.column_config.NumberColumn(format="%.4f"),
-            "Δ 1w": st.column_config.NumberColumn(format="%.4f"),
-            "Δ 1m": st.column_config.NumberColumn(format="%.4f"),
-            "Z(≈1y)": st.column_config.NumberColumn(format="%.2f"),
-            "Score": st.column_config.NumberColumn(format="%.2f"),
-        },
-    )
+rows = []
+for k in inds:
+    cfg = INDICATORS.get(k, {})
+    ser = fetch_indicator_series(k)
 
-    cols = st.columns(2)
-    for i, k in enumerate(inds):
-        cfg = INDICATORS.get(k, {})
-        ser = fetch_indicator_series(k)
-        with cols[i % 2]:
-            st.write(f"**{cfg.get('name', k)}**")
-            if ser is None or ser.empty:
-                st.info("No data (endpoint may be unavailable).")
-            else:
-                ser2 = ser.dropna().tail(3000).copy()
-                fig = px.line(ser2, x="date", y="value", title=None)
-                fig.update_layout(height=280, margin=dict(l=10, r=10, t=20, b=10))
-                st.plotly_chart(fig, use_container_width=True)
+    # extra debug for PMI (shows HTTP issue if any)
+    debug_note = ""
+    if k == "ISM_PMI" and (ser is None or ser.empty):
+        url = _fred_csv_url("NAPM")
+        txt = _get_text(url, retries=2)
+        debug_note = "FRED NAPM fetch failed" if not txt else "Parsed empty (check CSV content)"
+
+    snap = indicator_snapshot(ser)
+    label, score = indicator_signal(cfg, snap)
+    rows.append({
+        "Indicator": cfg.get("name", k),
+        "Key": k,
+        "Source": cfg.get("source", ""),
+        "Series/Symbol": cfg.get("id", ""),
+        "Latest": snap["latest"],
+        "Δ 1w": snap["chg_1w"],
+        "Δ 1m": snap["chg_1m"],
+        "Z(≈1y)": snap["z_1y"],
+        "Signal": label,
+        "Score": score,
+        "Note": debug_note,
+    })
+
+snap_df = pd.DataFrame(rows)
+st.dataframe(
+    snap_df,
+    use_container_width=True,
+    height=280,
+    column_config={
+        "Latest": st.column_config.NumberColumn(format="%.4f"),
+        "Δ 1w": st.column_config.NumberColumn(format="%.4f"),
+        "Δ 1m": st.column_config.NumberColumn(format="%.4f"),
+        "Z(≈1y)": st.column_config.NumberColumn(format="%.2f"),
+        "Score": st.column_config.NumberColumn(format="%.2f"),
+    },
+)
+
+cols = st.columns(2)
+for i, k in enumerate(inds):
+    cfg = INDICATORS.get(k, {})
+    ser = fetch_indicator_series(k)
+    with cols[i % 2]:
+        st.write(f"**{cfg.get('name', k)}**")
+        if ser is None or ser.empty:
+            st.info("No data (endpoint may be unavailable / blocked).")
+        else:
+            ser2 = ser.dropna().tail(3000).copy()
+            fig = px.line(ser2, x="date", y="value")
+            fig.update_layout(height=280, margin=dict(l=10, r=10, t=20, b=10))
+            st.plotly_chart(fig, use_container_width=True)
 
 # =========================
 # Technical Analysis
@@ -1220,16 +909,13 @@ df_t = df_t.dropna(subset=["Close"])
 close = df_t["Close"].astype(float)
 high = df_t["High"].astype(float) if "High" in df_t.columns else close
 low = df_t["Low"].astype(float) if "Low" in df_t.columns else close
-volume = df_t["Volume"].astype(float) if "Volume" in df_t.columns else None
 
 ema_spans = [5, 10, 20, 60, 120, 250]
 emas = {f"EMA{n}": ema(close, n) for n in ema_spans}
-
 rsi14 = rsi_series(close, 14)
 macd_line, signal_line, hist = macd(close, 12, 26, 9)
 k_line, d_line, j_line = kdj(high, low, close, n=9, k=3, d=3)
 
-# --- Price + EMAs
 price_df = pd.DataFrame({"Date": close.index, "Close": close.values})
 for n in ema_spans:
     price_df[f"EMA{n}"] = emas[f"EMA{n}"].values
@@ -1242,19 +928,12 @@ for n in ema_spans:
 fig_price.update_layout(title=f"{ticker_sel} — Price & EMAs", height=420, legend=dict(orientation="h"))
 st.plotly_chart(fig_price, use_container_width=True)
 
-# --- RSI
 rsi_df = pd.DataFrame({"Date": rsi14.index, "RSI14": rsi14.values}).dropna()
 fig_rsi = px.line(rsi_df, x="Date", y="RSI14", title="RSI(14)")
 fig_rsi.update_layout(height=260)
 st.plotly_chart(fig_rsi, use_container_width=True)
 
-# --- MACD (legend top-right)
-macd_df = pd.DataFrame({
-    "Date": close.index,
-    "MACD": macd_line.values,
-    "Signal": signal_line.values,
-    "Hist": hist.values,
-}).dropna()
+macd_df = pd.DataFrame({"Date": close.index, "MACD": macd_line.values, "Signal": signal_line.values, "Hist": hist.values}).dropna()
 fig_macd = go.Figure()
 fig_macd.add_trace(go.Scatter(x=macd_df["Date"], y=macd_df["MACD"], name="MACD"))
 fig_macd.add_trace(go.Scatter(x=macd_df["Date"], y=macd_df["Signal"], name="Signal"))
@@ -1274,77 +953,26 @@ fig_macd.update_layout(
 )
 st.plotly_chart(fig_macd, use_container_width=True)
 
-# --- KDJ
 kdj_df = pd.DataFrame({"Date": close.index, "K": k_line.values, "D": d_line.values, "J": j_line.values}).dropna()
 fig_kdj = px.line(kdj_df, x="Date", y=["K", "D", "J"], title="KDJ(9,3,3)")
 fig_kdj.update_layout(height=320)
 st.plotly_chart(fig_kdj, use_container_width=True)
 
-# --- Signals table + composite score (EMA consolidated)
-sig_rows = []
-
-# EMA cluster
-ema_scores = []
-ema_details = []
-for n in ema_spans:
-    _, sc_n = score_ema_trend(close, emas[f"EMA{n}"])
-    ema_scores.append(sc_n)
-    ema_details.append(f"{n}:{sc_n:+.0f}")
-ema_cluster = float(np.nanmean(ema_scores)) if len(ema_scores) else 0.0
-sig_rows.append({
-    "Indicator": "EMA Cluster (5/10/20/60/120/250)",
-    "Value": ema_cluster,
-    "Signal": " / ".join(ema_details[:6]),
-    "Score": float(np.clip(ema_cluster, -1.0, 1.0)),
-})
-
-label, sc = score_rsi(rsi14)
-sig_rows.append({"Indicator": "RSI(14)", "Value": safe_last(rsi14), "Signal": label, "Score": sc})
-
-label, sc = score_macd(macd_line, signal_line, hist)
-sig_rows.append({"Indicator": "MACD(12,26,9)", "Value": safe_last(hist), "Signal": label, "Score": sc})
-
-label, sc = score_kdj(k_line, d_line, j_line)
-sig_rows.append({"Indicator": "KDJ(9,3,3)", "Value": safe_last(k_line), "Signal": label, "Score": sc})
-
-# Additional indicators
-label, sc = score_momentum(close, 20)
-sig_rows.append({"Indicator": "Momentum 20d", "Value": np.nan, "Signal": label, "Score": sc})
-
-label, sc = score_momentum(close, 60)
-sig_rows.append({"Indicator": "Momentum 60d", "Value": np.nan, "Signal": label, "Score": sc})
-
-label, sc = score_bollinger(close)
-sig_rows.append({"Indicator": "Bollinger(20,2)", "Value": np.nan, "Signal": label, "Score": sc})
-
-label, sc = score_atr_pct(high, low, close)
-sig_rows.append({"Indicator": "ATR% (14)", "Value": np.nan, "Signal": label, "Score": sc})
-
-label, sc = score_obv_trend(close, volume)
-sig_rows.append({"Indicator": "OBV Trend", "Value": np.nan, "Signal": label, "Score": sc})
-
-sig_df = pd.DataFrame(sig_rows)
+# Consolidated scoring (EMA cluster + other)
+ema_cluster = float(np.nanmean([score_ema_trend(close, emas[f"EMA{n}"]) for n in ema_spans]))
+sig_df = pd.DataFrame([
+    {"Indicator": "EMA Cluster (5/10/20/60/120/250)", "Score": float(np.clip(ema_cluster, -1, 1))},
+    {"Indicator": "RSI(14)", "Score": score_rsi_value(rsi14)},
+    {"Indicator": "MACD(12,26,9)", "Score": score_macd_value(macd_line, signal_line, hist)},
+    {"Indicator": "KDJ (K vs D)", "Score": score_kdj_value(k_line, d_line)},
+])
 composite = float(sig_df["Score"].mean()) if not sig_df.empty else 0.0
 st.markdown(f"#### Indicator Signals (Composite Score: **{composite:+.2f}**)")
 
-st.dataframe(
-    sig_df,
-    use_container_width=True,
-    height=320,
-    column_config={
-        "Value": st.column_config.NumberColumn(format="%.4f"),
-        "Score": st.column_config.NumberColumn(format="%.2f"),
-    },
-)
-
-# --- Signals bar chart
-if not sig_df.empty:
-    sig_plot = sig_df.copy()
-    sig_plot["Score"] = pd.to_numeric(sig_plot["Score"], errors="coerce")
-    sig_plot = sig_plot.dropna(subset=["Score"])
-    fig_sig = px.bar(sig_plot, x="Indicator", y="Score", title="Technical Indicator Scores (higher = more bullish)")
-    fig_sig.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
-    st.plotly_chart(fig_sig, use_container_width=True)
+st.dataframe(sig_df, use_container_width=True, height=220, column_config={"Score": st.column_config.NumberColumn(format="%.2f")})
+fig_sig = px.bar(sig_df, x="Indicator", y="Score", title="Technical Indicator Scores")
+fig_sig.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
+st.plotly_chart(fig_sig, use_container_width=True)
 
 # =========================
 # News Sentiment
@@ -1356,7 +984,6 @@ days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
 news_days = days_map.get(news_window_label, 30)
 
 news_df = fetch_google_news_rss(ticker_sel, days=news_days)
-
 if news_df is None or news_df.empty:
     st.write("No recent RSS news found.")
 else:
@@ -1377,7 +1004,7 @@ else:
         link = str(n.get("link", ""))
         src = str(n.get("source", ""))
         pol = sentiment_polarity(title)
-        st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_ | headline polarity: `{pol:+.2f}`")
+        st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_ | polarity: `{pol:+.2f}`")
 
 # =========================
 # SEC Filings & Earnings Catalysts
@@ -1386,22 +1013,15 @@ st.subheader("SEC Filings & Earnings Catalysts")
 
 c_sec1, c_sec2 = st.columns([1.3, 1])
 with c_sec1:
-    forms_sel = st.multiselect(
-        "Filings to show",
-        ["10-K", "10-Q", "8-K", "S-1", "DEF 14A"],
-        default=["10-Q", "10-K", "8-K"],
-    )
+    forms_sel = st.multiselect("Filings to show", ["10-K", "10-Q", "8-K", "S-1", "DEF 14A"], default=["10-Q", "10-K", "8-K"])
 with c_sec2:
     filings_limit = st.slider("Max filings", min_value=3, max_value=20, value=8, step=1)
 
-# --- SEC Filings
-filings_df = get_latest_filings_for_ticker(ticker_sel, forms=forms_sel, limit=filings_limit)
-
-if filings_df is None or filings_df.empty:
-    st.info(
-        "SEC filings unavailable. On Streamlit Cloud this is usually due to SEC blocking your User-Agent.\n\n"
-        "Fix: add `SEC_CONTACT` (your email) in Streamlit secrets, and redeploy."
-    )
+filings_df, filings_meta = get_latest_filings_for_ticker(ticker_sel, forms=forms_sel, limit=filings_limit)
+if filings_df.empty:
+    st.info("SEC filings unavailable.")
+    st.code(filings_meta, language="python")
+    st.caption("If status=403/429: set Streamlit Secrets `SEC_CONTACT = \"you@domain.com\"`, reboot app. SEC often throttles cloud IPs.")
 else:
     show_df = filings_df.copy()
     show_df["filingDate"] = pd.to_datetime(show_df["filingDate"], errors="coerce").dt.date
@@ -1411,42 +1031,22 @@ else:
         height=260,
         column_config={"link": st.column_config.LinkColumn("Filing (SEC ixviewer)")},
     )
-    st.caption(
-        "Tip: open the latest 10-Q/10-K and jump to Items like 1A (Risk Factors), 2/7 (MD&A), 8 (Financials), "
-        "or scan for 'guidance', 'outlook', 'restructuring', 'impairment', 'material weakness', etc."
-    )
 
-# --- Earnings
 st.markdown("#### Earnings Calendar (best-effort)")
-
 earn_df = fetch_earnings_calendar_yf(ticker_sel, limit=12)
-if earn_df is None or earn_df.empty:
+if earn_df.empty:
     earn_df = fetch_earnings_calendar_fallback_info(ticker_sel)
 
-if earn_df is None or earn_df.empty:
-    st.info("Earnings dates unavailable from free sources on this host/IP (yfinance often limited on Streamlit Cloud).")
+if earn_df.empty:
+    st.info("Earnings dates unavailable from free sources on this host/IP (yfinance may be limited on Streamlit Cloud).")
 else:
     earn_df = earn_df.copy()
-
-    # Ensure column exists and is parseable
-    if "earnings_date" not in earn_df.columns:
-        # try to locate any datetime-like column
-        for c in earn_df.columns:
-            if "earn" in c.lower() and "date" in c.lower():
-                earn_df = earn_df.rename(columns={c: "earnings_date"})
-                break
-
     earn_df["earnings_date"] = pd.to_datetime(earn_df["earnings_date"], errors="coerce", utc=True)
-
-    show_cols = [c for c in ["earnings_date", "EPS Estimate", "Reported EPS", "Surprise(%)", "Revenue Estimate", "Reported Revenue"] if c in earn_df.columns]
-    if not show_cols:
-        show_cols = ["earnings_date"]
-
+    show_cols = [c for c in ["earnings_date", "EPS Estimate", "Reported EPS", "Surprise(%)", "Revenue Estimate", "Reported Revenue"] if c in earn_df.columns] or ["earnings_date"]
     st.dataframe(earn_df[show_cols].head(12), use_container_width=True, height=260)
 
     nxt = nearest_earnings_catalyst(earn_df)
-    if nxt is not None and pd.notna(nxt):
-        # nxt is tz-naive UTC timestamp
+    if nxt is not None:
         st.success(f"Nearest earnings catalyst (UTC): {pd.Timestamp(nxt).strftime('%Y-%m-%d %H:%M')}")
 
 # =========================
@@ -1456,7 +1056,6 @@ st.subheader("Investor Relations")
 
 website = (info or {}).get("website", "")
 base = normalize_base_url(website)
-
 if not base:
     st.write("Official website not available via yfinance for this ticker.")
 else:
@@ -1468,7 +1067,6 @@ else:
         st.write("Try manually: usually `/investors` or `/investor-relations` on the official domain.")
     else:
         st.write(f"Detected IR / News page: {ir_url}")
-
         links = extract_ir_news_links(ir_url, max_links=10)
         if not links:
             st.write("No obvious IR/news links found on that page (site may be JS-rendered).")
