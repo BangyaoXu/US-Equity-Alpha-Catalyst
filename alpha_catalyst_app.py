@@ -1047,16 +1047,16 @@ fig_macd.add_trace(go.Bar(x=macd_df["Date"], y=macd_df["Hist"], name="Hist"))
 fig_macd.update_layout(
     title="MACD(12,26,9)",
     height=320,
+    margin=dict(l=10, r=10, t=60, b=40),
     legend=dict(
-        orientation="v",
-        yanchor="top",
-        y=0.98,
-        xanchor="right",
-        x=0.99,
+        orientation="h",      # horizontal (aside)
+        yanchor="bottom",
+        y=1.02,               # just above plotting area, below title
+        xanchor="left",
+        x=0.0,
         font=dict(size=10),
-        bgcolor="rgba(255,255,255,0.6)",
+        bgcolor="rgba(255,255,255,0.0)",
     ),
-    margin=dict(l=10, r=10, t=50, b=10),
 )
 st.plotly_chart(fig_macd, use_container_width=True)
 
