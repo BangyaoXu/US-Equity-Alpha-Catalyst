@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import glob
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -39,6 +40,185 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 # =========================
 # UTILITIES
 # =========================
+
+def normalize_sec_ticker(t: str) -> str:
+    t = (t or "").upper().strip()
+    return t.replace(".", "-")  # BRK.B -> BRK-B
+
+def _sec_headers() -> Dict[str, str]:
+    """
+    SEC requires a descriptive User-Agent. On Streamlit Cloud, you MUST include an email.
+    Put SEC_CONTACT in Streamlit secrets.
+    """
+    contact = ""
+    try:
+        contact = st.secrets.get("SEC_CONTACT", "")
+    except Exception:
+        contact = ""
+
+    ua = USER_AGENT
+    if contact and contact not in ua:
+        ua = f"{USER_AGENT} ({contact})"
+    return {
+        "User-Agent": ua,
+        "Accept-Encoding": "gzip, deflate",
+        "Accept": "application/json,text/html,*/*",
+    }
+
+@st.cache_data(ttl=24 * 60 * 60)
+def fetch_sec_ticker_map_safe() -> pd.DataFrame:
+    """
+    Same as before but returns empty DataFrame on any failure.
+    """
+    SEC_TICKER_MAP_URLS = [
+        "https://www.sec.gov/files/company_tickers.json",
+        "https://www.sec.gov/files/company_tickers_exchange.json",
+    ]
+    for url in SEC_TICKER_MAP_URLS:
+        try:
+            r = requests.get(url, headers=_sec_headers(), timeout=25)
+            if not (200 <= r.status_code < 300):
+                continue
+            data = r.json()
+            rows = []
+            if isinstance(data, dict):
+                for _, obj in data.items():
+                    t = str(obj.get("ticker", "")).upper().strip()
+                    cik = obj.get("cik_str", obj.get("cik", None))
+                    title = obj.get("title", obj.get("name", ""))
+                    if t and cik is not None:
+                        rows.append({"ticker": t, "cik": int(cik), "title": title})
+            elif isinstance(data, list):
+                for obj in data:
+                    t = str(obj.get("ticker", "")).upper().strip()
+                    cik = obj.get("cik_str", obj.get("cik", None))
+                    title = obj.get("title", obj.get("name", ""))
+                    if t and cik is not None:
+                        rows.append({"ticker": t, "cik": int(cik), "title": title})
+            df = pd.DataFrame(rows).drop_duplicates(subset=["ticker"])
+            if not df.empty:
+                return df
+        except Exception:
+            continue
+    return pd.DataFrame(columns=["ticker", "cik", "title"])
+
+def cik10(cik_int: int) -> str:
+    return str(int(cik_int)).zfill(10)
+
+@st.cache_data(ttl=CACHE_TTL_META)
+def fetch_sec_submissions_safe(cik_int: int) -> Dict:
+    url = f"https://data.sec.gov/submissions/CIK{cik10(cik_int)}.json"
+    try:
+        r = requests.get(url, headers=_sec_headers(), timeout=25)
+        if not (200 <= r.status_code < 300):
+            return {"_http_status": r.status_code, "_url": url}
+        return r.json() or {}
+    except Exception as e:
+        return {"_error": str(e), "_url": url}
+
+def _filing_doc_url(cik_int: int, accession: str, primary_doc: str) -> str:
+    acc_nodash = accession.replace("-", "")
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{primary_doc}"
+
+def _ixviewer_url(doc_url: str) -> str:
+    return f"https://www.sec.gov/ixviewer/documents/?doc={requests.utils.quote(doc_url)}"
+
+@st.cache_data(ttl=CACHE_TTL_META)
+def sec_lookup_cik_fallback_companyfacts(ticker: str) -> Optional[int]:
+    """
+    Fallback CIK lookup: queries SEC companyfacts using CIK candidates from ticker map
+    is NOT possible without a CIK, so this is a weak fallback; we instead try:
+      - use ticker map first
+      - if ticker map fails, return None (cannot infer CIK reliably without external DB)
+    Kept for structure; most fixes come from proper UA + normalization.
+    """
+    return None
+
+def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None, limit: int = 8) -> pd.DataFrame:
+    """
+    Robust version:
+      - normalizes ticker (BRK.B -> BRK-B)
+      - uses safe map/submissions fetch
+      - returns empty DF on any failure (no exceptions)
+    """
+    t_norm = normalize_sec_ticker(ticker)
+    m = fetch_sec_ticker_map_safe()
+    if m.empty:
+        return pd.DataFrame()
+
+    hit = m[m["ticker"] == t_norm].head(1)
+    if hit.empty and t_norm != ticker.upper():
+        hit = m[m["ticker"] == ticker.upper()].head(1)
+    if hit.empty:
+        return pd.DataFrame()
+
+    cik_int = int(hit["cik"].iloc[0])
+
+    # polite throttle to reduce 429s on Cloud
+    time.sleep(0.15)
+
+    sub = fetch_sec_submissions_safe(cik_int)
+    recent = (((sub or {}).get("filings") or {}).get("recent") or {})
+    if not recent:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(recent)
+    if df.empty:
+        return pd.DataFrame()
+
+    keep = [c for c in ["filingDate", "reportDate", "acceptanceDateTime", "form", "accessionNumber", "primaryDocument"] if c in df.columns]
+    df = df[keep].copy()
+    df["filingDate"] = pd.to_datetime(df.get("filingDate"), errors="coerce")
+
+    if forms:
+        df = df[df["form"].isin(forms)]
+
+    df = df.sort_values("filingDate", ascending=False).head(limit)
+
+    def make_link(row):
+        doc = str(row.get("primaryDocument", "") or "")
+        acc = str(row.get("accessionNumber", "") or "")
+        if not doc or not acc:
+            return ""
+        doc_url = _filing_doc_url(cik_int, acc, doc)
+        return _ixviewer_url(doc_url)
+
+    df["link"] = df.apply(make_link, axis=1)
+    df.insert(0, "ticker", ticker.upper())
+    df.insert(1, "cik", cik_int)
+    return df
+
+def nearest_earnings_catalyst(df: pd.DataFrame) -> Optional[pd.Timestamp]:
+    """
+    Bulletproof tz handling:
+    - Parses to UTC-aware
+    - Converts to UTC-naive
+    - Compares using numpy datetime64[ns]
+    """
+    if df is None or df.empty or "earnings_date" not in df.columns:
+        return None
+
+    dts = pd.to_datetime(df["earnings_date"], errors="coerce", utc=True).dropna()
+    if len(dts) == 0:
+        return None
+
+    # Series -> tz-naive UTC
+    try:
+        dts = dts.dt.tz_convert("UTC").dt.tz_localize(None)
+    except Exception:
+        dts = pd.to_datetime(dts, errors="coerce").dropna()
+
+    if len(dts) == 0:
+        return None
+
+    dts64 = dts.astype("datetime64[ns]").to_numpy()
+    now64 = np.datetime64(pd.Timestamp.utcnow().to_datetime64())
+
+    future = dts64[dts64 >= now64]
+    if future.size > 0:
+        return pd.Timestamp(future.min())
+    return pd.Timestamp(dts64.max())
+
 def parse_universe_date_from_filename(fn: str) -> Optional[str]:
     m = re.search(r"selected_universe_(\d{4}-\d{2}-\d{2})\.csv$", fn)
     return m.group(1) if m else None
@@ -1206,13 +1386,22 @@ st.subheader("SEC Filings & Earnings Catalysts")
 
 c_sec1, c_sec2 = st.columns([1.3, 1])
 with c_sec1:
-    forms_sel = st.multiselect("Filings to show", ["10-K", "10-Q", "8-K", "S-1", "DEF 14A"], default=["10-Q", "10-K", "8-K"])
+    forms_sel = st.multiselect(
+        "Filings to show",
+        ["10-K", "10-Q", "8-K", "S-1", "DEF 14A"],
+        default=["10-Q", "10-K", "8-K"],
+    )
 with c_sec2:
     filings_limit = st.slider("Max filings", min_value=3, max_value=20, value=8, step=1)
 
+# --- SEC Filings
 filings_df = get_latest_filings_for_ticker(ticker_sel, forms=forms_sel, limit=filings_limit)
-if filings_df.empty:
-    st.info("SEC filings unavailable (ticker->CIK mapping missing or submissions fetch blocked). Tip: set SEC_CONTACT in Streamlit secrets.")
+
+if filings_df is None or filings_df.empty:
+    st.info(
+        "SEC filings unavailable. On Streamlit Cloud this is usually due to SEC blocking your User-Agent.\n\n"
+        "Fix: add `SEC_CONTACT` (your email) in Streamlit secrets, and redeploy."
+    )
 else:
     show_df = filings_df.copy()
     show_df["filingDate"] = pd.to_datetime(show_df["filingDate"], errors="coerce").dt.date
@@ -1222,36 +1411,52 @@ else:
         height=260,
         column_config={"link": st.column_config.LinkColumn("Filing (SEC ixviewer)")},
     )
-    st.caption("Tip: open the latest 10-Q/10-K and jump to Items like 1A (Risk Factors), 2/7 (MD&A), 8 (Financials), or scan for 'guidance', 'outlook', 'restructuring', 'impairment', 'material weakness', etc.")
+    st.caption(
+        "Tip: open the latest 10-Q/10-K and jump to Items like 1A (Risk Factors), 2/7 (MD&A), 8 (Financials), "
+        "or scan for 'guidance', 'outlook', 'restructuring', 'impairment', 'material weakness', etc."
+    )
 
+# --- Earnings
 st.markdown("#### Earnings Calendar (best-effort)")
+
 earn_df = fetch_earnings_calendar_yf(ticker_sel, limit=12)
-if earn_df.empty:
+if earn_df is None or earn_df.empty:
     earn_df = fetch_earnings_calendar_fallback_info(ticker_sel)
 
-if earn_df.empty:
-    st.info("Earnings dates unavailable from free sources on this host/IP (yfinance limited).")
+if earn_df is None or earn_df.empty:
+    st.info("Earnings dates unavailable from free sources on this host/IP (yfinance often limited on Streamlit Cloud).")
 else:
-    # normalize for display
     earn_df = earn_df.copy()
+
+    # Ensure column exists and is parseable
+    if "earnings_date" not in earn_df.columns:
+        # try to locate any datetime-like column
+        for c in earn_df.columns:
+            if "earn" in c.lower() and "date" in c.lower():
+                earn_df = earn_df.rename(columns={c: "earnings_date"})
+                break
+
     earn_df["earnings_date"] = pd.to_datetime(earn_df["earnings_date"], errors="coerce", utc=True)
 
     show_cols = [c for c in ["earnings_date", "EPS Estimate", "Reported EPS", "Surprise(%)", "Revenue Estimate", "Reported Revenue"] if c in earn_df.columns]
     if not show_cols:
         show_cols = ["earnings_date"]
+
     st.dataframe(earn_df[show_cols].head(12), use_container_width=True, height=260)
 
     nxt = nearest_earnings_catalyst(earn_df)
-    if nxt is not None:
-        st.success(f"Nearest earnings catalyst (UTC): {nxt.strftime('%Y-%m-%d %H:%M')}")
+    if nxt is not None and pd.notna(nxt):
+        # nxt is tz-naive UTC timestamp
+        st.success(f"Nearest earnings catalyst (UTC): {pd.Timestamp(nxt).strftime('%Y-%m-%d %H:%M')}")
 
 # =========================
 # Investor Relations
 # =========================
 st.subheader("Investor Relations")
 
-website = info.get("website", "")
+website = (info or {}).get("website", "")
 base = normalize_base_url(website)
+
 if not base:
     st.write("Official website not available via yfinance for this ticker.")
 else:
