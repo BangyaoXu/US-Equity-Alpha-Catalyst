@@ -515,8 +515,17 @@ def extract_ir_news_links(ir_url: str, max_links=10) -> List[Tuple[str, str]]:
     return out
 
 # =========================
-# SEC EDGAR (robust) + FIXED LINKS
+# SEC EDGAR (robust links: Index + Primary always, ixviewer only for Inline XBRL)
 # =========================
+import time
+import requests
+
+SEC_BASE = "https://data.sec.gov"
+SEC_TICKER_MAP_URLS = [
+    "https://www.sec.gov/files/company_tickers.json",
+    "https://www.sec.gov/files/company_tickers_exchange.json",
+]
+
 def _sec_headers() -> Dict[str, str]:
     contact = ""
     try:
@@ -533,39 +542,29 @@ def _sec_headers() -> Dict[str, str]:
         "Connection": "keep-alive",
     }
 
-def _sec_get_json(url: str, timeout: int = 25, retries: int = 4) -> Tuple[Optional[Dict], Dict]:
-    meta = {"url": url, "status": None, "error": None}
+def _sec_get_json(url: str, timeout: int = 25, retries: int = 4) -> Optional[dict]:
     for i in range(retries):
         try:
             r = requests.get(url, headers=_sec_headers(), timeout=timeout)
-            meta["status"] = r.status_code
             if 200 <= r.status_code < 300:
-                return (r.json(), meta)
+                return r.json()
             if r.status_code in (403, 429, 500, 502, 503, 504):
                 time.sleep(0.6 * (2 ** i))
                 continue
-            meta["error"] = f"HTTP {r.status_code}"
-            return (None, meta)
-        except Exception as e:
-            meta["error"] = str(e)
+            return None
+        except Exception:
             time.sleep(0.6 * (2 ** i))
             continue
-    return (None, meta)
+    return None
 
 def normalize_sec_ticker(t: str) -> str:
     # BRK.B -> BRK-B, BF.B -> BF-B
     return (t or "").upper().strip().replace(".", "-")
 
 @st.cache_data(ttl=24 * 60 * 60)
-def fetch_sec_ticker_map() -> Tuple[pd.DataFrame, Dict]:
-    urls = [
-        "https://www.sec.gov/files/company_tickers.json",
-        "https://www.sec.gov/files/company_tickers_exchange.json",
-    ]
-    last_meta = {}
-    for url in urls:
-        data, meta = _sec_get_json(url)
-        last_meta = meta
+def fetch_sec_ticker_map() -> pd.DataFrame:
+    for url in SEC_TICKER_MAP_URLS:
+        data = _sec_get_json(url)
         if not data:
             continue
         rows = []
@@ -585,53 +584,62 @@ def fetch_sec_ticker_map() -> Tuple[pd.DataFrame, Dict]:
                     rows.append({"ticker": t, "cik": int(cik), "title": title})
         df = pd.DataFrame(rows).drop_duplicates(subset=["ticker"])
         if not df.empty:
-            return df, meta
-    return pd.DataFrame(columns=["ticker", "cik", "title"]), last_meta
+            return df
+    return pd.DataFrame(columns=["ticker", "cik", "title"])
 
 def cik10(cik_int: int) -> str:
     return str(int(cik_int)).zfill(10)
 
 @st.cache_data(ttl=CACHE_TTL_META)
-def fetch_sec_submissions(cik_int: int) -> Tuple[Optional[Dict], Dict]:
-    url = f"https://data.sec.gov/submissions/CIK{cik10(cik_int)}.json"
-    data, meta = _sec_get_json(url)
-    return data, meta
+def fetch_sec_submissions(cik_int: int) -> dict:
+    url = f"{SEC_BASE}/submissions/CIK{cik10(cik_int)}.json"
+    data = _sec_get_json(url)
+    return data or {}
 
-def _sec_ixviewer_url_from_path(doc_path: str) -> str:
-    """
-    IMPORTANT: ixviewer expects doc= a PATH like /Archives/edgar/data/... not a full URL.
-    """
+def _sec_index_url(cik_int: int, accession: str) -> str:
+    # Index is always: {accession}-index.html (with dashes in accession)
+    acc_nodash = accession.replace("-", "")
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{accession}-index.html"
+
+def _sec_primary_url(cik_int: int, accession: str, primary_doc: str) -> str:
+    acc_nodash = accession.replace("-", "")
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{primary_doc}"
+
+def _sec_ixviewer_url_from_primary(cik_int: int, accession: str, primary_doc: str) -> str:
+    # ixviewer wants doc= PATH (not full URL) — but only meaningful for Inline XBRL filings
+    acc_nodash = accession.replace("-", "")
+    doc_path = f"/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{primary_doc}"
     return f"https://www.sec.gov/ixviewer/documents/?doc={requests.utils.quote(doc_path)}"
 
-def _sec_archives_url(doc_path: str) -> str:
-    return f"https://www.sec.gov{doc_path}"
-
-def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None, limit: int = 8) -> Tuple[pd.DataFrame, Dict]:
-    t_norm = normalize_sec_ticker(ticker)
-    m, meta_map = fetch_sec_ticker_map()
+def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None, limit: int = 8) -> pd.DataFrame:
+    m = fetch_sec_ticker_map()
     if m.empty:
-        return pd.DataFrame(), {"stage": "ticker_map", **meta_map}
+        return pd.DataFrame()
 
+    t_norm = normalize_sec_ticker(ticker)
     hit = m[m["ticker"] == t_norm].head(1)
-    if hit.empty and t_norm != ticker.upper():
+    if hit.empty:
         hit = m[m["ticker"] == ticker.upper()].head(1)
     if hit.empty:
-        return pd.DataFrame(), {"stage": "ticker_lookup", "error": f"{t_norm} not found in SEC map"}
+        return pd.DataFrame()
 
     cik_int = int(hit["cik"].iloc[0])
-    sub, meta_sub = fetch_sec_submissions(cik_int)
-    if not sub:
-        return pd.DataFrame(), {"stage": "submissions", "cik": cik_int, **meta_sub}
-
+    sub = fetch_sec_submissions(cik_int)
     recent = (((sub or {}).get("filings") or {}).get("recent") or {})
     if not recent:
-        return pd.DataFrame(), {"stage": "recent_empty", "cik": cik_int}
+        return pd.DataFrame()
 
     df = pd.DataFrame(recent)
     if df.empty:
-        return pd.DataFrame(), {"stage": "recent_df_empty", "cik": cik_int}
+        return pd.DataFrame()
 
-    keep = [c for c in ["filingDate", "reportDate", "acceptanceDateTime", "form", "accessionNumber", "primaryDocument"] if c in df.columns]
+    # Keep flags if present so we can decide ixviewer usage
+    keep = [c for c in [
+        "filingDate", "reportDate", "acceptanceDateTime",
+        "form", "accessionNumber", "primaryDocument",
+        "isXBRL", "isInlineXBRL"
+    ] if c in df.columns]
+
     df = df[keep].copy()
     df["filingDate"] = pd.to_datetime(df.get("filingDate"), errors="coerce")
 
@@ -639,25 +647,31 @@ def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None
         df = df[df["form"].isin(forms)]
     df = df.sort_values("filingDate", ascending=False).head(limit)
 
-    def make_links(row):
-        doc = str(row.get("primaryDocument", "") or "")
+    # Build links
+    def build_links(row):
         acc = str(row.get("accessionNumber", "") or "")
-        if not doc or not acc:
-            return pd.Series({"ixviewer": "", "archives": ""})
-        acc_nodash = acc.replace("-", "")
-        # ixviewer expects PATH (not full URL)
-        doc_path = f"/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{doc}"
-        return pd.Series({
-            "ixviewer": _sec_ixviewer_url_from_path(doc_path),
-            "archives": _sec_archives_url(doc_path),
-        })
+        doc = str(row.get("primaryDocument", "") or "")
+        if not acc:
+            return pd.Series({"index_url": "", "primary_url": "", "ixviewer_url": ""})
 
-    links = df.apply(make_links, axis=1)
+        index_url = _sec_index_url(cik_int, acc)
+        primary_url = _sec_primary_url(cik_int, acc, doc) if doc else ""
+
+        inline_flag = row.get("isInlineXBRL", None)
+        try:
+            inline_flag = int(inline_flag) if inline_flag is not None and str(inline_flag) != "nan" else 0
+        except Exception:
+            inline_flag = 0
+
+        ixviewer_url = _sec_ixviewer_url_from_primary(cik_int, acc, doc) if (inline_flag == 1 and doc) else ""
+        return pd.Series({"index_url": index_url, "primary_url": primary_url, "ixviewer_url": ixviewer_url})
+
+    links = df.apply(build_links, axis=1)
     df = pd.concat([df, links], axis=1)
 
     df.insert(0, "ticker", ticker.upper())
     df.insert(1, "cik", cik_int)
-    return df, {"stage": "ok", "cik": cik_int}
+    return df
 
 # =========================
 # Earnings (robust)
@@ -1135,51 +1149,40 @@ else:
         pol = sentiment_polarity(title)
         st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_ | polarity: `{pol:+.2f}`")
 
-# =========================
-# SEC Filings & Earnings Catalysts (links fixed)
-# =========================
 st.subheader("SEC Filings & Earnings Catalysts")
 
 c_sec1, c_sec2 = st.columns([1.3, 1])
 with c_sec1:
-    forms_sel = st.multiselect("Filings to show", ["10-K", "10-Q", "8-K", "S-1", "DEF 14A"], default=["10-Q", "10-K", "8-K"])
+    forms_sel = st.multiselect(
+        "Filings to show",
+        ["10-K", "10-Q", "8-K", "S-1", "DEF 14A"],
+        default=["10-Q", "10-K", "8-K"],
+    )
 with c_sec2:
     filings_limit = st.slider("Max filings", min_value=3, max_value=20, value=8, step=1)
 
-filings_df, filings_meta = get_latest_filings_for_ticker(ticker_sel, forms=forms_sel, limit=filings_limit)
+filings_df = get_latest_filings_for_ticker(ticker_sel, forms=forms_sel, limit=filings_limit)
+
 if filings_df.empty:
-    st.info("SEC filings unavailable.")
-    st.code(filings_meta, language="python")
+    st.info("SEC filings unavailable (ticker->CIK mapping missing OR submissions fetch blocked).")
 else:
     show_df = filings_df.copy()
     show_df["filingDate"] = pd.to_datetime(show_df["filingDate"], errors="coerce").dt.date
+
+    cols = ["ticker", "form", "filingDate", "reportDate", "accessionNumber", "index_url", "primary_url", "ixviewer_url"]
+    cols = [c for c in cols if c in show_df.columns]
+
     st.dataframe(
-        show_df[["ticker", "form", "filingDate", "reportDate", "accessionNumber", "ixviewer", "archives"]],
+        show_df[cols],
         use_container_width=True,
-        height=280,
+        height=300,
         column_config={
-            "ixviewer": st.column_config.LinkColumn("SEC ixviewer"),
-            "archives": st.column_config.LinkColumn("SEC Archives"),
+            "index_url": st.column_config.LinkColumn("EDGAR Index (best)"),
+            "primary_url": st.column_config.LinkColumn("Primary Doc"),
+            "ixviewer_url": st.column_config.LinkColumn("ixviewer (Inline XBRL only)"),
         },
     )
-    st.caption("Links fixed: ixviewer now uses doc=PATH (/Archives/...), not a full URL.")
-
-st.markdown("#### Earnings Calendar (best-effort)")
-earn_df = fetch_earnings_calendar_yf(ticker_sel, limit=12)
-if earn_df.empty:
-    earn_df = fetch_earnings_calendar_fallback_info(ticker_sel)
-
-if earn_df.empty:
-    st.info("Earnings dates unavailable from free sources on this host/IP (yfinance may be limited on Streamlit Cloud).")
-else:
-    earn_df = earn_df.copy()
-    earn_df["earnings_date"] = pd.to_datetime(earn_df["earnings_date"], errors="coerce", utc=True)
-    show_cols = [c for c in ["earnings_date", "EPS Estimate", "Reported EPS", "Surprise(%)", "Revenue Estimate", "Reported Revenue"] if c in earn_df.columns] or ["earnings_date"]
-    st.dataframe(earn_df[show_cols].head(12), use_container_width=True, height=260)
-
-    nxt = nearest_earnings_catalyst(earn_df)
-    if nxt is not None:
-        st.success(f"Nearest earnings catalyst (UTC): {pd.Timestamp(nxt).strftime('%Y-%m-%d %H:%M')}")
+    st.caption("Use **EDGAR Index** as the default. ixviewer appears only when `isInlineXBRL=1`.")
 
 # =========================
 # Investor Relations
