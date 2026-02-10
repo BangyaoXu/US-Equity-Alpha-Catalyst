@@ -1185,6 +1185,139 @@ else:
     st.caption("Use **EDGAR Index** as the default. ixviewer appears only when `isInlineXBRL=1`.")
 
 # =========================
+# Earnings Calendar (best-effort, robust)
+# =========================
+st.markdown("#### Earnings Calendar")
+
+@st.cache_data(ttl=CACHE_TTL_META)
+def fetch_earnings_calendar_yf(ticker: str, limit: int = 12) -> pd.DataFrame:
+    """
+    Uses yfinance get_earnings_dates (if available). Returns a dataframe with:
+      earnings_date + (optional) EPS Estimate, Reported EPS, Surprise(%), Revenue Estimate, Reported Revenue
+    """
+    try:
+        t = yf.Ticker(ticker)
+        df = t.get_earnings_dates(limit=limit)
+        if df is None or isinstance(df, dict) or df.empty:
+            return pd.DataFrame()
+        out = df.reset_index()
+        if "Earnings Date" in out.columns:
+            out = out.rename(columns={"Earnings Date": "earnings_date"})
+        elif out.columns[0] != "earnings_date":
+            out = out.rename(columns={out.columns[0]: "earnings_date"})
+        out["earnings_date"] = pd.to_datetime(out["earnings_date"], errors="coerce", utc=True)
+        return out.sort_values("earnings_date", ascending=False)
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=CACHE_TTL_META)
+def fetch_earnings_calendar_from_calendar(ticker: str) -> pd.DataFrame:
+    """
+    Fallback #1: yf.Ticker(ticker).calendar (sometimes returns next earnings date)
+    """
+    try:
+        t = yf.Ticker(ticker)
+        cal = t.calendar
+        if cal is None:
+            return pd.DataFrame()
+        # yfinance sometimes returns a DataFrame or dict-like
+        if isinstance(cal, pd.DataFrame) and not cal.empty:
+            # try common keys
+            for key in ["Earnings Date", "EarningsDate", "Earnings"]:
+                if key in cal.index:
+                    v = cal.loc[key].values
+                    dts = [pd.to_datetime(x, errors="coerce", utc=True) for x in v]
+                    dts = [x for x in dts if pd.notna(x)]
+                    if dts:
+                        return pd.DataFrame({"earnings_date": sorted(set(dts), reverse=True)})
+        if isinstance(cal, dict):
+            for key in ["Earnings Date", "EarningsDate", "Earnings"]:
+                if key in cal:
+                    v = cal[key]
+                    if isinstance(v, (list, tuple)):
+                        dts = [pd.to_datetime(x, errors="coerce", utc=True) for x in v]
+                    else:
+                        dts = [pd.to_datetime(v, errors="coerce", utc=True)]
+                    dts = [x for x in dts if pd.notna(x)]
+                    if dts:
+                        return pd.DataFrame({"earnings_date": sorted(set(dts), reverse=True)})
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=CACHE_TTL_META)
+def fetch_earnings_calendar_from_info(ticker: str) -> pd.DataFrame:
+    """
+    Fallback #2: timestamps in .info (earningsTimestamp / Start / End)
+    """
+    try:
+        info = fetch_info_one(ticker) or {}
+        keys = ["earningsTimestamp", "earningsTimestampStart", "earningsTimestampEnd"]
+        dts = []
+        for k in keys:
+            v = info.get(k)
+            if v is None:
+                continue
+            if isinstance(v, (list, tuple)):
+                for vv in v:
+                    if isinstance(vv, (int, float)) and vv > 0:
+                        dts.append(pd.to_datetime(int(vv), unit="s", utc=True))
+            else:
+                if isinstance(v, (int, float)) and v > 0:
+                    dts.append(pd.to_datetime(int(v), unit="s", utc=True))
+        if not dts:
+            return pd.DataFrame()
+        return pd.DataFrame({"earnings_date": sorted(set(dts), reverse=True)})
+    except Exception:
+        return pd.DataFrame()
+
+def nearest_earnings_catalyst(earn_df: pd.DataFrame) -> Optional[pd.Timestamp]:
+    """
+    Robust: converts everything to tz-naive UTC numpy datetime64 before comparing.
+    Avoids pandas InvalidComparison/TypeError.
+    """
+    if earn_df is None or earn_df.empty or "earnings_date" not in earn_df.columns:
+        return None
+
+    dts = pd.to_datetime(earn_df["earnings_date"], errors="coerce", utc=True).dropna()
+    if dts.empty:
+        return None
+
+    # convert to tz-naive UTC for safe comparisons
+    dts_naive = dts.dt.tz_convert("UTC").dt.tz_localize(None)
+    arr = dts_naive.astype("datetime64[ns]").to_numpy()
+
+    now = np.datetime64(pd.Timestamp.utcnow().to_datetime64())
+    future = arr[arr >= now]
+
+    if future.size > 0:
+        return pd.Timestamp(future.min())
+    return pd.Timestamp(arr.max())
+
+# --- fetch with fallbacks
+earn_df = fetch_earnings_calendar_yf(ticker_sel, limit=12)
+if earn_df.empty:
+    earn_df = fetch_earnings_calendar_from_calendar(ticker_sel)
+if earn_df.empty:
+    earn_df = fetch_earnings_calendar_from_info(ticker_sel)
+
+if earn_df.empty:
+    st.info("Earnings dates unavailable from free sources on this host/IP (yfinance often limited on Streamlit Cloud).")
+else:
+    earn_df = earn_df.copy()
+    earn_df["earnings_date"] = pd.to_datetime(earn_df["earnings_date"], errors="coerce", utc=True)
+
+    show_cols = [c for c in ["earnings_date", "EPS Estimate", "Reported EPS", "Surprise(%)", "Revenue Estimate", "Reported Revenue"] if c in earn_df.columns]
+    if not show_cols:
+        show_cols = ["earnings_date"]
+
+    st.dataframe(earn_df[show_cols].head(12), use_container_width=True, height=260)
+
+    nxt = nearest_earnings_catalyst(earn_df)
+    if nxt is not None:
+        st.success(f"Nearest earnings catalyst (UTC): {nxt.strftime('%Y-%m-%d %H:%M')}")
+
+# =========================
 # Investor Relations
 # =========================
 st.subheader("Investor Relations")
