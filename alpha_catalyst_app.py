@@ -6,6 +6,7 @@ import glob
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from io import StringIO
 
 import numpy as np
 import pandas as pd
@@ -97,25 +98,27 @@ def get_ohlc_from_panel(px_panel: pd.DataFrame, ticker: str) -> pd.DataFrame:
       first level ticker, second level OHLCV.
     For single ticker, sometimes it returns single-index OHLCV.
     """
-    if px_panel is None or px_panel.empty:
+    if px_panel is None or getattr(px_panel, "empty", True):
         return pd.DataFrame()
+
     if isinstance(px_panel.columns, pd.MultiIndex):
+        # exact match
         if ticker in px_panel.columns.levels[0]:
             df = px_panel[ticker].copy()
             df.columns = [str(c) for c in df.columns]
             return df
-        # fall back: try match normalized
+        # case-insensitive fallback
         for t in px_panel.columns.levels[0]:
             if str(t).upper() == str(ticker).upper():
                 df = px_panel[t].copy()
                 df.columns = [str(c) for c in df.columns]
                 return df
         return pd.DataFrame()
-    else:
-        # single ticker frame
-        df = px_panel.copy()
-        df.columns = [str(c) for c in df.columns]
-        return df
+
+    # single ticker frame
+    df = px_panel.copy()
+    df.columns = [str(c) for c in df.columns]
+    return df
 
 def normalize_universe_keep_original(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], Dict[str, str]]:
     df = df.copy()
@@ -147,7 +150,6 @@ def normalize_universe_keep_original(df: pd.DataFrame) -> Tuple[pd.DataFrame, Li
         if c and c not in present:
             present.append(c)
 
-    # return also canonical mapping (so we can find sector/industry columns in original row)
     canonical = {
         "company": company_col or "",
         "ticker": ticker_col,
@@ -160,7 +162,6 @@ def normalize_universe_keep_original(df: pd.DataFrame) -> Tuple[pd.DataFrame, Li
 # FREE SECTOR-INDICATOR ENGINE (best-effort)
 # =========================
 def _fred_csv_url(series_id: str) -> str:
-    # no key required for the CSV download endpoint
     return f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={requests.utils.quote(series_id)}"
 
 @st.cache_data(ttl=CACHE_TTL_INDICATORS)
@@ -180,7 +181,6 @@ def fetch_fred_series(series_id: str) -> pd.DataFrame:
         if not (200 <= r.status_code < 300):
             return pd.DataFrame(columns=["date", "value"])
 
-        from io import StringIO
         df = pd.read_csv(StringIO(r.text))
         if df is None or df.empty:
             return pd.DataFrame(columns=["date", "value"])
@@ -200,8 +200,8 @@ def fetch_fred_series(series_id: str) -> pd.DataFrame:
 @st.cache_data(ttl=CACHE_TTL_INDICATORS)
 def fetch_yf_series(symbol: str, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
     """
-    Free proxy via yfinance. Defensive: handles empty frames and missing 'Close' (prevents KeyError).
-    Returns columns: ['date', 'value'].
+    yfinance (best-effort). Returns columns: ['date','value'].
+    If yfinance is blocked/rate-limited on Streamlit Cloud, caller should fallback (Stooq).
     """
     try:
         px = yf.download(
@@ -210,7 +210,7 @@ def fetch_yf_series(symbol: str, period: str = "5y", interval: str = "1d") -> pd
             interval=interval,
             auto_adjust=True,
             progress=False,
-            threads=False,
+            threads=False,  # more stable on Streamlit Cloud
         )
     except Exception:
         return pd.DataFrame(columns=["date", "value"])
@@ -218,17 +218,12 @@ def fetch_yf_series(symbol: str, period: str = "5y", interval: str = "1d") -> pd
     if px is None or px.empty:
         return pd.DataFrame(columns=["date", "value"])
 
-    # Normalize column names
     px.columns = [str(c) for c in px.columns]
-
-    # Sometimes 'Close' is missing for invalid / unsupported symbols
     if "Close" not in px.columns:
-        # Try a few common variants
         for alt in ["Adj Close", "AdjClose", "close", "CLOSE"]:
             if alt in px.columns:
                 px = px.rename(columns={alt: "Close"})
                 break
-
     if "Close" not in px.columns:
         return pd.DataFrame(columns=["date", "value"])
 
@@ -237,20 +232,42 @@ def fetch_yf_series(symbol: str, period: str = "5y", interval: str = "1d") -> pd
         return pd.DataFrame(columns=["date", "value"])
 
     out = px[["Close"]].copy().reset_index()
-
-    # yfinance usually uses a DatetimeIndex named 'Date'
     date_col = "Date" if "Date" in out.columns else out.columns[0]
     out = out.rename(columns={date_col: "date", "Close": "value"})
-
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
     out["value"] = pd.to_numeric(out["value"], errors="coerce")
     return out.dropna(subset=["date"]).sort_values("date")
 
+@st.cache_data(ttl=CACHE_TTL_INDICATORS)
+def fetch_stooq_series(symbol: str) -> pd.DataFrame:
+    """
+    Free, no-key fallback via Stooq daily CSV.
+    Stooq symbols look like: 'spy.us', 'qqq.us', 'soxx.us', 'vixy.us', 'uup.us', 'gld.us'
+    Returns columns: ['date','value'].
+    """
+    try:
+        url = f"https://stooq.com/q/d/l/?s={requests.utils.quote(symbol.lower())}&i=d"
+        r = requests.get(url, headers={"User-Agent": USER_AGENT, "Accept": "text/csv,*/*"}, timeout=20)
+        if not (200 <= r.status_code < 300):
+            return pd.DataFrame(columns=["date", "value"])
+        df = pd.read_csv(StringIO(r.text))
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["date", "value"])
+        cols = {c.lower(): c for c in df.columns}
+        date_c = cols.get("date", df.columns[0])
+        close_c = cols.get("close", None)
+        if close_c is None:
+            return pd.DataFrame(columns=["date", "value"])
+        out = df[[date_c, close_c]].copy()
+        out.columns = ["date", "value"]
+        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+        out["value"] = pd.to_numeric(out["value"], errors="coerce")
+        out = out.dropna(subset=["date"]).sort_values("date")
+        return out
+    except Exception:
+        return pd.DataFrame(columns=["date", "value"])
+
 def infer_sector_bucket(zacks_sector: str) -> str:
-    """
-    Map your CSV's Zacks sector strings into broad buckets used in our indicator config.
-    If unknown, fall back to 'General'.
-    """
     s = (zacks_sector or "").strip().lower()
     if not s:
         return "General"
@@ -308,13 +325,14 @@ def infer_sector_bucket(zacks_sector: str) -> str:
     return "General"
 
 # Indicator catalog:
-# - source: "fred" or "yfinance"
+# - source: "fred" or "yfinance" or "computed"
 # - id: series id / symbol
-# - bullish: "higher" or "lower" (how to interpret up move)
+# - stooq: stooq symbol for fallback where possible
+# - bullish: "higher" or "lower"
 INDICATORS: Dict[str, Dict] = {
-    # General / cross-sector
-    "SP500": {"name": "S&P 500 (proxy)", "source": "yfinance", "id": "^GSPC", "bullish": "higher"},
-    "VIX": {"name": "VIX", "source": "yfinance", "id": "^VIX", "bullish": "lower"},
+    # General / cross-sector (avoid caret indices; use ETF proxies + Stooq fallback)
+    "SP500": {"name": "S&P 500 (SPY)", "source": "yfinance", "id": "SPY", "stooq": "spy.us", "bullish": "higher"},
+    "VIX": {"name": "VIX (VIXY proxy)", "source": "yfinance", "id": "VIXY", "stooq": "vixy.us", "bullish": "lower"},
     "DXY": {"name": "Broad USD Index (FRED)", "source": "fred", "id": "DTWEXBGS", "bullish": "lower"},
     "UST10Y": {"name": "10Y Treasury Yield", "source": "fred", "id": "DGS10", "bullish": "lower"},
     "UST2Y": {"name": "2Y Treasury Yield", "source": "fred", "id": "DGS2", "bullish": "lower"},
@@ -335,25 +353,24 @@ INDICATORS: Dict[str, Dict] = {
     "HOUST": {"name": "Housing Starts", "source": "fred", "id": "HOUST", "bullish": "higher"},
     "CSUSHPINSA": {"name": "Case-Shiller Home Price Index", "source": "fred", "id": "CSUSHPINSA", "bullish": "higher"},
 
-    # Energy / Materials (commodity proxies) — prefer FRED for hosted reliability (no key required)
+    # Energy / Materials (FRED commodities)
     "WTI": {"name": "WTI Spot ($/bbl) (FRED)", "source": "fred", "id": "DCOILWTICO", "bullish": "higher"},
     "BRENT": {"name": "Brent Spot ($/bbl) (FRED)", "source": "fred", "id": "DCOILBRENTEU", "bullish": "higher"},
     "NATGAS": {"name": "Nat Gas Henry Hub ($/MMBtu) (FRED)", "source": "fred", "id": "DHHNGSP", "bullish": "higher"},
     "COPPER": {"name": "Copper Global ($/mt) (FRED)", "source": "fred", "id": "PCOPPUSDM", "bullish": "higher"},
     "ALUMINUM": {"name": "Aluminum Global ($/mt) (FRED)", "source": "fred", "id": "PALUMUSDM", "bullish": "higher"},
-    "GOLD": {"name": "Gold proxy (GLD)", "source": "yfinance", "id": "GLD", "bullish": "higher"},
+    "GOLD": {"name": "Gold (GLD)", "source": "yfinance", "id": "GLD", "stooq": "gld.us", "bullish": "higher"},
 
     # Financials
     "CREDIT_SPREAD": {"name": "BBB Corporate Spread (proxy)", "source": "fred", "id": "BAA10Y", "bullish": "lower"},
     "UNRATE": {"name": "Unemployment Rate", "source": "fred", "id": "UNRATE", "bullish": "lower"},
     "FEDFUNDS": {"name": "Fed Funds Rate", "source": "fred", "id": "FEDFUNDS", "bullish": "lower"},
 
-    # Tech / chip cycle proxies (public series are limited; use market proxies)
-    "SOX": {"name": "PHLX Semiconductor Index", "source": "yfinance", "id": "^SOX", "bullish": "higher"},
-    "NDX": {"name": "Nasdaq-100", "source": "yfinance", "id": "^NDX", "bullish": "higher"},
+    # Tech / chip cycle proxies (ETF proxies instead of ^NDX/^SOX)
+    "SOX": {"name": "Semis (SOXX)", "source": "yfinance", "id": "SOXX", "stooq": "soxx.us", "bullish": "higher"},
+    "NDX": {"name": "Nasdaq-100 (QQQ)", "source": "yfinance", "id": "QQQ", "stooq": "qqq.us", "bullish": "higher"},
 }
 
-# Sector -> indicator keys (best-effort; extend as you like)
 SECTOR_TO_INDICATORS: Dict[str, List[str]] = {
     "General": ["SP500", "VIX", "DXY", "UST10Y", "YC_10_2"],
     "Healthcare": ["SP500", "VIX", "UST10Y"],
@@ -382,18 +399,26 @@ def compute_curve_10_2() -> pd.DataFrame:
 def fetch_indicator_series(ind_key: str) -> pd.DataFrame:
     cfg = INDICATORS.get(ind_key, {})
     src = cfg.get("source")
+
     if src == "fred":
         return fetch_fred_series(cfg["id"])
-    if src == "yfinance":
-        return fetch_yf_series(cfg["id"])
+
     if src == "computed" and ind_key == "YC_10_2":
         return compute_curve_10_2()
+
+    if src == "yfinance":
+        ser = fetch_yf_series(cfg.get("id", ""))
+        if ser is not None and not ser.empty:
+            return ser
+        stooq_id = cfg.get("stooq", "")
+        if stooq_id:
+            return fetch_stooq_series(stooq_id)
+        return pd.DataFrame()
+
     return pd.DataFrame()
 
 def indicator_snapshot(df: pd.DataFrame) -> Dict[str, float]:
-    """
-    latest, 1w change, 1m change, zscore(1y)
-    """
+    """latest, 1w change, 1m change, zscore(≈1y)"""
     if df is None or df.empty:
         return {"latest": np.nan, "chg_1w": np.nan, "chg_1m": np.nan, "z_1y": np.nan}
 
@@ -403,18 +428,10 @@ def indicator_snapshot(df: pd.DataFrame) -> Dict[str, float]:
         return {"latest": np.nan, "chg_1w": np.nan, "chg_1m": np.nan, "z_1y": np.nan}
 
     latest = float(s["value"].iloc[-1])
-    # find closest 5 business days and 21 business days ago (approx)
     v = s["value"].values
-    if len(v) >= 6:
-        chg_1w = latest - float(v[-6])
-    else:
-        chg_1w = np.nan
-    if len(v) >= 22:
-        chg_1m = latest - float(v[-22])
-    else:
-        chg_1m = np.nan
+    chg_1w = latest - float(v[-6]) if len(v) >= 6 else np.nan
+    chg_1m = latest - float(v[-22]) if len(v) >= 22 else np.nan
 
-    # 1y zscore (252d / 12m for monthly series)
     tail = s.tail(260)
     mu = tail["value"].mean()
     sd = tail["value"].std(ddof=0)
@@ -422,11 +439,6 @@ def indicator_snapshot(df: pd.DataFrame) -> Dict[str, float]:
     return {"latest": latest, "chg_1w": chg_1w, "chg_1m": chg_1m, "z_1y": z}
 
 def indicator_signal(cfg: Dict, snap: Dict[str, float]) -> Tuple[str, float]:
-    """
-    Very simple, interpretable signal:
-    - based on 1m change and bullish direction.
-    Returns (label, score in [-1, +1]).
-    """
     bullish = cfg.get("bullish", "higher")
     chg = snap.get("chg_1m", np.nan)
     if not np.isfinite(chg):
@@ -441,16 +453,19 @@ def indicator_signal(cfg: Dict, snap: Dict[str, float]) -> Tuple[str, float]:
 # =========================
 @st.cache_data(ttl=CACHE_TTL_PRICES)
 def fetch_prices_panel(tickers: List[str], period: str = DEFAULT_PRICE_PERIOD, interval: str = DEFAULT_PRICE_INTERVAL) -> pd.DataFrame:
-    px = yf.download(
-        tickers=tickers,
-        period=period,
-        interval=interval,
-        auto_adjust=True,
-        group_by="ticker",
-        threads=True,
-        progress=False,
-    )
-    return px
+    try:
+        px_panel = yf.download(
+            tickers=tickers,
+            period=period,
+            interval=interval,
+            auto_adjust=True,
+            group_by="ticker",
+            threads=False,  # Cloud stability
+            progress=False,
+        )
+        return px_panel
+    except Exception:
+        return pd.DataFrame()
 
 @st.cache_data(ttl=CACHE_TTL_META)
 def fetch_info_one(ticker: str) -> Dict:
@@ -571,7 +586,6 @@ def extract_ir_news_links(ir_url: str, max_links=10) -> List[Tuple[str, str]]:
             break
     return out
 
-
 # =========================
 # SEC EDGAR (latest filings) + EARNINGS CALENDAR (best-effort)
 # =========================
@@ -582,8 +596,6 @@ SEC_TICKER_MAP_URLS = [
 ]
 
 def _sec_headers() -> Dict[str, str]:
-    # SEC asks for a descriptive User-Agent. Put an email in secrets if you want:
-    # st.secrets.get("SEC_CONTACT","you@example.com")
     contact = ""
     try:
         contact = st.secrets.get("SEC_CONTACT", "")
@@ -600,16 +612,12 @@ def _sec_headers() -> Dict[str, str]:
 
 @st.cache_data(ttl=24 * 60 * 60)
 def fetch_sec_ticker_map() -> pd.DataFrame:
-    """
-    Fetch SEC ticker->CIK mapping (no key). Returns columns: ticker, cik, title.
-    """
     for url in SEC_TICKER_MAP_URLS:
         try:
             r = requests.get(url, headers=_sec_headers(), timeout=20)
             if not (200 <= r.status_code < 300):
                 continue
             data = r.json()
-            # company_tickers.json: dict of {0:{cik_str, ticker, title}, ...}
             rows = []
             if isinstance(data, dict):
                 for _, obj in data.items():
@@ -651,13 +659,9 @@ def _filing_doc_url(cik_int: int, accession: str, primary_doc: str) -> str:
     return f"https://www.sec.gov/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{primary_doc}"
 
 def _ixviewer_url(doc_url: str) -> str:
-    # SEC inline XBRL viewer is convenient for reading
     return f"https://www.sec.gov/ixviewer/documents/?doc={requests.utils.quote(doc_url)}"
 
 def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None, limit: int = 8) -> pd.DataFrame:
-    """
-    Returns a small table of recent filings with links.
-    """
     m = fetch_sec_ticker_map()
     if m.empty:
         return pd.DataFrame()
@@ -681,7 +685,6 @@ def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None
         df = df[df["form"].isin(forms)]
     df = df.sort_values("filingDate", ascending=False).head(limit)
 
-    # build links
     def make_link(row):
         doc = str(row.get("primaryDocument", "") or "")
         acc = str(row.get("accessionNumber", "") or "")
@@ -697,21 +700,17 @@ def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None
 
 @st.cache_data(ttl=CACHE_TTL_META)
 def fetch_earnings_calendar_yf(ticker: str, limit: int = 8) -> pd.DataFrame:
-    """
-    Best-effort: yfinance earnings dates. Returns columns: earnings_date, eps_estimate, reported_eps, surprise(%), revenue_estimate, reported_revenue
-    """
     try:
         t = yf.Ticker(ticker)
         df = t.get_earnings_dates(limit=limit)
         if df is None or isinstance(df, dict) or df.empty:
             return pd.DataFrame()
         out = df.reset_index()
-        # yfinance uses index name "Earnings Date"
         if "Earnings Date" in out.columns:
             out = out.rename(columns={"Earnings Date": "earnings_date"})
         elif out.columns[0] not in ("earnings_date",):
             out = out.rename(columns={out.columns[0]: "earnings_date"})
-        out["earnings_date"] = pd.to_datetime(out["earnings_date"], errors="coerce")
+        out["earnings_date"] = pd.to_datetime(out["earnings_date"], errors="coerce", utc=True)
         return out.sort_values("earnings_date", ascending=False)
     except Exception:
         return pd.DataFrame()
@@ -719,10 +718,12 @@ def fetch_earnings_calendar_yf(ticker: str, limit: int = 8) -> pd.DataFrame:
 def nearest_earnings_catalyst(df: pd.DataFrame) -> Optional[pd.Timestamp]:
     if df is None or df.empty or "earnings_date" not in df.columns:
         return None
-    now = pd.Timestamp.utcnow().tz_localize(None)
-    dts = pd.to_datetime(df["earnings_date"], errors="coerce").dropna()
+    dts = pd.to_datetime(df["earnings_date"], errors="coerce", utc=True).dropna()
     if dts.empty:
         return None
+    # compare as UTC-naive
+    dts = dts.dt.tz_convert(None)
+    now = pd.Timestamp.utcnow()  # tz-naive UTC
     future = dts[dts >= now]
     if not future.empty:
         return future.min()
@@ -751,7 +752,6 @@ def score_rsi(rsi: pd.Series) -> Tuple[str, float]:
         return ("Buy (oversold)", 1.0)
     if v >= 70:
         return ("Sell (overbought)", -1.0)
-    # mild bias to direction
     dv = safe_last(rsi.diff())
     if np.isfinite(dv) and dv > 0:
         return ("Neutral (RSI rising)", 0.25)
@@ -768,15 +768,14 @@ def score_macd(macd_line: pd.Series, signal_line: pd.Series, hist: pd.Series) ->
     cross = 1.0 if m > s else (-1.0 if m < s else 0.0)
     accel = safe_last(hist.diff())
     bonus = 0.25 if np.isfinite(accel) and accel > 0 else (-0.25 if np.isfinite(accel) and accel < 0 else 0.0)
-    score = np.clip(cross + bonus, -1.0, 1.0)
+    score = float(np.clip(cross + bonus, -1.0, 1.0))
     label = "Buy (MACD>Signal)" if score > 0 else ("Sell (MACD<Signal)" if score < 0 else "Neutral")
-    return (label, float(score))
+    return (label, score)
 
 def score_kdj(k: pd.Series, d: pd.Series, j: pd.Series) -> Tuple[str, float]:
     kv, dv, jv = safe_last(k), safe_last(d), safe_last(j)
     if not np.isfinite(kv) or not np.isfinite(dv) or not np.isfinite(jv):
         return ("N/A", 0.0)
-    # crosses
     dk = safe_last((k - d))
     dk_prev = safe_last((k - d).shift(1))
     cross_up = np.isfinite(dk_prev) and dk_prev <= 0 and dk > 0
@@ -785,11 +784,81 @@ def score_kdj(k: pd.Series, d: pd.Series, j: pd.Series) -> Tuple[str, float]:
         return ("Buy (K/D cross up, oversold)", 1.0)
     if cross_dn and kv > 80:
         return ("Sell (K/D cross down, overbought)", -1.0)
-    # otherwise mild
     if kv > dv:
         return ("Neutral (K above D)", 0.25)
     if kv < dv:
         return ("Neutral (K below D)", -0.25)
+    return ("Neutral", 0.0)
+
+# ---- additional indicators (best-effort)
+def bollinger_bands(close: pd.Series, window: int = 20, n_std: float = 2.0):
+    mid = close.rolling(window).mean()
+    sd = close.rolling(window).std(ddof=0)
+    upper = mid + n_std * sd
+    lower = mid - n_std * sd
+    return mid, upper, lower
+
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    prev = close.shift(1)
+    tr = pd.concat([(high - low).abs(), (high - prev).abs(), (low - prev).abs()], axis=1).max(axis=1)
+    return tr
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
+    return true_range(high, low, close).rolling(window).mean()
+
+def obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    direction = np.sign(close.diff()).fillna(0.0)
+    return (direction * volume.fillna(0.0)).cumsum()
+
+def score_momentum(close: pd.Series, lookback: int) -> Tuple[str, float]:
+    if close is None or close.dropna().shape[0] < lookback + 2:
+        return ("N/A", 0.0)
+    ret = float(close.iloc[-1] / close.iloc[-(lookback + 1)] - 1.0)
+    if ret > 0.03:
+        return (f"Buy ({lookback}d momentum)", 1.0)
+    if ret < -0.03:
+        return (f"Sell ({lookback}d momentum)", -1.0)
+    return (f"Neutral ({lookback}d momentum)", 0.0)
+
+def score_bollinger(close: pd.Series) -> Tuple[str, float]:
+    mid, up, lo = bollinger_bands(close, 20, 2.0)
+    c = safe_last(close)
+    u = safe_last(up)
+    l = safe_last(lo)
+    m = safe_last(mid)
+    if not np.isfinite(c) or not np.isfinite(u) or not np.isfinite(l) or not np.isfinite(m):
+        return ("N/A", 0.0)
+    denom = (u - l)
+    if not np.isfinite(denom) or denom == 0:
+        return ("N/A", 0.0)
+    pos = (c - l) / denom
+    if pos <= 0.1:
+        return ("Buy (near lower band)", 0.75)
+    if pos >= 0.9:
+        return ("Sell (near upper band)", -0.75)
+    return ("Neutral (within bands)", 0.25 if c >= m else -0.25)
+
+def score_atr_pct(high: pd.Series, low: pd.Series, close: pd.Series) -> Tuple[str, float]:
+    a = atr(high, low, close, 14)
+    c = safe_last(close)
+    ap = safe_last(a) / c if np.isfinite(c) and c != 0 else np.nan
+    if not np.isfinite(ap):
+        return ("N/A", 0.0)
+    if ap > 0.06:
+        return ("Neutral (high volatility)", -0.25)
+    return ("Neutral (vol normal)", 0.0)
+
+def score_obv_trend(close: pd.Series, volume: Optional[pd.Series]) -> Tuple[str, float]:
+    if volume is None or volume.dropna().empty:
+        return ("N/A", 0.0)
+    o = obv(close, volume)
+    slope = safe_last(o.diff().rolling(5).mean())
+    if not np.isfinite(slope):
+        return ("N/A", 0.0)
+    if slope > 0:
+        return ("Neutral (OBV rising)", 0.25)
+    if slope < 0:
+        return ("Neutral (OBV falling)", -0.25)
     return ("Neutral", 0.0)
 
 # =========================
@@ -832,7 +901,6 @@ else:
     st.info("Preferred key columns not found. Showing the first 12 columns instead.")
     st.dataframe(uni.iloc[:, :12], use_container_width=True, height=320)
 
-# --- Ticker selector (moved up)
 tickers_all = uni["ticker_norm"].dropna().unique().tolist()
 tickers_all = sorted([t for t in tickers_all if t])
 
@@ -848,7 +916,7 @@ sector_bucket = infer_sector_bucket(sector_zacks)
 st.caption(f"Selected: **{ticker_sel}** | Sector (Zacks): **{sector_zacks}** | Bucket: **{sector_bucket}** | Industry: **{industry}**")
 
 # =========================
-# Sector-Specific Indicators (inserted section)
+# Sector-Specific Indicators
 # =========================
 st.subheader("Sector-Specific Indicators")
 
@@ -856,39 +924,24 @@ inds = SECTOR_TO_INDICATORS.get(sector_bucket, SECTOR_TO_INDICATORS["General"])
 if not inds:
     st.info("No indicators configured for this sector bucket.")
 else:
-    # build snapshot table
     rows = []
     for k in inds:
         cfg = INDICATORS.get(k, {})
-        try:
-            ser = fetch_indicator_series(k)
-            snap = indicator_snapshot(ser)
-            label, score = indicator_signal(cfg, snap)
-            rows.append({
-                "Indicator": cfg.get("name", k),
-                "Key": k,
-                "Source": cfg.get("source", ""),
-                "Series/Symbol": cfg.get("id", ""),
-                "Latest": snap["latest"],
-                "Δ 1w": snap["chg_1w"],
-                "Δ 1m": snap["chg_1m"],
-                "Z(≈1y)": snap["z_1y"],
-                "Signal": label,
-                "Score": score,
-            })
-        except Exception as e:
-            rows.append({
-                "Indicator": cfg.get("name", k),
-                "Key": k,
-                "Source": cfg.get("source", ""),
-                "Series/Symbol": cfg.get("id", ""),
-                "Latest": np.nan,
-                "Δ 1w": np.nan,
-                "Δ 1m": np.nan,
-                "Z(≈1y)": np.nan,
-                "Signal": "Error",
-                "Score": 0.0,
-            })
+        ser = fetch_indicator_series(k)
+        snap = indicator_snapshot(ser)
+        label, score = indicator_signal(cfg, snap)
+        rows.append({
+            "Indicator": cfg.get("name", k),
+            "Key": k,
+            "Source": cfg.get("source", ""),
+            "Series/Symbol": cfg.get("id", ""),
+            "Latest": snap["latest"],
+            "Δ 1w": snap["chg_1w"],
+            "Δ 1m": snap["chg_1m"],
+            "Z(≈1y)": snap["z_1y"],
+            "Signal": label,
+            "Score": score,
+        })
     snap_df = pd.DataFrame(rows)
     st.dataframe(
         snap_df,
@@ -903,25 +956,22 @@ else:
         },
     )
 
-    # show charts (2 columns grid)
     cols = st.columns(2)
     for i, k in enumerate(inds):
         cfg = INDICATORS.get(k, {})
         ser = fetch_indicator_series(k)
-        if ser is None or ser.empty:
-            with cols[i % 2]:
-                st.write(f"**{cfg.get('name', k)}**")
-                st.info("No data (symbol/series may not be available via free endpoints).")
-            continue
-        # recent window for readability
-        ser2 = ser.dropna().tail(3000).copy()
-        fig = px.line(ser2, x="date", y="value", title=cfg.get("name", k))
-        fig.update_layout(height=280, margin=dict(l=10, r=10, t=40, b=10))
         with cols[i % 2]:
-            st.plotly_chart(fig, use_container_width=True)
+            st.write(f"**{cfg.get('name', k)}**")
+            if ser is None or ser.empty:
+                st.info("No data (endpoint may be unavailable).")
+            else:
+                ser2 = ser.dropna().tail(3000).copy()
+                fig = px.line(ser2, x="date", y="value", title=None)
+                fig.update_layout(height=280, margin=dict(l=10, r=10, t=20, b=10))
+                st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# Technical Analysis (renamed & enriched)
+# Technical Analysis
 # =========================
 st.subheader("Technical Analysis")
 
@@ -939,8 +989,8 @@ df_t = df_t.dropna(subset=["Close"])
 close = df_t["Close"].astype(float)
 high = df_t["High"].astype(float) if "High" in df_t.columns else close
 low = df_t["Low"].astype(float) if "Low" in df_t.columns else close
+volume = df_t["Volume"].astype(float) if "Volume" in df_t.columns else None
 
-# EMAs requested: 5/10/20/60/120/250
 ema_spans = [5, 10, 20, 60, 120, 250]
 emas = {f"EMA{n}": ema(close, n) for n in ema_spans}
 
@@ -967,7 +1017,7 @@ fig_rsi = px.line(rsi_df, x="Date", y="RSI14", title="RSI(14)")
 fig_rsi.update_layout(height=260)
 st.plotly_chart(fig_rsi, use_container_width=True)
 
-# --- MACD
+# --- MACD (legend fix: smaller and above chart)
 macd_df = pd.DataFrame({
     "Date": close.index,
     "MACD": macd_line.values,
@@ -978,7 +1028,19 @@ fig_macd = go.Figure()
 fig_macd.add_trace(go.Scatter(x=macd_df["Date"], y=macd_df["MACD"], name="MACD"))
 fig_macd.add_trace(go.Scatter(x=macd_df["Date"], y=macd_df["Signal"], name="Signal"))
 fig_macd.add_trace(go.Bar(x=macd_df["Date"], y=macd_df["Hist"], name="Hist"))
-fig_macd.update_layout(title="MACD(12,26,9)", height=320, legend=dict(orientation="h"))
+fig_macd.update_layout(
+    title="MACD(12,26,9)",
+    height=320,
+    legend=dict(
+        orientation="h",
+        yanchor="bottom",
+        y=1.02,
+        xanchor="left",
+        x=0.0,
+        font=dict(size=10),
+    ),
+    margin=dict(l=10, r=10, t=50, b=10),
+)
 st.plotly_chart(fig_macd, use_container_width=True)
 
 # --- KDJ
@@ -987,18 +1049,23 @@ fig_kdj = px.line(kdj_df, x="Date", y=["K", "D", "J"], title="KDJ(9,3,3)")
 fig_kdj.update_layout(height=320)
 st.plotly_chart(fig_kdj, use_container_width=True)
 
-# --- Signals table + composite score
+# --- Signals table + composite score (EMA consolidated)
 sig_rows = []
 
-# EMA scores
+# EMA cluster
+ema_scores = []
+ema_details = []
 for n in ema_spans:
-    label, sc = score_ema_trend(close, emas[f"EMA{n}"])
-    sig_rows.append({
-        "Indicator": f"EMA Trend vs EMA{n}",
-        "Value": safe_last(close) - safe_last(emas[f"EMA{n}"]),
-        "Signal": label,
-        "Score": sc,
-    })
+    label_n, sc_n = score_ema_trend(close, emas[f"EMA{n}"])
+    ema_scores.append(sc_n)
+    ema_details.append(f"{n}:{sc_n:+.0f}")
+ema_cluster = float(np.nanmean(ema_scores)) if len(ema_scores) else 0.0
+sig_rows.append({
+    "Indicator": "EMA Cluster (5/10/20/60/120/250)",
+    "Value": ema_cluster,
+    "Signal": " / ".join(ema_details[:6]),
+    "Score": float(np.clip(ema_cluster, -1.0, 1.0)),
+})
 
 label, sc = score_rsi(rsi14)
 sig_rows.append({"Indicator": "RSI(14)", "Value": safe_last(rsi14), "Signal": label, "Score": sc})
@@ -1009,6 +1076,22 @@ sig_rows.append({"Indicator": "MACD(12,26,9)", "Value": safe_last(hist), "Signal
 label, sc = score_kdj(k_line, d_line, j_line)
 sig_rows.append({"Indicator": "KDJ(9,3,3)", "Value": safe_last(k_line), "Signal": label, "Score": sc})
 
+# Additional indicators
+label, sc = score_momentum(close, 20)
+sig_rows.append({"Indicator": "Momentum 20d", "Value": np.nan, "Signal": label, "Score": sc})
+
+label, sc = score_momentum(close, 60)
+sig_rows.append({"Indicator": "Momentum 60d", "Value": np.nan, "Signal": label, "Score": sc})
+
+label, sc = score_bollinger(close)
+sig_rows.append({"Indicator": "Bollinger(20,2)", "Value": np.nan, "Signal": label, "Score": sc})
+
+label, sc = score_atr_pct(high, low, close)
+sig_rows.append({"Indicator": "ATR% (14)", "Value": np.nan, "Signal": label, "Score": sc})
+
+label, sc = score_obv_trend(close, volume)
+sig_rows.append({"Indicator": "OBV Trend", "Value": np.nan, "Signal": label, "Score": sc})
+
 sig_df = pd.DataFrame(sig_rows)
 composite = float(sig_df["Score"].mean()) if not sig_df.empty else 0.0
 st.markdown(f"#### Indicator Signals (Composite Score: **{composite:+.2f}**)")
@@ -1016,7 +1099,7 @@ st.markdown(f"#### Indicator Signals (Composite Score: **{composite:+.2f}**)")
 st.dataframe(
     sig_df,
     use_container_width=True,
-    height=260,
+    height=300,
     column_config={
         "Value": st.column_config.NumberColumn(format="%.4f"),
         "Score": st.column_config.NumberColumn(format="%.2f"),
@@ -1024,7 +1107,7 @@ st.dataframe(
 )
 
 # =========================
-# News Sentiment (renamed; no summarization)
+# News Sentiment
 # =========================
 st.subheader("News Sentiment")
 
@@ -1040,10 +1123,8 @@ else:
     news_df["time"] = pd.to_datetime(news_df["time"], utc=True, errors="coerce")
     news_df = news_df.dropna(subset=["title"]).head(25)
 
-    # quick sentiment view: headline polarity distribution
     pols = [sentiment_polarity(str(t)) for t in news_df["title"].tolist()]
-    sent_df = pd.DataFrame({"polarity": pols})
-    sent_df = sent_df.replace([np.inf, -np.inf], np.nan).dropna()
+    sent_df = pd.DataFrame({"polarity": pols}).replace([np.inf, -np.inf], np.nan).dropna()
     if not sent_df.empty:
         fig = px.histogram(sent_df, x="polarity", nbins=20, title="Headline Sentiment Polarity (TextBlob)")
         fig.update_layout(height=240)
@@ -1057,10 +1138,6 @@ else:
         src = str(n.get("source", ""))
         pol = sentiment_polarity(title)
         st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_ | headline polarity: `{pol:+.2f}`")
-
-# =========================
-# Investor Relations (renamed)
-# =========================
 
 # =========================
 # SEC Filings & Earnings Catalysts
@@ -1077,7 +1154,6 @@ filings_df = get_latest_filings_for_ticker(ticker_sel, forms=forms_sel, limit=fi
 if filings_df.empty:
     st.info("SEC filings unavailable (ticker->CIK mapping or submissions fetch failed).")
 else:
-    # clickable links
     show_df = filings_df.copy()
     show_df["filingDate"] = pd.to_datetime(show_df["filingDate"], errors="coerce").dt.date
     st.dataframe(
@@ -1088,17 +1164,14 @@ else:
             "link": st.column_config.LinkColumn("Filing (SEC ixviewer)"),
         },
     )
-    st.caption("Tip: open the latest 10-Q/10-K and jump to Items like 1A (Risk Factors), 2 (MD&A), 7 (MD&A), 8 (Financials), or scan for 'guidance', 'outlook', 'restructuring', 'impairment', 'material weakness', etc.")
+    st.caption("Tip: open the latest 10-Q/10-K and jump to Items like 1A (Risk Factors), 2/7 (MD&A), 8 (Financials), or scan for 'guidance', 'outlook', 'restructuring', 'impairment', 'material weakness', etc.")
 
 st.markdown("#### Earnings Calendar (best-effort)")
 earn_df = fetch_earnings_calendar_yf(ticker_sel, limit=12)
 if earn_df.empty:
     st.info("Earnings dates not available via yfinance on this host/IP (best-effort source).")
 else:
-    # Keep key columns if present
     cols = [c for c in ["earnings_date", "EPS Estimate", "Reported EPS", "Surprise(%)", "Revenue Estimate", "Reported Revenue"] if c in earn_df.columns]
-    if "earnings_date" in earn_df.columns:
-        earn_df["earnings_date"] = pd.to_datetime(earn_df["earnings_date"], errors="coerce")
     show_cols = cols if cols else earn_df.columns[:6].tolist()
     st.dataframe(earn_df[show_cols].head(12), use_container_width=True, height=260)
 
@@ -1106,6 +1179,9 @@ else:
     if nxt is not None:
         st.success(f"Nearest earnings catalyst (UTC): {nxt.strftime('%Y-%m-%d %H:%M')}")
 
+# =========================
+# Investor Relations
+# =========================
 st.subheader("Investor Relations")
 
 website = info.get("website", "")
