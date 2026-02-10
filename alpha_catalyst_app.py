@@ -102,12 +102,10 @@ def get_ohlc_from_panel(px_panel: pd.DataFrame, ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     if isinstance(px_panel.columns, pd.MultiIndex):
-        # exact match
         if ticker in px_panel.columns.levels[0]:
             df = px_panel[ticker].copy()
             df.columns = [str(c) for c in df.columns]
             return df
-        # case-insensitive fallback
         for t in px_panel.columns.levels[0]:
             if str(t).upper() == str(ticker).upper():
                 df = px_panel[t].copy()
@@ -115,7 +113,6 @@ def get_ohlc_from_panel(px_panel: pd.DataFrame, ticker: str) -> pd.DataFrame:
                 return df
         return pd.DataFrame()
 
-    # single ticker frame
     df = px_panel.copy()
     df.columns = [str(c) for c in df.columns]
     return df
@@ -166,7 +163,7 @@ def _fred_csv_url(series_id: str) -> str:
 
 @st.cache_data(ttl=CACHE_TTL_INDICATORS)
 def fetch_fred_series(series_id: str) -> pd.DataFrame:
-    """Free, no-key: FRED CSV endpoint. Defensive: never raises; returns empty on HTTP errors."""
+    """Free, no-key: FRED CSV endpoint. Defensive: returns empty on HTTP errors."""
     url = _fred_csv_url(series_id)
     try:
         r = requests.get(
@@ -181,7 +178,7 @@ def fetch_fred_series(series_id: str) -> pd.DataFrame:
         if not (200 <= r.status_code < 300):
             return pd.DataFrame(columns=["date", "value"])
 
-        df = pd.read_csv(StringIO(r.text))
+        df = pd.read_csv(StringIO(r.text), na_values=["."])
         if df is None or df.empty:
             return pd.DataFrame(columns=["date", "value"])
 
@@ -192,7 +189,7 @@ def fetch_fred_series(series_id: str) -> pd.DataFrame:
         out.columns = ["date", "value"]
         out["date"] = pd.to_datetime(out["date"], errors="coerce")
         out["value"] = pd.to_numeric(out["value"], errors="coerce")
-        out = out.dropna(subset=["date"]).sort_values("date")
+        out = out.dropna(subset=["date", "value"]).sort_values("date")
         return out
     except Exception:
         return pd.DataFrame(columns=["date", "value"])
@@ -242,7 +239,7 @@ def fetch_yf_series(symbol: str, period: str = "5y", interval: str = "1d") -> pd
 def fetch_stooq_series(symbol: str) -> pd.DataFrame:
     """
     Free, no-key fallback via Stooq daily CSV.
-    Stooq symbols look like: 'spy.us', 'qqq.us', 'soxx.us', 'vixy.us', 'uup.us', 'gld.us'
+    Stooq symbols look like: 'spy.us', 'qqq.us', 'soxx.us', 'vixy.us', 'gld.us'
     Returns columns: ['date','value'].
     """
     try:
@@ -262,7 +259,7 @@ def fetch_stooq_series(symbol: str) -> pd.DataFrame:
         out.columns = ["date", "value"]
         out["date"] = pd.to_datetime(out["date"], errors="coerce")
         out["value"] = pd.to_numeric(out["value"], errors="coerce")
-        out = out.dropna(subset=["date"]).sort_values("date")
+        out = out.dropna(subset=["date", "value"]).sort_values("date")
         return out
     except Exception:
         return pd.DataFrame(columns=["date", "value"])
@@ -366,7 +363,7 @@ INDICATORS: Dict[str, Dict] = {
     "UNRATE": {"name": "Unemployment Rate", "source": "fred", "id": "UNRATE", "bullish": "lower"},
     "FEDFUNDS": {"name": "Fed Funds Rate", "source": "fred", "id": "FEDFUNDS", "bullish": "lower"},
 
-    # Tech / chip cycle proxies (ETF proxies instead of ^NDX/^SOX)
+    # Tech / chip cycle proxies
     "SOX": {"name": "Semis (SOXX)", "source": "yfinance", "id": "SOXX", "stooq": "soxx.us", "bullish": "higher"},
     "NDX": {"name": "Nasdaq-100 (QQQ)", "source": "yfinance", "id": "QQQ", "stooq": "qqq.us", "bullish": "higher"},
 }
@@ -422,8 +419,7 @@ def indicator_snapshot(df: pd.DataFrame) -> Dict[str, float]:
     if df is None or df.empty:
         return {"latest": np.nan, "chg_1w": np.nan, "chg_1m": np.nan, "z_1y": np.nan}
 
-    s = df.dropna(subset=["date", "value"]).copy()
-    s = s.sort_values("date")
+    s = df.dropna(subset=["date", "value"]).copy().sort_values("date")
     if s.empty:
         return {"latest": np.nan, "chg_1w": np.nan, "chg_1m": np.nan, "z_1y": np.nan}
 
@@ -473,6 +469,34 @@ def fetch_info_one(ticker: str) -> Dict:
         return yf.Ticker(ticker).info or {}
     except Exception:
         return {}
+
+@st.cache_data(ttl=CACHE_TTL_META)
+def fetch_earnings_calendar_fallback_info(ticker: str) -> pd.DataFrame:
+    """
+    Fallback: try earningsTimestamp / earningsTimestampStart / earningsTimestampEnd from yfinance .info.
+    Returns a df with 'earnings_date' column.
+    """
+    try:
+        info = fetch_info_one(ticker) or {}
+        keys = ["earningsTimestamp", "earningsTimestampStart", "earningsTimestampEnd"]
+        dts = []
+        for k in keys:
+            v = info.get(k, None)
+            if v is None:
+                continue
+            if isinstance(v, (list, tuple)):
+                for vv in v:
+                    if isinstance(vv, (int, float)) and vv > 0:
+                        dts.append(pd.to_datetime(int(vv), unit="s", utc=True))
+            else:
+                if isinstance(v, (int, float)) and v > 0:
+                    dts.append(pd.to_datetime(int(v), unit="s", utc=True))
+        if not dts:
+            return pd.DataFrame()
+        out = pd.DataFrame({"earnings_date": sorted(set(dts))})
+        return out.sort_values("earnings_date", ascending=False).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
 
 @st.cache_data(ttl=CACHE_TTL_NEWS)
 def fetch_google_news_rss(ticker: str, days: int) -> pd.DataFrame:
@@ -587,7 +611,7 @@ def extract_ir_news_links(ir_url: str, max_links=10) -> List[Tuple[str, str]]:
     return out
 
 # =========================
-# SEC EDGAR (latest filings) + EARNINGS CALENDAR (best-effort)
+# SEC EDGAR (latest filings) + EARNINGS CALENDAR
 # =========================
 SEC_BASE = "https://data.sec.gov"
 SEC_TICKER_MAP_URLS = [
@@ -595,7 +619,14 @@ SEC_TICKER_MAP_URLS = [
     "https://www.sec.gov/files/company_tickers_exchange.json",
 ]
 
+def normalize_sec_ticker(t: str) -> str:
+    t = (t or "").upper().strip()
+    # SEC often uses dash for class shares
+    return t.replace(".", "-")
+
 def _sec_headers() -> Dict[str, str]:
+    # Put this in Streamlit secrets to reduce SEC blocking:
+    # SEC_CONTACT = "you@example.com"
     contact = ""
     try:
         contact = st.secrets.get("SEC_CONTACT", "")
@@ -665,9 +696,15 @@ def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None
     m = fetch_sec_ticker_map()
     if m.empty:
         return pd.DataFrame()
-    hit = m[m["ticker"] == ticker.upper()].head(1)
+
+    t_norm = normalize_sec_ticker(ticker)
+    hit = m[m["ticker"] == t_norm].head(1)
+    if hit.empty and t_norm != ticker.upper():
+        hit = m[m["ticker"] == ticker.upper()].head(1)
+
     if hit.empty:
         return pd.DataFrame()
+
     cik_int = int(hit["cik"].iloc[0])
     sub = fetch_sec_submissions(cik_int)
     recent = (((sub or {}).get("filings") or {}).get("recent") or {})
@@ -700,6 +737,9 @@ def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None
 
 @st.cache_data(ttl=CACHE_TTL_META)
 def fetch_earnings_calendar_yf(ticker: str, limit: int = 8) -> pd.DataFrame:
+    """
+    Best-effort: yfinance earnings dates table.
+    """
     try:
         t = yf.Ticker(ticker)
         df = t.get_earnings_dates(limit=limit)
@@ -716,16 +756,27 @@ def fetch_earnings_calendar_yf(ticker: str, limit: int = 8) -> pd.DataFrame:
         return pd.DataFrame()
 
 def nearest_earnings_catalyst(df: pd.DataFrame) -> Optional[pd.Timestamp]:
+    """
+    Robust against tz-aware vs tz-naive comparisons.
+    Always returns tz-naive UTC Timestamp.
+    """
     if df is None or df.empty or "earnings_date" not in df.columns:
         return None
+
     dts = pd.to_datetime(df["earnings_date"], errors="coerce", utc=True).dropna()
-    if dts.empty:
+    if len(dts) == 0:
         return None
-    # compare as UTC-naive
-    dts = dts.dt.tz_convert(None)
+
+    # Series -> tz-naive
+    try:
+        dts = dts.dt.tz_localize(None)
+    except Exception:
+        # fallback if already naive or not Series
+        dts = pd.to_datetime(dts, errors="coerce").dropna()
+
     now = pd.Timestamp.utcnow()  # tz-naive UTC
     future = dts[dts >= now]
-    if not future.empty:
+    if len(future) > 0:
         return future.min()
     return dts.max()
 
@@ -1017,7 +1068,7 @@ fig_rsi = px.line(rsi_df, x="Date", y="RSI14", title="RSI(14)")
 fig_rsi.update_layout(height=260)
 st.plotly_chart(fig_rsi, use_container_width=True)
 
-# --- MACD (legend fix: smaller and above chart)
+# --- MACD (legend top-right)
 macd_df = pd.DataFrame({
     "Date": close.index,
     "MACD": macd_line.values,
@@ -1035,8 +1086,8 @@ fig_macd.update_layout(
         orientation="h",
         yanchor="bottom",
         y=1.02,
-        xanchor="left",
-        x=0.0,
+        xanchor="right",
+        x=1.0,
         font=dict(size=10),
     ),
     margin=dict(l=10, r=10, t=50, b=10),
@@ -1056,7 +1107,7 @@ sig_rows = []
 ema_scores = []
 ema_details = []
 for n in ema_spans:
-    label_n, sc_n = score_ema_trend(close, emas[f"EMA{n}"])
+    _, sc_n = score_ema_trend(close, emas[f"EMA{n}"])
     ema_scores.append(sc_n)
     ema_details.append(f"{n}:{sc_n:+.0f}")
 ema_cluster = float(np.nanmean(ema_scores)) if len(ema_scores) else 0.0
@@ -1099,12 +1150,21 @@ st.markdown(f"#### Indicator Signals (Composite Score: **{composite:+.2f}**)")
 st.dataframe(
     sig_df,
     use_container_width=True,
-    height=300,
+    height=320,
     column_config={
         "Value": st.column_config.NumberColumn(format="%.4f"),
         "Score": st.column_config.NumberColumn(format="%.2f"),
     },
 )
+
+# --- Signals bar chart
+if not sig_df.empty:
+    sig_plot = sig_df.copy()
+    sig_plot["Score"] = pd.to_numeric(sig_plot["Score"], errors="coerce")
+    sig_plot = sig_plot.dropna(subset=["Score"])
+    fig_sig = px.bar(sig_plot, x="Indicator", y="Score", title="Technical Indicator Scores (higher = more bullish)")
+    fig_sig.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
+    st.plotly_chart(fig_sig, use_container_width=True)
 
 # =========================
 # News Sentiment
@@ -1152,7 +1212,7 @@ with c_sec2:
 
 filings_df = get_latest_filings_for_ticker(ticker_sel, forms=forms_sel, limit=filings_limit)
 if filings_df.empty:
-    st.info("SEC filings unavailable (ticker->CIK mapping or submissions fetch failed).")
+    st.info("SEC filings unavailable (ticker->CIK mapping missing or submissions fetch blocked). Tip: set SEC_CONTACT in Streamlit secrets.")
 else:
     show_df = filings_df.copy()
     show_df["filingDate"] = pd.to_datetime(show_df["filingDate"], errors="coerce").dt.date
@@ -1160,19 +1220,25 @@ else:
         show_df[["ticker", "form", "filingDate", "reportDate", "accessionNumber", "link"]],
         use_container_width=True,
         height=260,
-        column_config={
-            "link": st.column_config.LinkColumn("Filing (SEC ixviewer)"),
-        },
+        column_config={"link": st.column_config.LinkColumn("Filing (SEC ixviewer)")},
     )
     st.caption("Tip: open the latest 10-Q/10-K and jump to Items like 1A (Risk Factors), 2/7 (MD&A), 8 (Financials), or scan for 'guidance', 'outlook', 'restructuring', 'impairment', 'material weakness', etc.")
 
 st.markdown("#### Earnings Calendar (best-effort)")
 earn_df = fetch_earnings_calendar_yf(ticker_sel, limit=12)
 if earn_df.empty:
-    st.info("Earnings dates not available via yfinance on this host/IP (best-effort source).")
+    earn_df = fetch_earnings_calendar_fallback_info(ticker_sel)
+
+if earn_df.empty:
+    st.info("Earnings dates unavailable from free sources on this host/IP (yfinance limited).")
 else:
-    cols = [c for c in ["earnings_date", "EPS Estimate", "Reported EPS", "Surprise(%)", "Revenue Estimate", "Reported Revenue"] if c in earn_df.columns]
-    show_cols = cols if cols else earn_df.columns[:6].tolist()
+    # normalize for display
+    earn_df = earn_df.copy()
+    earn_df["earnings_date"] = pd.to_datetime(earn_df["earnings_date"], errors="coerce", utc=True)
+
+    show_cols = [c for c in ["earnings_date", "EPS Estimate", "Reported EPS", "Surprise(%)", "Revenue Estimate", "Reported Revenue"] if c in earn_df.columns]
+    if not show_cols:
+        show_cols = ["earnings_date"]
     st.dataframe(earn_df[show_cols].head(12), use_container_width=True, height=260)
 
     nxt = nearest_earnings_catalyst(earn_df)
