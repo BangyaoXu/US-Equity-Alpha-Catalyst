@@ -81,7 +81,8 @@ def macd(close: pd.Series, fast=12, slow=26, signal=9):
 def kdj(high: pd.Series, low: pd.Series, close: pd.Series, n=9, k=3, d=3):
     ln = low.rolling(n).min()
     hn = high.rolling(n).max()
-    rsv = (close - ln) / (hn - ln) * 100
+    denom = (hn - ln).replace(0, np.nan)
+    rsv = (close - ln) / denom * 100
     rsv = rsv.replace([np.inf, -np.inf], np.nan).ffill()
     k_line = rsv.ewm(span=k, adjust=False).mean()
     d_line = k_line.ewm(span=d, adjust=False).mean()
@@ -153,6 +154,9 @@ def normalize_universe_keep_original(df: pd.DataFrame) -> Tuple[pd.DataFrame, Li
     canonical = {"company": company_col or "", "ticker": ticker_col, "sector": sector_col or "", "industry": industry_col or ""}
     return df, present, canonical
 
+def normalize_yf_ticker(t: str) -> str:
+    return (t or "").upper().strip().replace(".", "-")
+
 # =========================
 # PRICE RETURNS SINCE UNIVERSE DATE
 # =========================
@@ -160,7 +164,7 @@ def normalize_universe_keep_original(df: pd.DataFrame) -> Tuple[pd.DataFrame, Li
 def fetch_returns_since(universe_date_str: str, tickers: List[str]) -> Dict[str, float]:
     """
     Return map: ticker -> (last_close / first_close_from_universe_date - 1)
-    Uses yfinance Adj/auto-adjusted close.
+    Uses yfinance auto_adjust close.
     """
     if not tickers:
         return {}
@@ -168,14 +172,13 @@ def fetch_returns_since(universe_date_str: str, tickers: List[str]) -> Dict[str,
         start_dt = pd.to_datetime(universe_date_str, errors="coerce")
         if pd.isna(start_dt):
             return {}
-        # robust "now" (tz-aware), avoid tz_localize on tz-aware timestamps
         now_utc = pd.Timestamp.now(tz="UTC")
         end_dt = (now_utc + pd.Timedelta(days=1)).date()
         start_str = start_dt.date().isoformat()
         end_str = end_dt.isoformat()
 
         px = yf.download(
-            tickers=[t.upper().strip().replace(".", "-") for t in tickers],
+            tickers=[normalize_yf_ticker(t) for t in tickers],
             start=start_str,
             end=end_str,
             auto_adjust=True,
@@ -186,23 +189,20 @@ def fetch_returns_since(universe_date_str: str, tickers: List[str]) -> Dict[str,
         if px is None or px.empty:
             return {}
 
-        # normalize to dict of close series per ticker
         ret_map: Dict[str, float] = {}
         for t in tickers:
-            tt = t.upper().strip().replace(".", "-")
+            tt = normalize_yf_ticker(t)
             close = None
             if isinstance(px.columns, pd.MultiIndex):
                 if tt in px.columns.levels[0] and ("Close" in px[tt].columns):
                     close = px[tt]["Close"].dropna()
                 else:
-                    # try case-insensitive match
                     for lvl in px.columns.levels[0]:
                         if str(lvl).upper() == tt:
                             if "Close" in px[lvl].columns:
                                 close = px[lvl]["Close"].dropna()
                             break
             else:
-                # single ticker case
                 if "Close" in px.columns:
                     close = px["Close"].dropna()
 
@@ -344,6 +344,11 @@ def fetch_earnings_calendar_nasdaq(ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 def nearest_earnings_catalyst(earn_df: pd.DataFrame) -> Optional[pd.Timestamp]:
+    """
+    FIXED:
+    Avoid pandas' TypeError when calling .astype('datetime64[ns]') on tz-aware data.
+    We convert to UTC, drop tz to get naive datetime64[ns], then to numpy.
+    """
     if earn_df is None or earn_df.empty or "earnings_date" not in earn_df.columns:
         return None
 
@@ -351,8 +356,11 @@ def nearest_earnings_catalyst(earn_df: pd.DataFrame) -> Optional[pd.Timestamp]:
     if dts.empty:
         return None
 
-    arr = dts.astype("datetime64[ns]").to_numpy()
-    now = np.datetime64(pd.Timestamp.now(tz="UTC").to_datetime64())
+    # tz-aware -> UTC -> tz-naive (safe for numpy comparisons)
+    dts_naive = dts.dt.tz_convert("UTC").dt.tz_localize(None)
+    arr = dts_naive.to_numpy(dtype="datetime64[ns]")
+
+    now = np.datetime64(pd.Timestamp.now(tz="UTC").tz_localize(None).to_datetime64())
     future = arr[arr >= now]
 
     if future.size > 0:
@@ -603,9 +611,6 @@ def fetch_prices_panel(tickers: List[str], period: str = DEFAULT_PRICE_PERIOD, i
     except Exception:
         return pd.DataFrame()
 
-def normalize_yf_ticker(t: str) -> str:
-    return (t or "").upper().strip().replace(".", "-")
-
 @st.cache_data(ttl=CACHE_TTL_META)
 def fetch_info_one(ticker: str) -> Dict:
     try:
@@ -613,6 +618,9 @@ def fetch_info_one(ticker: str) -> Dict:
     except Exception:
         return {}
 
+# =========================
+# NEWS (Google RSS)
+# =========================
 @st.cache_data(ttl=CACHE_TTL_NEWS)
 def fetch_google_news_rss(ticker: str, days: int) -> pd.DataFrame:
     q = f"{ticker} stock"
@@ -652,15 +660,10 @@ def fetch_google_news_rss(ticker: str, days: int) -> pd.DataFrame:
 # =========================
 @st.cache_data(ttl=CACHE_TTL_ANALYST)
 def fetch_analyst_price_targets_yf(ticker: str) -> Dict[str, float]:
-    """
-    Best-effort: yfinance info fields + newer yfinance analyst price targets if available.
-    Returns dict with mean/high/low/median where possible.
-    """
     out = {"mean": np.nan, "high": np.nan, "low": np.nan, "median": np.nan}
     sym = normalize_yf_ticker(ticker)
     try:
         info = fetch_info_one(sym) or {}
-        # Common Yahoo fields
         for k_src, k_dst in [
             ("targetMeanPrice", "mean"),
             ("targetHighPrice", "high"),
@@ -676,13 +679,11 @@ def fetch_analyst_price_targets_yf(ticker: str) -> Dict[str, float]:
     except Exception:
         pass
 
-    # Try yfinance Ticker.analyst_price_targets (if present in installed version)
     try:
         t = yf.Ticker(sym)
         apt = getattr(t, "analyst_price_targets", None)
         if callable(apt):
             aptv = apt()
-            # Sometimes dict-like
             if isinstance(aptv, dict):
                 for k in out.keys():
                     if k in aptv:
@@ -697,42 +698,16 @@ def fetch_analyst_price_targets_yf(ticker: str) -> Dict[str, float]:
 
 @st.cache_data(ttl=CACHE_TTL_ANALYST)
 def fetch_upgrades_downgrades_yf(ticker: str, max_rows: int = 50) -> pd.DataFrame:
-    """
-    yfinance provides a upgrades_downgrades table for many tickers (not all).
-    Columns vary but typically include: Firm, ToGrade, FromGrade, Action.
-    """
     sym = normalize_yf_ticker(ticker)
     try:
         t = yf.Ticker(sym)
         ud = getattr(t, "upgrades_downgrades", None)
         if ud is None:
             return pd.DataFrame()
-        # in yfinance, this is often a dataframe
         if isinstance(ud, pd.DataFrame) and not ud.empty:
             df = ud.copy()
-            # index often is datetime
             if df.index.name is None:
                 df.index.name = "Date"
-            df = df.reset_index()
-            # normalize date
-            if "Date" in df.columns:
-                df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
-            return df.head(max_rows)
-        return pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
-
-@st.cache_data(ttl=CACHE_TTL_ANALYST)
-def fetch_recommendations_yf(ticker: str, max_rows: int = 50) -> pd.DataFrame:
-    """
-    yfinance recommendations time series (not always available).
-    """
-    sym = normalize_yf_ticker(ticker)
-    try:
-        t = yf.Ticker(sym)
-        rec = getattr(t, "recommendations", None)
-        if isinstance(rec, pd.DataFrame) and not rec.empty:
-            df = rec.copy()
             df = df.reset_index()
             if "Date" in df.columns:
                 df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
@@ -973,7 +948,7 @@ def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None
     return df
 
 # =========================
-# Technical indicators (added)
+# Technical indicators
 # =========================
 def bollinger(close: pd.Series, window: int = 20, n_std: float = 2.0):
     mid = close.rolling(window).mean()
@@ -1026,7 +1001,7 @@ def vwap_daily(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Ser
     return (tp * v).cumsum() / v.cumsum().replace(0, np.nan)
 
 # =========================
-# Technical scoring (expanded)
+# Technical scoring
 # =========================
 def score_ema_trend(close: pd.Series, ema_s: pd.Series) -> float:
     c = safe_last(close)
@@ -1141,7 +1116,6 @@ st.caption(f"Using: `{Path(universe_path).name}`")
 uni_raw = pd.read_csv(universe_path)
 uni, key_cols_present, _ = normalize_universe_keep_original(uni_raw)
 
-# ----- add Return column computed from universe date to now
 tickers_all = sorted([t for t in uni["ticker_norm"].dropna().unique().tolist() if t])
 ret_map = fetch_returns_since(date_sel, tickers_all)
 
@@ -1149,17 +1123,12 @@ st.subheader("Opportunity Set")
 if key_cols_present:
     show_uni = uni[key_cols_present].copy()
 
-    # Insert Return between Ticker and Industry if possible; else add at front
     cols = list(show_uni.columns)
     ticker_col = None
-    industry_col = None
     for c in cols:
         if str(c).lower() in ["ticker", "symbol"]:
             ticker_col = c
-        if str(c).lower() == "industry":
-            industry_col = c
 
-    # build Return series aligned to displayed tickers
     if ticker_col is not None:
         returns = show_uni[ticker_col].astype(str).str.upper().str.strip().map(ret_map)
     else:
@@ -1167,7 +1136,6 @@ if key_cols_present:
 
     show_uni.insert(0, "__Return", returns)
 
-    # Move __Return to after Ticker, before Industry when possible
     if ticker_col is not None:
         cols2 = list(show_uni.columns)
         cols2.remove("__Return")
@@ -1176,7 +1144,6 @@ if key_cols_present:
             insert_pos = tpos + 1
         except Exception:
             insert_pos = 1
-
         cols2.insert(insert_pos, "__Return")
         show_uni = show_uni[cols2]
 
@@ -1204,7 +1171,7 @@ sector_bucket = infer_sector_bucket(sector_zacks)
 st.caption(f"Selected: **{ticker_sel}** | Sector: **{sector_zacks}** | Bucket: **{sector_bucket}** | Industry: **{industry}**")
 
 # =========================
-# Sector-Specific Indicators (with explanation)
+# Sector-Specific Indicators
 # =========================
 st.subheader("Sector-Specific Indicators")
 
@@ -1271,7 +1238,7 @@ for i, k in enumerate(inds):
             st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# Technical Analysis (expanded)
+# Technical Analysis
 # =========================
 st.subheader("Technical Analysis")
 
@@ -1399,25 +1366,13 @@ sig_df = pd.DataFrame([
 composite = float(sig_df["Score"].mean()) if not sig_df.empty else 0.0
 st.markdown(f"#### Indicator Signals (Composite Score: **{composite:+.2f}**)")
 
-with st.expander("How technical scores work", expanded=False):
-    st.markdown(
-        """
-Scores are **heuristics** (not a model):
-- **EMA Cluster**: price above EMA and EMA slope up → bullish; below and slope down → bearish.
-- **RSI**: <=30 bullish (oversold), >=70 bearish (overbought), otherwise mild directional tilt.
-- **MACD**: MACD above signal bullish; plus a small bonus if histogram is accelerating.
-- **ADX**: below ~18 means “no trend”; above that, +DI vs -DI determines direction.
-- **OBV/ROC/CCI/Boll Width** add smaller “confirmation” tilts.
-        """
-    )
-
 st.dataframe(sig_df, use_container_width=True, height=260, column_config={"Score": st.column_config.NumberColumn(format="%.2f")})
 fig_sig = px.bar(sig_df, x="Indicator", y="Score", title="Technical Indicator Scores")
 fig_sig.update_layout(height=340, margin=dict(l=10, r=10, t=50, b=10))
 st.plotly_chart(fig_sig, use_container_width=True)
 
 # =========================
-# News Sentiment (default 1w)
+# News Sentiment
 # =========================
 st.subheader("News Sentiment")
 
@@ -1449,55 +1404,40 @@ else:
         st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_ | polarity: `{pol:+.2f}`")
 
 # =========================
-# Analyst Ratings (Up/Downgrades + Price Targets)
+# Analyst Ratings
 # =========================
 st.subheader("Analyst Ratings")
 
 pt = fetch_analyst_price_targets_yf(ticker_sel)
 ud = fetch_upgrades_downgrades_yf(ticker_sel, max_rows=50)
-rec = fetch_recommendations_yf(ticker_sel, max_rows=50)
 
-cpt1, cpt2 = st.columns([1.2, 1])
-with cpt1:
-    st.markdown("#### Price Target Snapshot (Yahoo via yfinance)")
-    pt_df = pd.DataFrame([{
-        "Mean": pt.get("mean"),
-        "Median": pt.get("median"),
-        "High": pt.get("high"),
-        "Low": pt.get("low"),
-    }])
-    st.dataframe(
-        pt_df,
-        use_container_width=True,
-        height=90,
-        column_config={
-            "Mean": st.column_config.NumberColumn(format="%.2f"),
-            "Median": st.column_config.NumberColumn(format="%.2f"),
-            "High": st.column_config.NumberColumn(format="%.2f"),
-            "Low": st.column_config.NumberColumn(format="%.2f"),
-        },
-    )
-    st.caption("These are best-effort fields; some tickers have missing targets on Yahoo.")
+st.markdown("#### Price Target Summary")
+pt_df = pd.DataFrame([{
+    "Mean": pt.get("mean"),
+    "Median": pt.get("median"),
+    "High": pt.get("high"),
+    "Low": pt.get("low"),
+}])
+st.dataframe(
+    pt_df,
+    use_container_width=True,
+    height=90,
+    column_config={
+        "Mean": st.column_config.NumberColumn(format="%.2f"),
+        "Median": st.column_config.NumberColumn(format="%.2f"),
+        "High": st.column_config.NumberColumn(format="%.2f"),
+        "Low": st.column_config.NumberColumn(format="%.2f"),
+    },
+)
+st.caption("Best-effort from Yahoo via yfinance; some tickers may have missing targets.")
 
-with cpt2:
-    st.markdown("#### Notes")
-    st.write("- **Upgrades/Downgrades** table is often available for large caps, but can be empty.")
-    st.write("- If you want true real-time broker notes, you typically need a paid feed/API.")
-
-st.markdown("#### Upgrades / Downgrades (yfinance)")
+st.markdown("#### Upgrades / Downgrades")
 if ud is None or ud.empty:
     st.info("No upgrades/downgrades data available for this ticker from yfinance.")
 else:
-    # try to order common columns nicely
     cols_pref = [c for c in ["Date", "Firm", "ToGrade", "FromGrade", "Action"] if c in ud.columns]
     cols_rest = [c for c in ud.columns if c not in cols_pref]
     st.dataframe(ud[cols_pref + cols_rest], use_container_width=True, height=260)
-
-with st.expander("Recommendations history (yfinance)", expanded=False):
-    if rec is None or rec.empty:
-        st.info("No recommendations history available for this ticker from yfinance.")
-    else:
-        st.dataframe(rec, use_container_width=True, height=260)
 
 # =========================
 # SEC Filings & Earnings Catalysts
@@ -1534,11 +1474,7 @@ enter the issuer's **CIK** (digits only).
 
 c_sec1, c_sec2 = st.columns([1.3, 1])
 with c_sec1:
-    forms_sel = st.multiselect(
-        "Filings to show",
-        ["10-K", "10-Q", "8-K"],
-        default=[],
-    )
+    forms_sel = st.multiselect("Filings to show", ["10-K", "10-Q", "8-K"], default=[])
 with c_sec2:
     filings_limit = st.slider("Max filings", min_value=3, max_value=20, value=8, step=1)
 
@@ -1564,9 +1500,6 @@ else:
     )
     st.caption("Use **EDGAR Index** as the default.")
 
-# =========================
-# Earnings Calendar (NO FMP)
-# =========================
 st.markdown("#### Earnings Calendar")
 
 earn_df = fetch_earnings_calendar_yf(ticker_sel, limit=12)
@@ -1588,8 +1521,7 @@ else:
     earn_df = earn_df.copy()
     earn_df["earnings_date"] = pd.to_datetime(earn_df["earnings_date"], errors="coerce", utc=True)
 
-    show_cols = [c for c in ["earnings_date", "time", "source", "EPS Estimate", "Reported EPS", "Surprise(%)",
-                             "Revenue Estimate", "Reported Revenue"] if c in earn_df.columns]
+    show_cols = [c for c in ["earnings_date", "time", "source"] if c in earn_df.columns]
     if not show_cols:
         show_cols = ["earnings_date"]
 
