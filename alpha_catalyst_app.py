@@ -157,6 +157,14 @@ def normalize_universe_keep_original(df: pd.DataFrame) -> Tuple[pd.DataFrame, Li
 def normalize_yf_ticker(t: str) -> str:
     return (t or "").upper().strip().replace(".", "-")
 
+def strip_trailing_parens(name: str) -> str:
+    """
+    Remove trailing parenthetical like 'EPS Surprise (most recent report)' -> 'EPS Surprise'
+    Only removes the LAST '(...)' at end.
+    """
+    s = str(name or "").strip()
+    return re.sub(r"\s*\([^)]*\)\s*$", "", s).strip()
+
 # =========================
 # HTTP helpers
 # =========================
@@ -333,11 +341,10 @@ def nearest_earnings_catalyst(earn_df: pd.DataFrame) -> Optional[pd.Timestamp]:
     if dts.empty:
         return None
 
-    # convert to tz-naive numpy safely
     dts_naive = dts.dt.tz_convert("UTC").dt.tz_localize(None)
     arr = dts_naive.to_numpy(dtype="datetime64[ns]")
 
-    now = np.datetime64(pd.Timestamp.now(tz="UTC").tz_convert("UTC").tz_localize(None).to_datetime64())
+    now = np.datetime64(pd.Timestamp.now(tz="UTC").tz_localize(None).to_datetime64())
     future = arr[arr >= now]
 
     if future.size > 0:
@@ -467,11 +474,9 @@ def _row_get(df: pd.DataFrame, keys: List[str]) -> Optional[pd.Series]:
     return None
 
 def _q_yoy_growth(series: pd.Series) -> float:
-    # series indexed by quarter end (columns already converted to datetime)
     if series is None or series.dropna().shape[0] < 5:
         return np.nan
     s = series.dropna().sort_index()
-    # last and 4 quarters ago
     if s.shape[0] < 5:
         return np.nan
     last = float(s.iloc[-1])
@@ -487,7 +492,6 @@ def _q_margin_pct(num: pd.Series, den: pd.Series) -> float:
     b = den.dropna().sort_index()
     if a.empty or b.empty:
         return np.nan
-    # align
     df = pd.concat([a, b], axis=1, join="inner")
     if df.empty:
         return np.nan
@@ -513,7 +517,6 @@ def _days_inventory(balance: pd.DataFrame, income: pd.DataFrame) -> float:
     cogs_last = float(df.iloc[-1, 1])
     if not np.isfinite(inv_last) or not np.isfinite(cogs_last) or cogs_last == 0:
         return np.nan
-    # quarterly COGS -> annualize by *4
     return (inv_last / (abs(cogs_last) * 4.0)) * 365.0
 
 def _ar_days(balance: pd.DataFrame, income: pd.DataFrame) -> float:
@@ -538,7 +541,8 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
     Returns:
       {
         "scalars": DataFrame(columns=[Indicator, Value, Unit, Source, Definition, Update]),
-        "series": dict[name -> df(date,value)]  # optional time series for plotting
+        "sector_etf_map": {...},
+        "driver_series_map": {...},
       }
     """
     sym = normalize_yf_ticker(ticker)
@@ -547,37 +551,20 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
     bal = yf_quarterly_balance(sym)
     cfs = yf_quarterly_cashflow(sym)
 
-    # Common series: sector ETF/benchmark prices (sector-ish, not SPX/VIX)
-    def _yf_series(symbol: str, label: str, period="5y") -> Optional[pd.DataFrame]:
-        try:
-            px = yf.download(symbol, period=period, interval="1d", auto_adjust=True, progress=False, threads=False)
-            if px is None or px.empty:
-                return None
-            if "Close" not in px.columns:
-                return None
-            out = px[["Close"]].dropna().reset_index()
-            out.columns = ["date", "value"]
-            out["date"] = pd.to_datetime(out["date"], errors="coerce")
-            out["value"] = pd.to_numeric(out["value"], errors="coerce")
-            out = out.dropna(subset=["date", "value"]).sort_values("date")
-            return out
-        except Exception:
-            return None
-
-    # Scalar helpers from Yahoo info
     scalars: List[Dict[str, object]] = []
 
     def add_scalar(name, value, unit, source, definition, update):
-        scalars.append({
-            "Indicator": name,
-            "Value": value,
-            "Unit": unit,
-            "Source": source,
-            "Definition": definition,
-            "Update": update,
-        })
+        scalars.append(
+            {
+                "Indicator": name,
+                "Value": value,
+                "Unit": unit,
+                "Source": source,
+                "Definition": definition,
+                "Update": update,
+            }
+        )
 
-    # Robust quarterly metrics
     rev_s = _row_get(inc, ["total revenue", "totalrevenue", "revenue"])
     gp_s = _row_get(inc, ["gross profit", "grossprofit"])
     opinc_s = _row_get(inc, ["operating income", "operatingincome"])
@@ -613,10 +600,7 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
         "Quarterly",
     )
 
-    if rd_s is not None and rev_s is not None:
-        rd_int = _q_margin_pct(rd_s, rev_s)
-    else:
-        rd_int = np.nan
+    rd_int = _q_margin_pct(rd_s, rev_s) if rd_s is not None and rev_s is not None else np.nan
     add_scalar(
         "R&D Intensity (latest quarter)",
         rd_int,
@@ -626,14 +610,13 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
         "Quarterly",
     )
 
-    # Balance-sheet efficiency proxies
     dinv = _days_inventory(bal, inc)
     add_scalar(
         "Days Inventory (proxy)",
         dinv,
         "days",
         "Yahoo Finance via yfinance (quarterly_balance_sheet + quarterly_financials)",
-        "Inventory / (COGS annualized) × 365; higher can mean inventory build / demand softness (sector-dependent).",
+        "Inventory / (COGS annualized) × 365.",
         "Quarterly",
     )
 
@@ -643,19 +626,15 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
         dso,
         "days",
         "Yahoo Finance via yfinance (quarterly_balance_sheet + quarterly_financials)",
-        "Accounts Receivable / (Revenue annualized) × 365; rising can flag slowing collections / demand quality.",
+        "Accounts Receivable / (Revenue annualized) × 365.",
         "Quarterly",
     )
 
-    # Cashflow proxies (best-effort)
     ocf = _row_get(cfs, ["total cash from operating activities", "operating cash flow", "totalcashfromoperatingactivities"])
     capex = _row_get(cfs, ["capital expenditures", "capitalexpenditures"])
     if ocf is not None and capex is not None:
         df_cf = pd.concat([ocf.dropna().sort_index(), capex.dropna().sort_index()], axis=1, join="inner")
-        if not df_cf.empty:
-            fcf_latest = float(df_cf.iloc[-1, 0] + df_cf.iloc[-1, 1])  # capex usually negative
-        else:
-            fcf_latest = np.nan
+        fcf_latest = float(df_cf.iloc[-1, 0] + df_cf.iloc[-1, 1]) if not df_cf.empty else np.nan
     else:
         fcf_latest = np.nan
     add_scalar(
@@ -667,11 +646,9 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
         "Quarterly",
     )
 
-    # Earnings surprise metrics (from earnings dates table)
     earn = fetch_earnings_dates_yf(sym, limit=8)
     eps_surp = np.nan
     if earn is not None and not earn.empty:
-        # try common column names
         for col in ["Surprise(%)", "Surprise (%)", "Surprise %", "Surprise"]:
             if col in earn.columns:
                 eps_surp = _to_num(earn[col].iloc[0])
@@ -685,7 +662,6 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
         "Quarterly (on earnings)",
     )
 
-    # Forward-looking / sector-relevant Yahoo info fields
     add_scalar(
         "Forward P/E",
         _to_num(info.get("forwardPE")),
@@ -694,25 +670,28 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
         "Forward P/E multiple (if available).",
         "Daily",
     )
+    rg = _to_num(info.get("revenueGrowth"))
     add_scalar(
         "Revenue Growth (Yahoo field)",
-        _to_num(info.get("revenueGrowth")) * 100.0 if np.isfinite(_to_num(info.get("revenueGrowth"))) else np.nan,
+        rg * 100.0 if np.isfinite(rg) else np.nan,
         "%",
         "Yahoo Finance via yfinance (.info)",
         "Yahoo-provided revenue growth field (definition varies by name).",
         "Daily",
     )
+    eg = _to_num(info.get("earningsGrowth"))
     add_scalar(
         "Earnings Growth (Yahoo field)",
-        _to_num(info.get("earningsGrowth")) * 100.0 if np.isfinite(_to_num(info.get("earningsGrowth"))) else np.nan,
+        eg * 100.0 if np.isfinite(eg) else np.nan,
         "%",
         "Yahoo Finance via yfinance (.info)",
         "Yahoo-provided earnings growth field (definition varies by name).",
         "Daily",
     )
+    roe = _to_num(info.get("returnOnEquity"))
     add_scalar(
         "Return on Equity",
-        _to_num(info.get("returnOnEquity")) * 100.0 if np.isfinite(_to_num(info.get("returnOnEquity"))) else np.nan,
+        roe * 100.0 if np.isfinite(roe) else np.nan,
         "%",
         "Yahoo Finance via yfinance (.info)",
         "ROE (if available).",
@@ -726,16 +705,17 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
         "Debt-to-Equity ratio (if available).",
         "Daily",
     )
+    dy = _to_num(info.get("dividendYield"))
     add_scalar(
         "Dividend Yield",
-        _to_num(info.get("dividendYield")) * 100.0 if np.isfinite(_to_num(info.get("dividendYield"))) else np.nan,
+        dy * 100.0 if np.isfinite(dy) else np.nan,
         "%",
         "Yahoo Finance via yfinance (.info)",
         "Dividend yield (if available).",
         "Daily",
     )
 
-    # --- sector “benchmarks” (not macro like SPX/VIX): used only for context
+    # Benchmarks/Drivers (sector-ish, not SPX/VIX)
     sector_etf_map = {
         "Medical (Healthcare)": "XLV",
         "Computer and Technology": "XLK",
@@ -747,57 +727,38 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
         "Industrial Products": "XLI",
         "Transportation": "IYT",
         "Retail-Wholesale": "XRT",
-        "Auto-Tires-Trucks": "CARZ",  # may be thin; best-effort
+        "Auto-Tires-Trucks": "CARZ",
         "Construction": "ITB",
         "Aerospace": "ITA",
-        "Business Services": "XLI",   # best-effort (services often mixed)
-        "Conglomerates": "XLI",       # best-effort
+        "Business Services": "XLI",
+        "Conglomerates": "XLI",
     }
 
-    series: Dict[str, pd.DataFrame] = {}
-    sec_name = str(info.get("sector") or "")
-    # We MUST use the universe sector name; the caller will provide it separately.
-    # Here we just provide optional benchmark series via a mapping.
-
-    # Commodity/industry drivers (sector-relevant, free via Yahoo tickers)
     driver_series_map = {
         "Basic Materials": [("HG=F", "Copper Futures (HG=F)"), ("GC=F", "Gold Futures (GC=F)")],
         "Energy": [("CL=F", "WTI Crude (CL=F)"), ("NG=F", "Nat Gas (NG=F)")],
         "Transportation": [("CL=F", "WTI Crude (CL=F)"), ("BZ=F", "Brent (BZ=F)")],
-        "Aerospace": [("BA", "Boeing (peer proxy)"), ("ITA", "Aerospace & Defense ETF (ITA)")],
-        "Construction": [("LUMBER", "Lumber (if available)"), ("ITB", "Homebuilders ETF (ITB)")],
+        "Aerospace": [("ITA", "Aerospace & Defense ETF (ITA)")],
+        "Construction": [("ITB", "Homebuilders ETF (ITB)")],
     }
-
-    # Benchmark ETF series (if exists)
-    # (We’ll attach under a generic label; app decides if it should plot)
-    # NOTE: if ETF isn't available, it just won't show.
-    # We keep this minimal to avoid clutter.
-    etf = None  # decided by sector in UI
 
     return {
         "scalars": pd.DataFrame(scalars),
-        "series": series,  # filled in UI based on sector name
         "sector_etf_map": sector_etf_map,
         "driver_series_map": driver_series_map,
     }
 
 def build_sector_indicator_view(sector_name_exact: str, ticker: str) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
-    """
-    Uses PDF-aligned sector names (kept EXACT) to decide which indicators/series to show.
-    We show:
-      - firm-specific fundamentals/efficiency/surprise proxies (always)
-      - plus sector-relevant benchmark/driver time series (best-effort)
-    """
     payload = fetch_sector_indicator_panel(ticker)
     scalars = payload["scalars"].copy()
 
-    # Add sector-specific “context series” (ETF + drivers) without SPX/VIX
+    # ---- strip trailing parentheses from indicator names
+    if scalars is not None and not scalars.empty and "Indicator" in scalars.columns:
+        scalars["Indicator"] = scalars["Indicator"].map(strip_trailing_parens)
+
     series: Dict[str, pd.DataFrame] = {}
 
-    def _yf_series(symbol: str, label: str, period="5y") -> Optional[pd.DataFrame]:
-        if symbol == "LUMBER":
-            # Yahoo lumber tickers change; keep as best-effort no-op to avoid errors.
-            return None
+    def _yf_series(symbol: str, period="5y") -> Optional[pd.DataFrame]:
         try:
             px = yf.download(symbol, period=period, interval="1d", auto_adjust=True, progress=False, threads=False)
             if px is None or px.empty or "Close" not in px.columns:
@@ -814,120 +775,58 @@ def build_sector_indicator_view(sector_name_exact: str, ticker: str) -> Tuple[pd
     etf_map = payload.get("sector_etf_map", {})
     etf = etf_map.get(sector_name_exact)
     if etf:
-        ser = _yf_series(etf, f"{sector_name_exact} Benchmark ETF ({etf})")
+        ser = _yf_series(etf)
         if ser is not None and not ser.empty:
             series[f"{sector_name_exact} Benchmark ETF ({etf})"] = ser
 
     driver_map = payload.get("driver_series_map", {})
     for sym, label in driver_map.get(sector_name_exact, []):
-        ser = _yf_series(sym, label)
+        ser = _yf_series(sym)
         if ser is not None and not ser.empty:
             series[label] = ser
 
-    # Sector-specific “focus indicators” (from PDF themes, but computed via free fields)
-    # Keep sector names EXACT (do not rename).
+    # ---- sector focus list (strip parens already, so list uses cleaned names)
     focus: Dict[str, List[str]] = {
-        "Medical (Healthcare)": [
-            "EPS Surprise (most recent report)",
-            "R&D Intensity (latest quarter)",
-            "Revenue YoY (latest quarter)",
-            "Operating Margin (latest quarter)",
-        ],
-        "Computer and Technology": [
-            "EPS Surprise (most recent report)",
-            "Revenue YoY (latest quarter)",
-            "Gross Margin (latest quarter)",
-            "R&D Intensity (latest quarter)",
-        ],
-        "Finance": [
-            "EPS Surprise (most recent report)",
-            "Return on Equity",
-            "Debt/Equity",
-            "Revenue YoY (latest quarter)",
-        ],
-        "Utilities": [
-            "Dividend Yield",
-            "Debt/Equity",
-            "Operating Margin (latest quarter)",
-            "EPS Surprise (most recent report)",
-        ],
-        "Consumer Staples": [
-            "Gross Margin (latest quarter)",
-            "Revenue YoY (latest quarter)",
-            "Days Inventory (proxy)",
-            "EPS Surprise (most recent report)",
-        ],
-        "Consumer Discretionary": [
-            "Revenue YoY (latest quarter)",
-            "Gross Margin (latest quarter)",
-            "Days Inventory (proxy)",
-            "EPS Surprise (most recent report)",
-        ],
-        "Retail-Wholesale": [
-            "Days Inventory (proxy)",
-            "Revenue YoY (latest quarter)",
-            "Gross Margin (latest quarter)",
-            "EPS Surprise (most recent report)",
-        ],
-        "Auto-Tires-Trucks": [
-            "Days Inventory (proxy)",
-            "Revenue YoY (latest quarter)",
-            "Operating Margin (latest quarter)",
-            "EPS Surprise (most recent report)",
-        ],
-        "Basic Materials": [
-            "Revenue YoY (latest quarter)",
-            "Operating Margin (latest quarter)",
-            "EPS Surprise (most recent report)",
-            "Debt/Equity",
-        ],
-        "Industrial Products": [
-            "Days Sales Outstanding (proxy)",
-            "Revenue YoY (latest quarter)",
-            "Operating Margin (latest quarter)",
-            "EPS Surprise (most recent report)",
-        ],
-        "Business Services": [
-            "Days Sales Outstanding (proxy)",
-            "Revenue YoY (latest quarter)",
-            "Operating Margin (latest quarter)",
-            "EPS Surprise (most recent report)",
-        ],
-        "Transportation": [
-            "Revenue YoY (latest quarter)",
-            "Operating Margin (latest quarter)",
-            "Days Sales Outstanding (proxy)",
-            "EPS Surprise (most recent report)",
-        ],
-        "Construction": [
-            "Revenue YoY (latest quarter)",
-            "Operating Margin (latest quarter)",
-            "Days Inventory (proxy)",
-            "EPS Surprise (most recent report)",
-        ],
-        "Aerospace": [
-            "Revenue YoY (latest quarter)",
-            "Operating Margin (latest quarter)",
-            "Days Sales Outstanding (proxy)",
-            "EPS Surprise (most recent report)",
-        ],
-        "Conglomerates": [
-            "Return on Equity",
-            "Revenue YoY (latest quarter)",
-            "Operating Margin (latest quarter)",
-            "EPS Surprise (most recent report)",
-        ],
+        "Medical (Healthcare)": ["EPS Surprise", "R&D Intensity", "Revenue YoY", "Operating Margin"],
+        "Computer and Technology": ["EPS Surprise", "Revenue YoY", "Gross Margin", "R&D Intensity"],
+        "Finance": ["EPS Surprise", "Return on Equity", "Debt/Equity", "Revenue YoY"],
+        "Utilities": ["Dividend Yield", "Debt/Equity", "Operating Margin", "EPS Surprise"],
+        "Consumer Staples": ["Gross Margin", "Revenue YoY", "Days Inventory", "EPS Surprise"],
+        "Consumer Discretionary": ["Revenue YoY", "Gross Margin", "Days Inventory", "EPS Surprise"],
+        "Retail-Wholesale": ["Days Inventory", "Revenue YoY", "Gross Margin", "EPS Surprise"],
+        "Auto-Tires-Trucks": ["Days Inventory", "Revenue YoY", "Operating Margin", "EPS Surprise"],
+        "Basic Materials": ["Revenue YoY", "Operating Margin", "EPS Surprise", "Debt/Equity"],
+        "Industrial Products": ["Days Sales Outstanding", "Revenue YoY", "Operating Margin", "EPS Surprise"],
+        "Business Services": ["Days Sales Outstanding", "Revenue YoY", "Operating Margin", "EPS Surprise"],
+        "Transportation": ["Revenue YoY", "Operating Margin", "Days Sales Outstanding", "EPS Surprise"],
+        "Construction": ["Revenue YoY", "Operating Margin", "Days Inventory", "EPS Surprise"],
+        "Aerospace": ["Revenue YoY", "Operating Margin", "Days Sales Outstanding", "EPS Surprise"],
+        "Conglomerates": ["Return on Equity", "Revenue YoY", "Operating Margin", "EPS Surprise"],
     }
 
-    want = focus.get(sector_name_exact, [])
-    if want:
-        scalars = scalars[scalars["Indicator"].isin(want)].copy()
+    # ---- shorten Indicator labels to remove any trailing details
+    if scalars is not None and not scalars.empty and "Indicator" in scalars.columns:
+        # normalize a few patterns BEFORE stripping parentheses
+        repl = {
+            "Revenue YoY (latest quarter)": "Revenue YoY",
+            "Gross Margin (latest quarter)": "Gross Margin",
+            "Operating Margin (latest quarter)": "Operating Margin",
+            "R&D Intensity (latest quarter)": "R&D Intensity",
+            "Days Inventory (proxy)": "Days Inventory",
+            "Days Sales Outstanding (proxy)": "Days Sales Outstanding",
+            "Free Cash Flow (latest quarter, proxy)": "Free Cash Flow",
+            "EPS Surprise (most recent report)": "EPS Surprise",
+            "Revenue Growth (Yahoo field)": "Revenue Growth",
+            "Earnings Growth (Yahoo field)": "Earnings Growth",
+        }
+        scalars["Indicator"] = scalars["Indicator"].replace(repl).map(strip_trailing_parens)
 
-    # nice ordering
-    if want:
-        order = {k: i for i, k in enumerate(want)}
-        scalars["__ord"] = scalars["Indicator"].map(order).fillna(999)
-        scalars = scalars.sort_values("__ord").drop(columns=["__ord"])
+        want = focus.get(sector_name_exact, [])
+        if want:
+            scalars = scalars[scalars["Indicator"].isin(want)].copy()
+            order = {k: i for i, k in enumerate(want)}
+            scalars["__ord"] = scalars["Indicator"].map(order).fillna(999)
+            scalars = scalars.sort_values("__ord").drop(columns=["__ord"])
 
     return scalars, series
 
@@ -1337,19 +1236,17 @@ ret_map = fetch_returns_since(date_sel, tickers_all)
 st.subheader("Opportunity Set")
 if key_cols_present:
     show_uni = uni[key_cols_present].copy()
-
-    # Insert Return between Ticker and Industry if possible
     cols = list(show_uni.columns)
     ticker_col = None
     for c in cols:
         if str(c).lower() in ["ticker", "symbol"]:
             ticker_col = c
 
-    if ticker_col is not None:
-        returns = show_uni[ticker_col].astype(str).str.upper().str.strip().map(ret_map)
-    else:
-        returns = uni["ticker_norm"].astype(str).str.upper().str.strip().map(ret_map)
-
+    returns = (
+        show_uni[ticker_col].astype(str).str.upper().str.strip().map(ret_map)
+        if ticker_col is not None
+        else uni["ticker_norm"].astype(str).str.upper().str.strip().map(ret_map)
+    )
     show_uni.insert(0, "__Return", returns)
 
     if ticker_col is not None:
@@ -1368,9 +1265,7 @@ if key_cols_present:
         show_uni,
         use_container_width=True,
         height=320,
-        column_config={
-            "Return": st.column_config.NumberColumn("Return", format="%.2f"),
-        },
+        column_config={"Return": st.column_config.NumberColumn("Return", format="%.2f")},
     )
 else:
     st.dataframe(uni.iloc[:, :12], use_container_width=True, height=320)
@@ -1382,40 +1277,51 @@ if not ticker_sel:
 row = uni.loc[uni["ticker_norm"] == ticker_sel].head(1)
 sector_exact = str(row["sector_norm"].iloc[0]) if not row.empty else "Unknown"
 industry = str(row["industry_norm"].iloc[0]) if not row.empty else ""
-
 st.caption(f"Selected: **{ticker_sel}** | Sector: **{sector_exact}** | Industry: **{industry}**")
 
 # =========================
-# Sector-Specific Indicators (REWRITTEN, sector names kept EXACT)
+# Sector-Specific Indicators (REWRITTEN)
+# Requirements:
+# 1) remove "What you are seeing"
+# 2) indicator table: remove trailing (...) in names
+# 3) remove source column
+# 4) filter out None value columns
+# 5) rename "Sector Drivers (best-effort)" -> "Sector Drivers"
 # =========================
 st.subheader("Sector-Specific Indicators")
-
-with st.expander("What you are seeing", expanded=False):
-    st.markdown(
-        """
-This section shows **firm-specific, sector-relevant** indicators (mostly company fundamentals/efficiency and earnings surprise),
-plus **optional sector driver series** (e.g., relevant sector ETF or commodity inputs) when available.
-- Sector names are used **exactly as in your Opportunity Set** (no renaming).
-- All data is fetched from **free sources** (primarily Yahoo Finance via `yfinance`).
-        """
-    )
 
 scalars_df, series_map = build_sector_indicator_view(sector_exact, ticker_sel)
 
 if scalars_df is None or scalars_df.empty:
     st.info("No sector indicator data available for this ticker/sector (best-effort fields can be missing on Yahoo).")
 else:
+    scalars_df = scalars_df.copy()
+
+    # 2) already stripped in builder; do again defensively
+    if "Indicator" in scalars_df.columns:
+        scalars_df["Indicator"] = scalars_df["Indicator"].map(strip_trailing_parens)
+
+    # 3) remove Source column
+    if "Source" in scalars_df.columns:
+        scalars_df = scalars_df.drop(columns=["Source"])
+
+    # make Value numeric (best-effort)
+    if "Value" in scalars_df.columns:
+        scalars_df["Value"] = pd.to_numeric(scalars_df["Value"], errors="coerce")
+
+    # 4) drop columns that are entirely null
+    scalars_df = scalars_df.dropna(axis=1, how="all")
+
     st.dataframe(
         scalars_df,
         use_container_width=True,
         height=280,
-        column_config={
-            "Value": st.column_config.NumberColumn(format="%.4f"),
-        },
+        column_config={"Value": st.column_config.NumberColumn(format="%.4f")} if "Value" in scalars_df.columns else None,
     )
 
 if series_map:
-    st.markdown("#### Sector Drivers (best-effort)")
+    # 5) rename header
+    st.markdown("#### Sector Drivers")
     cols = st.columns(2)
     i = 0
     for name, ser in series_map.items():
@@ -1497,15 +1403,8 @@ fig_macd.update_layout(
     title="MACD(12,26,9)",
     height=320,
     margin=dict(l=10, r=10, t=60, b=40),
-    legend=dict(
-        orientation="h",
-        yanchor="bottom",
-        y=1.02,
-        xanchor="left",
-        x=0.0,
-        font=dict(size=10),
-        bgcolor="rgba(255,255,255,0.0)",
-    ),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0, font=dict(size=10),
+                bgcolor="rgba(255,255,255,0.0)"),
 )
 st.plotly_chart(fig_macd, use_container_width=True)
 
@@ -1696,7 +1595,6 @@ if earn_df is None or earn_df.empty:
 else:
     earn_df = earn_df.copy()
     earn_df["earnings_date"] = pd.to_datetime(earn_df["earnings_date"], errors="coerce", utc=True)
-    # show the fields you actually want
     show_cols = ["earnings_date"]
     for c in ["EPS Estimate", "Reported EPS", "Surprise(%)", "Revenue Estimate", "Reported Revenue"]:
         if c in earn_df.columns:
@@ -1705,11 +1603,17 @@ else:
 
     nxt = nearest_earnings_catalyst(earn_df)
     if nxt is not None:
-        nxt_utc = pd.Timestamp(nxt).tz_localize("UTC") if pd.Timestamp(nxt).tzinfo is None else pd.Timestamp(nxt).tz_convert("UTC")
+        # ensure tz-aware UTC timestamp (no double-localize)
+        nxt_ts = pd.Timestamp(nxt)
+        if nxt_ts.tzinfo is None:
+            nxt_utc = nxt_ts.tz_localize("UTC")
+        else:
+            nxt_utc = nxt_ts.tz_convert("UTC")
+
         try:
             import zoneinfo
             tor = zoneinfo.ZoneInfo("America/Toronto")
-            nxt_tor = nxt_utc.astimezone(tor)
+            nxt_tor = nxt_utc.to_pydatetime().astimezone(tor)
             st.success(
                 "Nearest earnings catalyst: "
                 f"**{nxt_utc.strftime('%Y-%m-%d %H:%M')} UTC** / "
