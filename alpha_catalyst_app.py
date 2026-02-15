@@ -610,11 +610,6 @@ def _sec_primary_url(cik_int: int, accession: str, primary_doc: str) -> str:
     acc_nodash = accession.replace("-", "")
     return f"https://www.sec.gov/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{primary_doc}"
 
-def _sec_ixviewer_url_from_primary(cik_int: int, accession: str, primary_doc: str) -> str:
-    acc_nodash = accession.replace("-", "")
-    doc_path = f"/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{primary_doc}"
-    return f"https://www.sec.gov/ixviewer/documents/?doc={requests.utils.quote(doc_path)}"
-
 def _resolve_cik_for_ticker(ticker: str) -> Optional[int]:
     """
     Resolve CIK using:
@@ -677,19 +672,11 @@ def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None
         acc = str(row.get("accessionNumber", "") or "")
         doc = str(row.get("primaryDocument", "") or "")
         if not acc:
-            return pd.Series({"index_url": "", "primary_url": "", "ixviewer_url": ""})
-
+            return pd.Series({"index_url": "", "primary_url": ""})
+        
         index_url = _sec_index_url(cik_int, acc)
         primary_url = _sec_primary_url(cik_int, acc, doc) if doc else ""
-
-        inline_flag = row.get("isInlineXBRL", 0)
-        try:
-            inline_flag = int(inline_flag) if inline_flag is not None and str(inline_flag) != "nan" else 0
-        except Exception:
-            inline_flag = 0
-
-        ixviewer_url = _sec_ixviewer_url_from_primary(cik_int, acc, doc) if (inline_flag == 1 and doc) else ""
-        return pd.Series({"index_url": index_url, "primary_url": primary_url, "ixviewer_url": ixviewer_url})
+        return pd.Series({"index_url": index_url, "primary_url": primary_url})
 
     links = df.apply(build_links, axis=1)
     df = pd.concat([df, links], axis=1)
@@ -1328,7 +1315,7 @@ else:
     show_df = filings_df.copy()
     show_df["filingDate"] = pd.to_datetime(show_df["filingDate"], errors="coerce").dt.date
 
-    cols = ["ticker", "cik", "form", "filingDate", "reportDate", "accessionNumber", "index_url", "primary_url", "ixviewer_url"]
+    cols = ["ticker", "cik", "form", "filingDate", "reportDate", "accessionNumber", "index_url", "primary_url"]
     cols = [c for c in cols if c in show_df.columns]
 
     st.dataframe(
