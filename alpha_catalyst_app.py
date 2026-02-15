@@ -1282,12 +1282,17 @@ if "CIK_OVERRIDES" not in st.session_state:
     st.session_state["CIK_OVERRIDES"] = {}
 
 with st.expander("Fix EDGAR for tickers with missing CIK (optional)", expanded=False):
+
     st.markdown(
         """
 If EDGAR is unavailable because **ticker→CIK mapping is missing** (or SEC blocks submissions fetch),
-you can manually enter the issuer's **CIK** here (digits only).  
-This is saved in the session and used immediately for building EDGAR links.
+enter the issuer's **CIK** (digits only).
         """
+    )
+
+    st.link_button(
+        "🔎 Open SEC CIK Lookup",
+        "https://www.sec.gov/search-filings/cik-lookup"
     )
     cur = st.session_state["CIK_OVERRIDES"].get(ticker_sel, "")
     cik_in = st.text_input(f"CIK override for {ticker_sel}", value=str(cur) if cur else "")
