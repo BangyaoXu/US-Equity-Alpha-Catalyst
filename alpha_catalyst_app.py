@@ -171,17 +171,28 @@ def fetch_returns_since(universe_date: str, tickers: List[str]) -> Dict[str, flo
     if not tickers:
         return {}
 
-    try:
-        start = pd.to_datetime(universe_date).tz_localize("UTC")
-    except Exception:
-        start = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=365)
+    def _as_utc(ts: pd.Timestamp) -> pd.Timestamp:
+        # Works for both tz-naive and tz-aware
+        return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
 
+    # robust "now UTC"
+    now_utc = _as_utc(pd.Timestamp.utcnow())
+
+    # universe start (UTC)
+    try:
+        start = _as_utc(pd.to_datetime(universe_date, errors="raise"))
+    except Exception:
+        start = now_utc - pd.Timedelta(days=365)
+
+    # fetch window (buffer a few days to ensure we have first bar)
     start_fetch = (start - pd.Timedelta(days=5)).date()
-    end_fetch = (pd.Timestamp.utcnow().tz_localize("UTC") + pd.Timedelta(days=1)).date()
+    end_fetch = (now_utc + pd.Timedelta(days=1)).date()
+
+    tickers_norm = [normalize_yf_ticker(t) for t in tickers]
 
     try:
         px = yf.download(
-            tickers=[normalize_yf_ticker(t) for t in tickers],
+            tickers=tickers_norm,
             start=str(start_fetch),
             end=str(end_fetch),
             interval="1d",
@@ -200,13 +211,16 @@ def fetch_returns_since(universe_date: str, tickers: List[str]) -> Dict[str, flo
         df.columns = [str(c) for c in df.columns]
         if "Close" not in df.columns:
             return np.nan
+
         s = df[["Close"]].dropna()
         if s.empty:
             return np.nan
+
         s.index = pd.to_datetime(s.index, errors="coerce")
         s = s.loc[pd.notna(s.index)].sort_index()
 
-        s2 = s[s.index >= pd.Timestamp(start.date())]
+        # compare dates (date-based is fine for daily bars)
+        s2 = s[s.index.date >= start.date()]
         if s2.empty:
             return np.nan
 
@@ -217,26 +231,27 @@ def fetch_returns_since(universe_date: str, tickers: List[str]) -> Dict[str, flo
         return (last / first) - 1.0
 
     out: Dict[str, float] = {}
+
     if px is None or getattr(px, "empty", True):
         return out
 
     if isinstance(px.columns, pd.MultiIndex):
-        for t in tickers:
-            tn = normalize_yf_ticker(t)
+        # Multi-ticker panel
+        for raw, tn in zip(tickers, tickers_norm):
             if tn in px.columns.levels[0]:
-                out[t] = _calc_one(px[tn])
+                out[raw] = _calc_one(px[tn])
             else:
+                # sometimes level0 casing differs
                 found = None
                 for lvl0 in px.columns.levels[0]:
                     if str(lvl0).upper() == tn.upper():
                         found = lvl0
                         break
-                out[t] = _calc_one(px[found]) if found is not None else np.nan
+                out[raw] = _calc_one(px[found]) if found is not None else np.nan
         return out
 
     # single ticker
-    if "Close" in [str(c) for c in px.columns]:
-        out[tickers[0]] = _calc_one(px)
+    out[tickers[0]] = _calc_one(px)
     return out
 
 # =========================
@@ -1144,21 +1159,21 @@ else:
 
 ticker_col = canonical.get("ticker", "")
 if ticker_col and ticker_col in disp.columns:
-    disp["Return"] = disp[ticker_col].astype(str).str.upper().str.strip().map(ret_map)
+    disp["Return_%"] = disp[ticker_col].astype(str).str.upper().str.strip().map(ret_map) * 100.0
     cols = list(disp.columns)
     cols.remove("Return")
     tpos = cols.index(ticker_col) + 1
     cols.insert(tpos, "Return")
     disp = disp[cols]
 else:
-    disp["Return"] = uni["ticker_norm"].map(ret_map)
+    disp["Return_%"] = uni["ticker_norm"].map(ret_map) * 100.0
 
 st.dataframe(
     disp,
     use_container_width=True,
     height=320,
     column_config={
-        "Return": st.column_config.NumberColumn("Return", format="%.2f"),
+        "Return_%": st.column_config.NumberColumn("Return", format="%.2f%%"),
     },
 )
 
