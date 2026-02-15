@@ -81,8 +81,7 @@ def macd(close: pd.Series, fast=12, slow=26, signal=9):
 def kdj(high: pd.Series, low: pd.Series, close: pd.Series, n=9, k=3, d=3):
     ln = low.rolling(n).min()
     hn = high.rolling(n).max()
-    denom = (hn - ln).replace(0, np.nan)
-    rsv = (close - ln) / denom * 100
+    rsv = (close - ln) / (hn - ln) * 100
     rsv = rsv.replace([np.inf, -np.inf], np.nan).ffill()
     k_line = rsv.ewm(span=k, adjust=False).mean()
     d_line = k_line.ewm(span=d, adjust=False).mean()
@@ -102,6 +101,9 @@ def safe_last(x: pd.Series) -> float:
         return float(v)
     except Exception:
         return float("nan")
+
+def normalize_yf_ticker(t: str) -> str:
+    return (t or "").upper().strip().replace(".", "-")
 
 def get_ohlc_from_panel(px_panel: pd.DataFrame, ticker: str) -> pd.DataFrame:
     if px_panel is None or getattr(px_panel, "empty", True):
@@ -151,11 +153,13 @@ def normalize_universe_keep_original(df: pd.DataFrame) -> Tuple[pd.DataFrame, Li
         if c and c not in present:
             present.append(c)
 
-    canonical = {"company": company_col or "", "ticker": ticker_col, "sector": sector_col or "", "industry": industry_col or ""}
+    canonical = {
+        "company": company_col or "",
+        "ticker": ticker_col,
+        "sector": sector_col or "",
+        "industry": industry_col or "",
+    }
     return df, present, canonical
-
-def normalize_yf_ticker(t: str) -> str:
-    return (t or "").upper().strip().replace(".", "-")
 
 # =========================
 # PRICE RETURNS SINCE UNIVERSE DATE
@@ -164,7 +168,7 @@ def normalize_yf_ticker(t: str) -> str:
 def fetch_returns_since(universe_date_str: str, tickers: List[str]) -> Dict[str, float]:
     """
     Return map: ticker -> (last_close / first_close_from_universe_date - 1)
-    Uses yfinance auto_adjust close.
+    Uses yfinance auto-adjusted close.
     """
     if not tickers:
         return {}
@@ -172,13 +176,14 @@ def fetch_returns_since(universe_date_str: str, tickers: List[str]) -> Dict[str,
         start_dt = pd.to_datetime(universe_date_str, errors="coerce")
         if pd.isna(start_dt):
             return {}
+
         now_utc = pd.Timestamp.now(tz="UTC")
         end_dt = (now_utc + pd.Timedelta(days=1)).date()
         start_str = start_dt.date().isoformat()
         end_str = end_dt.isoformat()
 
         px = yf.download(
-            tickers=[normalize_yf_ticker(t) for t in tickers],
+            tickers=[t.upper().strip().replace(".", "-") for t in tickers],
             start=start_str,
             end=end_str,
             auto_adjust=True,
@@ -191,7 +196,7 @@ def fetch_returns_since(universe_date_str: str, tickers: List[str]) -> Dict[str,
 
         ret_map: Dict[str, float] = {}
         for t in tickers:
-            tt = normalize_yf_ticker(t)
+            tt = t.upper().strip().replace(".", "-")
             close = None
             if isinstance(px.columns, pd.MultiIndex):
                 if tt in px.columns.levels[0] and ("Close" in px[tt].columns):
@@ -222,132 +227,54 @@ def fetch_returns_since(universe_date_str: str, tickers: List[str]) -> Dict[str,
         return {}
 
 # =========================
-# Earnings (NO FMP)
+# Earnings (NO FMP) — we want forecast/actual/surprise, not just dates
 # =========================
-def _nasdaq_headers() -> Dict[str, str]:
-    return {
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.nasdaq.com/market-activity/stocks",
-        "Origin": "https://www.nasdaq.com",
-        "Connection": "keep-alive",
-    }
-
 @st.cache_data(ttl=CACHE_TTL_EARNINGS)
-def fetch_earnings_calendar_yf(ticker: str, limit: int = 12) -> pd.DataFrame:
+def fetch_earnings_forecast_actuals_yf(ticker: str, limit: int = 16) -> pd.DataFrame:
+    """
+    Primary: yfinance.get_earnings_dates() — often includes:
+      EPS Estimate, Reported EPS, Surprise(%),
+      Revenue Estimate, Reported Revenue
+    """
     try:
         t = yf.Ticker(normalize_yf_ticker(ticker))
         df = t.get_earnings_dates(limit=limit)
         if df is None or isinstance(df, dict) or df.empty:
             return pd.DataFrame()
+
         out = df.reset_index()
+
         if "Earnings Date" in out.columns:
             out = out.rename(columns={"Earnings Date": "earnings_date"})
         elif out.columns[0] != "earnings_date":
             out = out.rename(columns={out.columns[0]: "earnings_date"})
+
         out["earnings_date"] = pd.to_datetime(out["earnings_date"], errors="coerce", utc=True)
-        out["source"] = "yfinance.get_earnings_dates"
-        return out.sort_values("earnings_date", ascending=False)
-    except Exception:
-        return pd.DataFrame()
 
-@st.cache_data(ttl=CACHE_TTL_EARNINGS)
-def fetch_earnings_calendar_from_calendar(ticker: str) -> pd.DataFrame:
-    try:
-        t = yf.Ticker(normalize_yf_ticker(ticker))
-        cal = t.calendar
-        if cal is None:
-            return pd.DataFrame()
+        keep = [
+            "earnings_date",
+            "EPS Estimate",
+            "Reported EPS",
+            "Surprise(%)",
+            "Revenue Estimate",
+            "Reported Revenue",
+        ]
+        keep = [c for c in keep if c in out.columns]
+        out = out[keep].copy()
+        out = out.dropna(subset=["earnings_date"]).sort_values("earnings_date", ascending=False).reset_index(drop=True)
 
-        if isinstance(cal, pd.DataFrame) and not cal.empty:
-            for key in ["Earnings Date", "EarningsDate", "Earnings"]:
-                if key in cal.index:
-                    v = cal.loc[key].values
-                    dts = [pd.to_datetime(x, errors="coerce", utc=True) for x in v]
-                    dts = [x for x in dts if pd.notna(x)]
-                    if dts:
-                        df = pd.DataFrame({"earnings_date": sorted(set(dts), reverse=True)})
-                        df["source"] = "yfinance.calendar"
-                        return df
+        for c in ["EPS Estimate", "Reported EPS", "Surprise(%)", "Revenue Estimate", "Reported Revenue"]:
+            if c in out.columns:
+                out[c] = pd.to_numeric(out[c], errors="coerce")
 
-        if isinstance(cal, dict):
-            for key in ["Earnings Date", "EarningsDate", "Earnings"]:
-                if key in cal:
-                    v = cal[key]
-                    if isinstance(v, (list, tuple)):
-                        dts = [pd.to_datetime(x, errors="coerce", utc=True) for x in v]
-                    else:
-                        dts = [pd.to_datetime(v, errors="coerce", utc=True)]
-                    dts = [x for x in dts if pd.notna(x)]
-                    if dts:
-                        df = pd.DataFrame({"earnings_date": sorted(set(dts), reverse=True)})
-                        df["source"] = "yfinance.calendar"
-                        return df
-        return pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
-
-@st.cache_data(ttl=CACHE_TTL_EARNINGS)
-def fetch_earnings_calendar_from_info(ticker: str) -> pd.DataFrame:
-    try:
-        info = fetch_info_one(normalize_yf_ticker(ticker)) or {}
-        keys = ["earningsTimestamp", "earningsTimestampStart", "earningsTimestampEnd"]
-        dts = []
-        for k in keys:
-            v = info.get(k)
-            if v is None:
-                continue
-            if isinstance(v, (list, tuple)):
-                for vv in v:
-                    if isinstance(vv, (int, float)) and vv > 0:
-                        dts.append(pd.to_datetime(int(vv), unit="s", utc=True))
-            else:
-                if isinstance(v, (int, float)) and v > 0:
-                    dts.append(pd.to_datetime(int(v), unit="s", utc=True))
-        if not dts:
-            return pd.DataFrame()
-        df = pd.DataFrame({"earnings_date": sorted(set(dts), reverse=True)})
-        df["source"] = "yfinance.info"
-        return df
-    except Exception:
-        return pd.DataFrame()
-
-@st.cache_data(ttl=CACHE_TTL_EARNINGS)
-def fetch_earnings_calendar_nasdaq(ticker: str) -> pd.DataFrame:
-    sym = (ticker or "").upper().strip()
-    if not sym:
-        return pd.DataFrame()
-
-    url = f"https://api.nasdaq.com/api/calendar/earnings?symbol={requests.utils.quote(sym)}"
-    try:
-        r = SESSION.get(url, headers=_nasdaq_headers(), timeout=15)
-        if not (200 <= r.status_code < 300):
-            return pd.DataFrame()
-        js = r.json() or {}
-        data = (js.get("data") or {})
-        rows = data.get("rows") or []
-        out_rows = []
-        for obj in rows:
-            d = obj.get("earningsDate") or obj.get("date") or obj.get("earnDate")
-            t = obj.get("time") or obj.get("earningsTime") or ""
-            if d:
-                dt_str = f"{d} {t}".strip()
-                dtv = pd.to_datetime(dt_str, errors="coerce", utc=True)
-                if pd.notna(dtv):
-                    out_rows.append({"earnings_date": dtv, "time": t, "source": "nasdaq"})
-        if not out_rows:
-            return pd.DataFrame()
-        df = pd.DataFrame(out_rows).drop_duplicates()
-        return df.sort_values("earnings_date", ascending=False).reset_index(drop=True)
+        return out
     except Exception:
         return pd.DataFrame()
 
 def nearest_earnings_catalyst(earn_df: pd.DataFrame) -> Optional[pd.Timestamp]:
     """
-    FIXED:
-    Avoid pandas' TypeError when calling .astype('datetime64[ns]') on tz-aware data.
-    We convert to UTC, drop tz to get naive datetime64[ns], then to numpy.
+    Robust nearest date picker that avoids tz-aware -> datetime64 astype TypeErrors.
+    Returns a tz-naive pandas Timestamp (UTC basis).
     """
     if earn_df is None or earn_df.empty or "earnings_date" not in earn_df.columns:
         return None
@@ -356,13 +283,12 @@ def nearest_earnings_catalyst(earn_df: pd.DataFrame) -> Optional[pd.Timestamp]:
     if dts.empty:
         return None
 
-    # tz-aware -> UTC -> tz-naive (safe for numpy comparisons)
+    # Convert to tz-naive UTC timestamps to safely compare/convert
     dts_naive = dts.dt.tz_convert("UTC").dt.tz_localize(None)
     arr = dts_naive.to_numpy(dtype="datetime64[ns]")
 
-    now = np.datetime64(pd.Timestamp.now(tz="UTC").tz_localize(None).to_datetime64())
+    now = np.datetime64(pd.Timestamp.utcnow().to_datetime64())
     future = arr[arr >= now]
-
     if future.size > 0:
         return pd.Timestamp(future.min())
     return pd.Timestamp(arr.max())
@@ -618,9 +544,6 @@ def fetch_info_one(ticker: str) -> Dict:
     except Exception:
         return {}
 
-# =========================
-# NEWS (Google RSS)
-# =========================
 @st.cache_data(ttl=CACHE_TTL_NEWS)
 def fetch_google_news_rss(ticker: str, days: int) -> pd.DataFrame:
     q = f"{ticker} stock"
@@ -660,6 +583,9 @@ def fetch_google_news_rss(ticker: str, days: int) -> pd.DataFrame:
 # =========================
 @st.cache_data(ttl=CACHE_TTL_ANALYST)
 def fetch_analyst_price_targets_yf(ticker: str) -> Dict[str, float]:
+    """
+    Best-effort: Yahoo via yfinance info fields (targetMean/High/Low/Median).
+    """
     out = {"mean": np.nan, "high": np.nan, "low": np.nan, "median": np.nan}
     sym = normalize_yf_ticker(ticker)
     try:
@@ -678,26 +604,13 @@ def fetch_analyst_price_targets_yf(ticker: str) -> Dict[str, float]:
                     pass
     except Exception:
         pass
-
-    try:
-        t = yf.Ticker(sym)
-        apt = getattr(t, "analyst_price_targets", None)
-        if callable(apt):
-            aptv = apt()
-            if isinstance(aptv, dict):
-                for k in out.keys():
-                    if k in aptv:
-                        try:
-                            out[k] = float(aptv[k])
-                        except Exception:
-                            pass
-    except Exception:
-        pass
-
     return out
 
 @st.cache_data(ttl=CACHE_TTL_ANALYST)
 def fetch_upgrades_downgrades_yf(ticker: str, max_rows: int = 50) -> pd.DataFrame:
+    """
+    yfinance upgrades_downgrades table (often large caps; can be empty).
+    """
     sym = normalize_yf_ticker(ticker)
     try:
         t = yf.Ticker(sym)
@@ -948,7 +861,7 @@ def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None
     return df
 
 # =========================
-# Technical indicators
+# Technical indicators (added)
 # =========================
 def bollinger(close: pd.Series, window: int = 20, n_std: float = 2.0):
     mid = close.rolling(window).mean()
@@ -1001,7 +914,7 @@ def vwap_daily(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Ser
     return (tp * v).cumsum() / v.cumsum().replace(0, np.nan)
 
 # =========================
-# Technical scoring
+# Technical scoring (expanded)
 # =========================
 def score_ema_trend(close: pd.Series, ema_s: pd.Series) -> float:
     c = safe_last(close)
@@ -1366,13 +1279,25 @@ sig_df = pd.DataFrame([
 composite = float(sig_df["Score"].mean()) if not sig_df.empty else 0.0
 st.markdown(f"#### Indicator Signals (Composite Score: **{composite:+.2f}**)")
 
+with st.expander("How technical scores work", expanded=False):
+    st.markdown(
+        """
+Scores are **heuristics** (not a model):
+- **EMA Cluster**: price above EMA and EMA slope up → bullish; below and slope down → bearish.
+- **RSI**: <=30 bullish (oversold), >=70 bearish (overbought), otherwise mild directional tilt.
+- **MACD**: MACD above signal bullish; plus a small bonus if histogram is accelerating.
+- **ADX**: below ~18 means “no trend”; above that, +DI vs -DI determines direction.
+- **OBV/ROC/CCI/Boll Width** add smaller “confirmation” tilts.
+        """
+    )
+
 st.dataframe(sig_df, use_container_width=True, height=260, column_config={"Score": st.column_config.NumberColumn(format="%.2f")})
 fig_sig = px.bar(sig_df, x="Indicator", y="Score", title="Technical Indicator Scores")
 fig_sig.update_layout(height=340, margin=dict(l=10, r=10, t=50, b=10))
 st.plotly_chart(fig_sig, use_container_width=True)
 
 # =========================
-# News Sentiment
+# News Sentiment (default 1w)
 # =========================
 st.subheader("News Sentiment")
 
@@ -1404,7 +1329,7 @@ else:
         st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_ | polarity: `{pol:+.2f}`")
 
 # =========================
-# Analyst Ratings
+# Analyst Ratings (Up/Downgrades + Price Targets)
 # =========================
 st.subheader("Analyst Ratings")
 
@@ -1429,7 +1354,6 @@ st.dataframe(
         "Low": st.column_config.NumberColumn(format="%.2f"),
     },
 )
-st.caption("Best-effort from Yahoo via yfinance; some tickers may have missing targets.")
 
 st.markdown("#### Upgrades / Downgrades")
 if ud is None or ud.empty:
@@ -1440,9 +1364,9 @@ else:
     st.dataframe(ud[cols_pref + cols_rest], use_container_width=True, height=260)
 
 # =========================
-# SEC Filings & Earnings Catalysts
+# SEC Filings & Earnings
 # =========================
-st.subheader("SEC Filings & Earnings Catalysts")
+st.subheader("SEC Filings & Earnings")
 
 if "CIK_OVERRIDES" not in st.session_state:
     st.session_state["CIK_OVERRIDES"] = {}
@@ -1485,7 +1409,6 @@ if filings_df.empty:
 else:
     show_df = filings_df.copy()
     show_df["filingDate"] = pd.to_datetime(show_df["filingDate"], errors="coerce").dt.date
-
     cols = ["ticker", "cik", "form", "filingDate", "reportDate", "accessionNumber", "index_url", "primary_url"]
     cols = [c for c in cols if c in show_df.columns]
 
@@ -1500,33 +1423,25 @@ else:
     )
     st.caption("Use **EDGAR Index** as the default.")
 
-st.markdown("#### Earnings Calendar")
-
-earn_df = fetch_earnings_calendar_yf(ticker_sel, limit=12)
-src_used = "yfinance.get_earnings_dates"
+st.markdown("#### Earnings (Forecasts / Actuals / Surprises)")
+earn_df = fetch_earnings_forecast_actuals_yf(ticker_sel, limit=16)
 
 if earn_df.empty:
-    earn_df = fetch_earnings_calendar_nasdaq(ticker_sel)
-    src_used = "nasdaq (best-effort)"
-if earn_df.empty:
-    earn_df = fetch_earnings_calendar_from_calendar(ticker_sel)
-    src_used = "yfinance.calendar"
-if earn_df.empty:
-    earn_df = fetch_earnings_calendar_from_info(ticker_sel)
-    src_used = "yfinance.info timestamps"
-
-if earn_df.empty:
-    st.info("Earnings dates unavailable from free sources on this host/IP. (Common on Streamlit Cloud.)")
+    st.info("No earnings forecast/actual/surprise data available from Yahoo for this ticker (common for smaller caps).")
 else:
-    earn_df = earn_df.copy()
-    earn_df["earnings_date"] = pd.to_datetime(earn_df["earnings_date"], errors="coerce", utc=True)
+    cfg = {}
+    if "EPS Estimate" in earn_df.columns:
+        cfg["EPS Estimate"] = st.column_config.NumberColumn(format="%.3f")
+    if "Reported EPS" in earn_df.columns:
+        cfg["Reported EPS"] = st.column_config.NumberColumn(format="%.3f")
+    if "Surprise(%)" in earn_df.columns:
+        cfg["Surprise(%)"] = st.column_config.NumberColumn(format="%.2f")
+    if "Revenue Estimate" in earn_df.columns:
+        cfg["Revenue Estimate"] = st.column_config.NumberColumn(format="%.0f")
+    if "Reported Revenue" in earn_df.columns:
+        cfg["Reported Revenue"] = st.column_config.NumberColumn(format="%.0f")
 
-    show_cols = [c for c in ["earnings_date", "time", "source"] if c in earn_df.columns]
-    if not show_cols:
-        show_cols = ["earnings_date"]
-
-    st.caption(f"Source used: **{src_used}** (best available)")
-    st.dataframe(earn_df[show_cols].head(12), use_container_width=True, height=260)
+    st.dataframe(earn_df.head(12), use_container_width=True, height=280, column_config=cfg)
 
     nxt = nearest_earnings_catalyst(earn_df)
     if nxt is not None:
