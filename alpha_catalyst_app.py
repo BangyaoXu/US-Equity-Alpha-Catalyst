@@ -1159,21 +1159,21 @@ else:
 
 ticker_col = canonical.get("ticker", "")
 if ticker_col and ticker_col in disp.columns:
-    disp["Return_%"] = disp[ticker_col].astype(str).str.upper().str.strip().map(ret_map) * 100.0
+    disp["Return"] = disp[ticker_col].astype(str).str.upper().str.strip().map(ret_map) * 100.0
     cols = list(disp.columns)
     cols.remove("Return")
     tpos = cols.index(ticker_col) + 1
     cols.insert(tpos, "Return")
     disp = disp[cols]
 else:
-    disp["Return_%"] = uni["ticker_norm"].map(ret_map) * 100.0
+    disp["Return"] = uni["ticker_norm"].map(ret_map) * 100.0
 
 st.dataframe(
     disp,
     use_container_width=True,
     height=320,
     column_config={
-        "Return_%": st.column_config.NumberColumn("Return", format="%.2f%%"),
+        "Return": st.column_config.NumberColumn("Return", format="%.2f%%"),
     },
 )
 
