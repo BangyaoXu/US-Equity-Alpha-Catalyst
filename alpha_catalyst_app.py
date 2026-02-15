@@ -154,6 +154,71 @@ def normalize_universe_keep_original(df: pd.DataFrame) -> Tuple[pd.DataFrame, Li
     return df, present, canonical
 
 # =========================
+# Earnings (PRIMARY: FMP)
+# =========================
+def _get_json(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 20) -> Optional[object]:
+    try:
+        r = SESSION.get(url, headers=headers or {}, timeout=timeout)
+        if 200 <= r.status_code < 300:
+            return r.json()
+        return None
+    except Exception:
+        return None
+
+@st.cache_data(ttl=CACHE_TTL_EARNINGS)
+def fetch_earnings_fmp_symbol(ticker: str, limit: int = 32) -> pd.DataFrame:
+    """
+    PRIMARY earnings source.
+    FMP Earnings Report API (by symbol):
+      https://financialmodelingprep.com/stable/earnings?symbol=AAPL
+    Returns a normalized dataframe with at least: earnings_date, time, eps, epsEstimated, revenue, revenueEstimated
+    """
+    api_key = ""
+    try:
+        api_key = st.secrets.get("FMP_API_KEY", "")
+    except Exception:
+        api_key = ""
+    if not api_key:
+        return pd.DataFrame()
+
+    sym = (ticker or "").upper().strip()
+    if not sym:
+        return pd.DataFrame()
+
+    url = f"https://financialmodelingprep.com/stable/earnings?symbol={requests.utils.quote(sym)}&apikey={requests.utils.quote(api_key)}"
+    js = _get_json(url)
+    if not js or not isinstance(js, list):
+        return pd.DataFrame()
+
+    df = pd.DataFrame(js)
+    if df.empty:
+        return pd.DataFrame()
+
+    # FMP commonly uses these field names (can vary slightly by plan/version)
+    # date/time: often "date" + optional "time" (bmo/amc)
+    date_col = "date" if "date" in df.columns else None
+    if not date_col:
+        return pd.DataFrame()
+
+    out = pd.DataFrame()
+    out["earnings_date"] = pd.to_datetime(df[date_col], errors="coerce", utc=True)
+
+    for c in ["time", "eps", "epsEstimated", "revenue", "revenueEstimated"]:
+        if c in df.columns:
+            out[c] = df[c]
+
+    # Keep only valid dates
+    out = out.dropna(subset=["earnings_date"])
+
+    # If FMP returns more than you want, trim
+    if len(out) > limit:
+        out = out.sort_values("earnings_date", ascending=False).head(limit)
+
+    out["source"] = "fmp"
+    out = out.drop_duplicates().sort_values("earnings_date", ascending=False).reset_index(drop=True)
+    return out
+
+# =========================
 # SECTOR INDICATORS (FRED + market proxies)
 # =========================
 def _fred_csv_url(series_id: str) -> str:
@@ -1334,9 +1399,13 @@ else:
 # =========================
 st.markdown("#### Earnings Calendar")
 
-earn_df = fetch_earnings_calendar_yf(ticker_sel, limit=12)
-src_used = "yfinance.get_earnings_dates"
+earn_df = fetch_earnings_fmp_symbol(ticker_sel, limit=32)
+src_used = "FMP: /stable/earnings?symbol="
 
+# fallback only if FMP empty / key missing / blocked
+if earn_df.empty:
+    earn_df = fetch_earnings_calendar_yf(ticker_sel, limit=12)
+    src_used = "yfinance.get_earnings_dates"
 if earn_df.empty:
     earn_df = fetch_earnings_calendar_from_calendar(ticker_sel)
     src_used = "yfinance.calendar"
@@ -1344,8 +1413,9 @@ if earn_df.empty:
     earn_df = fetch_earnings_calendar_from_info(ticker_sel)
     src_used = "yfinance.info timestamps"
 if earn_df.empty:
-    earn_df = fetch_earnings_calendar_nasdaq(ticker_sel)
+    earn_df = fetch_earnings_calendar_nasdaq(ticker_sel)   # if you kept it
     src_used = "nasdaq (best-effort)"
+
 
 if earn_df.empty:
     st.info("Earnings dates unavailable from free sources on this host/IP. (Common on Streamlit Cloud.)")
