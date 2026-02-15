@@ -1314,8 +1314,8 @@ c_sec1, c_sec2 = st.columns([1.3, 1])
 with c_sec1:
     forms_sel = st.multiselect(
         "Filings to show",
-        ["10-K", "10-Q", "8-K", "S-1", "DEF 14A"],
-        default=["10-Q", "10-K", "8-K"],
+        ["10-K", "10-Q", "8-K"],
+        default=[],
     )
 with c_sec2:
     filings_limit = st.slider("Max filings", min_value=3, max_value=20, value=8, step=1)
