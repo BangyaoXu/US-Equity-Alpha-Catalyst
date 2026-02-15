@@ -1338,10 +1338,9 @@ else:
         column_config={
             "index_url": st.column_config.LinkColumn("EDGAR Index (best)"),
             "primary_url": st.column_config.LinkColumn("Primary Doc"),
-            "ixviewer_url": st.column_config.LinkColumn("ixviewer (Inline XBRL only)"),
         },
     )
-    st.caption("Use **EDGAR Index** as the default. ixviewer appears only when `isInlineXBRL=1`.")
+    st.caption("Use **EDGAR Index** as the default.")
 
 # =========================
 # Earnings Calendar (enhanced)
