@@ -35,6 +35,9 @@ CACHE_TTL_META = 60 * 60
 CACHE_TTL_NEWS = 30 * 60
 CACHE_TTL_INDICATORS = 60 * 60
 
+# Earnings can change often + yfinance can be flaky: keep TTL shorter
+CACHE_TTL_EARNINGS = 15 * 60
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome Safari"
@@ -157,11 +160,9 @@ def _fred_csv_url(series_id: str) -> str:
     return f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={requests.utils.quote(series_id)}"
 
 def _get_text(url: str, timeout: int = 25, retries: int = 3) -> Optional[str]:
-    last = None
     for i in range(retries):
         try:
             r = SESSION.get(url, timeout=timeout, headers={"Accept": "text/csv,*/*"})
-            last = r
             if 200 <= r.status_code < 300 and r.text and len(r.text) > 20:
                 return r.text
             if r.status_code in (403, 429, 500, 502, 503, 504):
@@ -171,12 +172,6 @@ def _get_text(url: str, timeout: int = 25, retries: int = 3) -> Optional[str]:
         except Exception:
             time.sleep(0.6 * (2 ** i))
             continue
-    try:
-        r = requests.get(url, timeout=timeout)
-        if 200 <= r.status_code < 300 and r.text and len(r.text) > 20:
-            return r.text
-    except Exception:
-        pass
     return None
 
 @st.cache_data(ttl=CACHE_TTL_INDICATORS)
@@ -309,7 +304,6 @@ INDICATORS: Dict[str, Dict] = {
     "NDX": {"name": "Nasdaq-100 (QQQ)", "source": "yfinance", "id": "QQQ", "stooq": "qqq.us", "bullish": "higher"},
 }
 
-# PMI REMOVED from all sector mappings per request
 SECTOR_TO_INDICATORS: Dict[str, List[str]] = {
     "General": ["SP500", "VIX", "DXY", "UST10Y", "YC_10_2"],
     "Healthcare": ["SP500", "VIX", "UST10Y"],
@@ -370,7 +364,7 @@ def indicator_snapshot(df: pd.DataFrame) -> Dict[str, float]:
     return {"latest": latest, "chg_1w": chg_1w, "chg_1m": chg_1m, "z_1y": z}
 
 def indicator_signal(cfg: Dict, snap: Dict[str, float]) -> Tuple[str, float]:
-    bullish = cfg.get("bullish", "higher")
+    bullish = cfg.get("bullish", "higher")  # "higher" or "lower"
     chg = snap.get("chg_1m", np.nan)
     if not np.isfinite(chg):
         return ("N/A", 0.0)
@@ -378,6 +372,15 @@ def indicator_signal(cfg: Dict, snap: Dict[str, float]) -> Tuple[str, float]:
     score = sign if bullish == "higher" else -sign
     label = "Bullish" if score > 0 else ("Bearish" if score < 0 else "Neutral")
     return (label, float(score))
+
+def indicator_signal_explain(cfg: Dict) -> str:
+    """
+    Human-readable explanation for the sector indicator signal.
+    """
+    bullish = cfg.get("bullish", "higher")
+    if bullish == "higher":
+        return "Signal uses **Δ 1m**: rising = **Bullish**, falling = **Bearish**."
+    return "Signal uses **Δ 1m**: rising = **Bearish**, falling = **Bullish** (lower is better)."
 
 # =========================
 # DATA FETCH (prices/meta/news)
@@ -515,16 +518,21 @@ def extract_ir_news_links(ir_url: str, max_links=10) -> List[Tuple[str, str]]:
     return out
 
 # =========================
-# SEC EDGAR (robust links: Index + Primary always, ixviewer only for Inline XBRL)
+# SEC EDGAR (robust)
 # =========================
-import time
-import requests
-
 SEC_BASE = "https://data.sec.gov"
 SEC_TICKER_MAP_URLS = [
     "https://www.sec.gov/files/company_tickers.json",
     "https://www.sec.gov/files/company_tickers_exchange.json",
 ]
+
+def normalize_sec_ticker(t: str) -> str:
+    # BRK.B -> BRK-B, BF.B -> BF-B
+    return (t or "").upper().strip().replace(".", "-")
+
+def normalize_yf_ticker(t: str) -> str:
+    # yfinance usually wants BRK-B style
+    return (t or "").upper().strip().replace(".", "-")
 
 def _sec_headers() -> Dict[str, str]:
     contact = ""
@@ -542,10 +550,12 @@ def _sec_headers() -> Dict[str, str]:
         "Connection": "keep-alive",
     }
 
-def _sec_get_json(url: str, timeout: int = 25, retries: int = 4) -> Optional[dict]:
+def _sec_get_json(url: str, timeout: int = 25, retries: int = 4, throttle_s: float = 0.12) -> Optional[dict]:
+    # Throttle to reduce 429 risk on Streamlit Cloud IPs
     for i in range(retries):
         try:
-            r = requests.get(url, headers=_sec_headers(), timeout=timeout)
+            time.sleep(throttle_s)
+            r = SESSION.get(url, headers=_sec_headers(), timeout=timeout)
             if 200 <= r.status_code < 300:
                 return r.json()
             if r.status_code in (403, 429, 500, 502, 503, 504):
@@ -556,10 +566,6 @@ def _sec_get_json(url: str, timeout: int = 25, retries: int = 4) -> Optional[dic
             time.sleep(0.6 * (2 ** i))
             continue
     return None
-
-def normalize_sec_ticker(t: str) -> str:
-    # BRK.B -> BRK-B, BF.B -> BF-B
-    return (t or "").upper().strip().replace(".", "-")
 
 @st.cache_data(ttl=24 * 60 * 60)
 def fetch_sec_ticker_map() -> pd.DataFrame:
@@ -597,7 +603,6 @@ def fetch_sec_submissions(cik_int: int) -> dict:
     return data or {}
 
 def _sec_index_url(cik_int: int, accession: str) -> str:
-    # Index is always: {accession}-index.html (with dashes in accession)
     acc_nodash = accession.replace("-", "")
     return f"https://www.sec.gov/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{accession}-index.html"
 
@@ -606,24 +611,46 @@ def _sec_primary_url(cik_int: int, accession: str, primary_doc: str) -> str:
     return f"https://www.sec.gov/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{primary_doc}"
 
 def _sec_ixviewer_url_from_primary(cik_int: int, accession: str, primary_doc: str) -> str:
-    # ixviewer wants doc= PATH (not full URL) — but only meaningful for Inline XBRL filings
     acc_nodash = accession.replace("-", "")
     doc_path = f"/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{primary_doc}"
     return f"https://www.sec.gov/ixviewer/documents/?doc={requests.utils.quote(doc_path)}"
 
-def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None, limit: int = 8) -> pd.DataFrame:
+def _resolve_cik_for_ticker(ticker: str) -> Optional[int]:
+    """
+    Resolve CIK using:
+      1) user override (session)
+      2) SEC ticker map (normalized + raw)
+    """
+    t = (ticker or "").upper().strip()
+    if not t:
+        return None
+
+    # 1) user override (session)
+    overrides = st.session_state.get("CIK_OVERRIDES", {})
+    if isinstance(overrides, dict) and t in overrides:
+        try:
+            return int(overrides[t])
+        except Exception:
+            pass
+
     m = fetch_sec_ticker_map()
     if m.empty:
-        return pd.DataFrame()
+        return None
 
-    t_norm = normalize_sec_ticker(ticker)
+    t_norm = normalize_sec_ticker(t)
     hit = m[m["ticker"] == t_norm].head(1)
     if hit.empty:
-        hit = m[m["ticker"] == ticker.upper()].head(1)
+        hit = m[m["ticker"] == t].head(1)
+
     if hit.empty:
+        return None
+    return int(hit["cik"].iloc[0])
+
+def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None, limit: int = 8) -> pd.DataFrame:
+    cik_int = _resolve_cik_for_ticker(ticker)
+    if cik_int is None:
         return pd.DataFrame()
 
-    cik_int = int(hit["cik"].iloc[0])
     sub = fetch_sec_submissions(cik_int)
     recent = (((sub or {}).get("filings") or {}).get("recent") or {})
     if not recent:
@@ -633,7 +660,6 @@ def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None
     if df.empty:
         return pd.DataFrame()
 
-    # Keep flags if present so we can decide ixviewer usage
     keep = [c for c in [
         "filingDate", "reportDate", "acceptanceDateTime",
         "form", "accessionNumber", "primaryDocument",
@@ -647,7 +673,6 @@ def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None
         df = df[df["form"].isin(forms)]
     df = df.sort_values("filingDate", ascending=False).head(limit)
 
-    # Build links
     def build_links(row):
         acc = str(row.get("accessionNumber", "") or "")
         doc = str(row.get("primaryDocument", "") or "")
@@ -657,7 +682,7 @@ def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None
         index_url = _sec_index_url(cik_int, acc)
         primary_url = _sec_primary_url(cik_int, acc, doc) if doc else ""
 
-        inline_flag = row.get("isInlineXBRL", None)
+        inline_flag = row.get("isInlineXBRL", 0)
         try:
             inline_flag = int(inline_flag) if inline_flag is not None and str(inline_flag) != "nan" else 0
         except Exception:
@@ -670,16 +695,27 @@ def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None
     df = pd.concat([df, links], axis=1)
 
     df.insert(0, "ticker", ticker.upper())
-    df.insert(1, "cik", cik_int)
+    df.insert(1, "cik", int(cik_int))
     return df
 
 # =========================
-# Earnings (robust)
+# Earnings (robust, multi-source)
 # =========================
-@st.cache_data(ttl=CACHE_TTL_META)
-def fetch_earnings_calendar_yf(ticker: str, limit: int = 8) -> pd.DataFrame:
+def _nasdaq_headers() -> Dict[str, str]:
+    # Nasdaq endpoints often require "browsery" headers
+    return {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://www.nasdaq.com",
+        "Referer": "https://www.nasdaq.com/",
+        "Connection": "keep-alive",
+    }
+
+@st.cache_data(ttl=CACHE_TTL_EARNINGS)
+def fetch_earnings_calendar_yf(ticker: str, limit: int = 12) -> pd.DataFrame:
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(normalize_yf_ticker(ticker))
         df = t.get_earnings_dates(limit=limit)
         if df is None or isinstance(df, dict) or df.empty:
             return pd.DataFrame()
@@ -693,14 +729,46 @@ def fetch_earnings_calendar_yf(ticker: str, limit: int = 8) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=CACHE_TTL_META)
-def fetch_earnings_calendar_fallback_info(ticker: str) -> pd.DataFrame:
+@st.cache_data(ttl=CACHE_TTL_EARNINGS)
+def fetch_earnings_calendar_from_calendar(ticker: str) -> pd.DataFrame:
     try:
-        info = fetch_info_one(ticker) or {}
+        t = yf.Ticker(normalize_yf_ticker(ticker))
+        cal = t.calendar
+        if cal is None:
+            return pd.DataFrame()
+
+        if isinstance(cal, pd.DataFrame) and not cal.empty:
+            for key in ["Earnings Date", "EarningsDate", "Earnings"]:
+                if key in cal.index:
+                    v = cal.loc[key].values
+                    dts = [pd.to_datetime(x, errors="coerce", utc=True) for x in v]
+                    dts = [x for x in dts if pd.notna(x)]
+                    if dts:
+                        return pd.DataFrame({"earnings_date": sorted(set(dts), reverse=True)})
+
+        if isinstance(cal, dict):
+            for key in ["Earnings Date", "EarningsDate", "Earnings"]:
+                if key in cal:
+                    v = cal[key]
+                    if isinstance(v, (list, tuple)):
+                        dts = [pd.to_datetime(x, errors="coerce", utc=True) for x in v]
+                    else:
+                        dts = [pd.to_datetime(v, errors="coerce", utc=True)]
+                    dts = [x for x in dts if pd.notna(x)]
+                    if dts:
+                        return pd.DataFrame({"earnings_date": sorted(set(dts), reverse=True)})
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=CACHE_TTL_EARNINGS)
+def fetch_earnings_calendar_from_info(ticker: str) -> pd.DataFrame:
+    try:
+        info = fetch_info_one(normalize_yf_ticker(ticker)) or {}
         keys = ["earningsTimestamp", "earningsTimestampStart", "earningsTimestampEnd"]
         dts = []
         for k in keys:
-            v = info.get(k, None)
+            v = info.get(k)
             if v is None:
                 continue
             if isinstance(v, (list, tuple)):
@@ -712,21 +780,65 @@ def fetch_earnings_calendar_fallback_info(ticker: str) -> pd.DataFrame:
                     dts.append(pd.to_datetime(int(v), unit="s", utc=True))
         if not dts:
             return pd.DataFrame()
-        return pd.DataFrame({"earnings_date": sorted(set(dts))}).sort_values("earnings_date", ascending=False).reset_index(drop=True)
+        return pd.DataFrame({"earnings_date": sorted(set(dts), reverse=True)})
     except Exception:
         return pd.DataFrame()
 
-def nearest_earnings_catalyst(df: pd.DataFrame) -> Optional[pd.Timestamp]:
-    if df is None or df.empty or "earnings_date" not in df.columns:
+@st.cache_data(ttl=CACHE_TTL_EARNINGS)
+def fetch_earnings_calendar_nasdaq(ticker: str) -> pd.DataFrame:
+    """
+    Best-effort fallback: Nasdaq calendar API (no key).
+    May be blocked on some hosts/IPs.
+    """
+    sym = (ticker or "").upper().strip()
+    if not sym:
+        return pd.DataFrame()
+
+    # Common endpoint used by nasdaq.com site
+    url = f"https://api.nasdaq.com/api/calendar/earnings?symbol={requests.utils.quote(sym)}"
+    try:
+        r = SESSION.get(url, headers=_nasdaq_headers(), timeout=15)
+        if not (200 <= r.status_code < 300):
+            return pd.DataFrame()
+        js = r.json() or {}
+        data = (js.get("data") or {})
+        # Structure can vary; try a few known shapes
+        # Often: data -> rows -> [ { "earningsDate": "...", "time": "...", ... } ]
+        rows = data.get("rows") or []
+        out_rows = []
+        for obj in rows:
+            d = obj.get("earningsDate") or obj.get("date") or obj.get("earnDate")
+            t = obj.get("time") or obj.get("earningsTime") or ""
+            if d:
+                # date only => treat as midnight UTC; if time is parseable, append
+                dt_str = f"{d} {t}".strip()
+                dtv = pd.to_datetime(dt_str, errors="coerce", utc=True)
+                if pd.notna(dtv):
+                    out_rows.append({"earnings_date": dtv, "source": "nasdaq"})
+        if not out_rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(out_rows).drop_duplicates()
+        return df.sort_values("earnings_date", ascending=False).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+def nearest_earnings_catalyst(earn_df: pd.DataFrame) -> Optional[pd.Timestamp]:
+    if earn_df is None or earn_df.empty or "earnings_date" not in earn_df.columns:
         return None
-    dts = pd.to_datetime(df["earnings_date"], errors="coerce", utc=True).dropna()
-    if len(dts) == 0:
+
+    dts = pd.to_datetime(earn_df["earnings_date"], errors="coerce", utc=True).dropna()
+    if dts.empty:
         return None
-    dts = dts.dt.tz_convert("UTC").dt.tz_localize(None)
-    dts64 = dts.astype("datetime64[ns]").to_numpy()
-    now64 = np.datetime64(pd.Timestamp.utcnow().to_datetime64())
-    future = dts64[dts64 >= now64]
-    return pd.Timestamp(future.min()) if future.size > 0 else pd.Timestamp(dts64.max())
+
+    dts_naive = dts.dt.tz_convert("UTC").dt.tz_localize(None)
+    arr = dts_naive.astype("datetime64[ns]").to_numpy()
+
+    now = np.datetime64(pd.Timestamp.utcnow().to_datetime64())
+    future = arr[arr >= now]
+
+    if future.size > 0:
+        return pd.Timestamp(future.min())
+    return pd.Timestamp(arr.max())
 
 # =========================
 # Technical indicators (added)
@@ -826,15 +938,12 @@ def score_kdj_value(k: pd.Series, d: pd.Series) -> float:
     kv, dv = safe_last(k), safe_last(d)
     if not np.isfinite(kv) or not np.isfinite(dv):
         return 0.0
-    # mild directional score
     return 0.25 if kv > dv else (-0.25 if kv < dv else 0.0)
 
 def score_boll_width(bb_width: pd.Series) -> float:
-    # mean-reversion friendly: very wide bands -> riskier; very narrow -> breakout potential
     w = safe_last(bb_width)
     if not np.isfinite(w):
         return 0.0
-    # normalize: narrower is slightly bullish, wider slightly bearish
     return float(np.clip((0.05 - w) / 0.05, -1.0, 1.0))
 
 def score_adx_trend(adx_s: pd.Series, plus_di: pd.Series, minus_di: pd.Series) -> float:
@@ -844,11 +953,10 @@ def score_adx_trend(adx_s: pd.Series, plus_di: pd.Series, minus_di: pd.Series) -
     if not np.isfinite(a) or not np.isfinite(p) or not np.isfinite(m):
         return 0.0
     if a < 18:
-        return 0.0  # no trend
+        return 0.0
     return 0.75 if p > m else (-0.75 if m > p else 0.0)
 
 def score_obv(obv_s: pd.Series) -> float:
-    # recent OBV slope
     if obv_s is None or obv_s.dropna().shape[0] < 20:
         return 0.0
     slope = safe_last(obv_s.diff().rolling(10).mean())
@@ -920,9 +1028,20 @@ sector_bucket = infer_sector_bucket(sector_zacks)
 st.caption(f"Selected: **{ticker_sel}** | Sector: **{sector_zacks}** | Bucket: **{sector_bucket}** | Industry: **{industry}**")
 
 # =========================
-# Sector-Specific Indicators (PMI removed)
+# Sector-Specific Indicators (with explanation)
 # =========================
 st.subheader("Sector-Specific Indicators")
+
+with st.expander("How sector indicator signals work", expanded=False):
+    st.markdown(
+        """
+- We compute **Δ 1m** as *latest value minus ~22 trading days ago* (or nearest available).
+- Each indicator has a rule for what is **“bullish”**:
+  - **bullish = higher** → increasing over 1m is labeled **Bullish**
+  - **bullish = lower** → decreasing over 1m is labeled **Bullish** (e.g., yields, USD, VIX proxies)
+- The **Score** is a simple sign score: `+1` bullish, `-1` bearish, `0` neutral/flat (N/A if Δ 1m not available).
+        """
+    )
 
 inds = SECTOR_TO_INDICATORS.get(sector_bucket, SECTOR_TO_INDICATORS["General"])
 rows = []
@@ -934,6 +1053,8 @@ for k in inds:
     rows.append({
         "Indicator": cfg.get("name", k),
         "Key": k,
+        "Bullish when": "Higher" if cfg.get("bullish", "higher") == "higher" else "Lower",
+        "Signal logic": indicator_signal_explain(cfg),
         "Source": cfg.get("source", ""),
         "Series/Symbol": cfg.get("id", ""),
         "Latest": snap["latest"],
@@ -948,7 +1069,7 @@ snap_df = pd.DataFrame(rows)
 st.dataframe(
     snap_df,
     use_container_width=True,
-    height=260,
+    height=300,
     column_config={
         "Latest": st.column_config.NumberColumn(format="%.4f"),
         "Δ 1w": st.column_config.NumberColumn(format="%.4f"),
@@ -964,6 +1085,7 @@ for i, k in enumerate(inds):
     ser = fetch_indicator_series(k)
     with cols[i % 2]:
         st.write(f"**{cfg.get('name', k)}**")
+        st.caption(indicator_signal_explain(cfg))
         if ser is None or ser.empty:
             st.info("No data (endpoint may be unavailable / blocked).")
         else:
@@ -978,10 +1100,10 @@ for i, k in enumerate(inds):
 st.subheader("Technical Analysis")
 
 with st.spinner("Fetching price history…"):
-    px_panel = fetch_prices_panel([ticker_sel], period=DEFAULT_PRICE_PERIOD, interval=DEFAULT_PRICE_INTERVAL)
+    px_panel = fetch_prices_panel([normalize_yf_ticker(ticker_sel)], period=DEFAULT_PRICE_PERIOD, interval=DEFAULT_PRICE_INTERVAL)
 
-info = fetch_info_one(ticker_sel)
-df_t = get_ohlc_from_panel(px_panel, ticker_sel)
+info = fetch_info_one(normalize_yf_ticker(ticker_sel))
+df_t = get_ohlc_from_panel(px_panel, normalize_yf_ticker(ticker_sel))
 
 if df_t.empty or "Close" not in df_t.columns:
     st.warning("No price data for selected ticker.")
@@ -993,14 +1115,12 @@ high = df_t["High"].astype(float) if "High" in df_t.columns else close
 low = df_t["Low"].astype(float) if "Low" in df_t.columns else close
 volume = df_t["Volume"].astype(float) if "Volume" in df_t.columns else pd.Series(index=close.index, data=np.nan)
 
-# Core indicators
 ema_spans = [5, 10, 20, 60, 120, 250]
 emas = {f"EMA{n}": ema(close, n) for n in ema_spans}
 rsi14 = rsi_series(close, 14)
 macd_line, signal_line, hist = macd(close, 12, 26, 9)
 k_line, d_line, j_line = kdj(high, low, close, n=9, k=3, d=3)
 
-# Added indicators
 bb_mid, bb_up, bb_dn, bb_width = bollinger(close, 20, 2.0)
 atr14 = atr(high, low, close, 14)
 plus_di, minus_di, adx14 = adx(high, low, close, 14)
@@ -1009,7 +1129,6 @@ roc10 = roc(close, 10)
 cci20 = cci(high, low, close, 20)
 vwap_s = vwap_daily(high, low, close, volume) if volume.notna().any() else pd.Series(index=close.index, data=np.nan)
 
-# --- Price + EMAs + Bollinger
 price_df = pd.DataFrame({"Date": close.index, "Close": close.values})
 for n in ema_spans:
     price_df[f"EMA{n}"] = emas[f"EMA{n}"].values
@@ -1032,13 +1151,11 @@ if "VWAP" in price_df.columns:
 fig_price.update_layout(title=f"{ticker_sel} — Price / EMAs / Bollinger / VWAP", height=460, legend=dict(orientation="h"))
 st.plotly_chart(fig_price, use_container_width=True)
 
-# --- RSI
 rsi_df = pd.DataFrame({"Date": rsi14.index, "RSI14": rsi14.values}).dropna()
 fig_rsi = px.line(rsi_df, x="Date", y="RSI14", title="RSI(14)")
 fig_rsi.update_layout(height=260)
 st.plotly_chart(fig_rsi, use_container_width=True)
 
-# --- MACD (legend top-right per request)
 macd_df = pd.DataFrame({"Date": close.index, "MACD": macd_line.values, "Signal": signal_line.values, "Hist": hist.values}).dropna()
 fig_macd = go.Figure()
 fig_macd.add_trace(go.Scatter(x=macd_df["Date"], y=macd_df["MACD"], name="MACD"))
@@ -1049,9 +1166,9 @@ fig_macd.update_layout(
     height=320,
     margin=dict(l=10, r=10, t=60, b=40),
     legend=dict(
-        orientation="h",      # horizontal (aside)
+        orientation="h",
         yanchor="bottom",
-        y=1.02,               # just above plotting area, below title
+        y=1.02,
         xanchor="left",
         x=0.0,
         font=dict(size=10),
@@ -1060,32 +1177,27 @@ fig_macd.update_layout(
 )
 st.plotly_chart(fig_macd, use_container_width=True)
 
-# --- KDJ
 kdj_df = pd.DataFrame({"Date": close.index, "K": k_line.values, "D": d_line.values, "J": j_line.values}).dropna()
 fig_kdj = px.line(kdj_df, x="Date", y=["K", "D", "J"], title="KDJ(9,3,3)")
 fig_kdj.update_layout(height=320)
 st.plotly_chart(fig_kdj, use_container_width=True)
 
-# --- ATR
 atr_df = pd.DataFrame({"Date": atr14.index, "ATR14": atr14.values}).dropna()
 fig_atr = px.line(atr_df, x="Date", y="ATR14", title="ATR(14)")
 fig_atr.update_layout(height=260)
 st.plotly_chart(fig_atr, use_container_width=True)
 
-# --- ADX (+DI, -DI)
 adx_df = pd.DataFrame({"Date": adx14.index, "ADX14": adx14.values, "+DI": plus_di.values, "-DI": minus_di.values}).dropna()
 fig_adx = px.line(adx_df, x="Date", y=["ADX14", "+DI", "-DI"], title="ADX(14) with +DI/-DI")
 fig_adx.update_layout(height=320)
 st.plotly_chart(fig_adx, use_container_width=True)
 
-# --- OBV
 if obv_s is not None and obv_s.dropna().shape[0] > 10:
     obv_df = pd.DataFrame({"Date": obv_s.index, "OBV": obv_s.values}).dropna()
     fig_obv = px.line(obv_df, x="Date", y="OBV", title="On-Balance Volume (OBV)")
     fig_obv.update_layout(height=260)
     st.plotly_chart(fig_obv, use_container_width=True)
 
-# --- ROC & CCI
 roc_df = pd.DataFrame({"Date": roc10.index, "ROC10": roc10.values}).dropna()
 fig_roc = px.line(roc_df, x="Date", y="ROC10", title="Rate of Change ROC(10) [%]")
 fig_roc.update_layout(height=260)
@@ -1096,7 +1208,6 @@ fig_cci = px.line(cci_df, x="Date", y="CCI20", title="CCI(20)")
 fig_cci.update_layout(height=260)
 st.plotly_chart(fig_cci, use_container_width=True)
 
-# --- Signals (EMA consolidated + extra indicators) + score chart
 ema_cluster = float(np.nanmean([score_ema_trend(close, emas[f"EMA{n}"]) for n in ema_spans]))
 sig_df = pd.DataFrame([
     {"Indicator": "EMA Cluster (5/10/20/60/120/250)", "Score": float(np.clip(ema_cluster, -1, 1))},
@@ -1111,6 +1222,18 @@ sig_df = pd.DataFrame([
 ])
 composite = float(sig_df["Score"].mean()) if not sig_df.empty else 0.0
 st.markdown(f"#### Indicator Signals (Composite Score: **{composite:+.2f}**)")
+
+with st.expander("How technical scores work", expanded=False):
+    st.markdown(
+        """
+Scores are **heuristics** (not a model):
+- **EMA Cluster**: price above EMA and EMA slope up → bullish; below and slope down → bearish.
+- **RSI**: <=30 bullish (oversold), >=70 bearish (overbought), otherwise mild directional tilt.
+- **MACD**: MACD above signal bullish; plus a small bonus if histogram is accelerating.
+- **ADX**: below ~18 means “no trend”; above that, +DI vs -DI determines direction.
+- **OBV/ROC/CCI/Boll Width** add smaller “confirmation” tilts.
+        """
+    )
 
 st.dataframe(sig_df, use_container_width=True, height=260, column_config={"Score": st.column_config.NumberColumn(format="%.2f")})
 fig_sig = px.bar(sig_df, x="Indicator", y="Score", title="Technical Indicator Scores")
@@ -1149,7 +1272,38 @@ else:
         pol = sentiment_polarity(title)
         st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_ | polarity: `{pol:+.2f}`")
 
+# =========================
+# SEC Filings & Earnings Catalysts
+# =========================
 st.subheader("SEC Filings & Earnings Catalysts")
+
+# ---- CIK override UI (fixes missing ticker->CIK mapping)
+if "CIK_OVERRIDES" not in st.session_state:
+    st.session_state["CIK_OVERRIDES"] = {}
+
+with st.expander("Fix EDGAR for tickers with missing CIK (optional)", expanded=False):
+    st.markdown(
+        """
+If EDGAR is unavailable because **ticker→CIK mapping is missing** (or SEC blocks submissions fetch),
+you can manually enter the issuer's **CIK** here (digits only).  
+This is saved in the session and used immediately for building EDGAR links.
+        """
+    )
+    cur = st.session_state["CIK_OVERRIDES"].get(ticker_sel, "")
+    cik_in = st.text_input(f"CIK override for {ticker_sel}", value=str(cur) if cur else "")
+    cbtn1, cbtn2 = st.columns(2)
+    with cbtn1:
+        if st.button("Save CIK override"):
+            try:
+                v = int(str(cik_in).strip())
+                st.session_state["CIK_OVERRIDES"][ticker_sel] = v
+                st.success(f"Saved CIK override for {ticker_sel}: {v}")
+            except Exception:
+                st.error("Please enter digits only (e.g., 320193).")
+    with cbtn2:
+        if st.button("Clear CIK override"):
+            st.session_state["CIK_OVERRIDES"].pop(ticker_sel, None)
+            st.success("Cleared override.")
 
 c_sec1, c_sec2 = st.columns([1.3, 1])
 with c_sec1:
@@ -1164,12 +1318,12 @@ with c_sec2:
 filings_df = get_latest_filings_for_ticker(ticker_sel, forms=forms_sel, limit=filings_limit)
 
 if filings_df.empty:
-    st.info("SEC filings unavailable (ticker->CIK mapping missing OR submissions fetch blocked).")
+    st.info("SEC filings unavailable (ticker->CIK mapping missing OR submissions fetch blocked). Try the CIK override above.")
 else:
     show_df = filings_df.copy()
     show_df["filingDate"] = pd.to_datetime(show_df["filingDate"], errors="coerce").dt.date
 
-    cols = ["ticker", "form", "filingDate", "reportDate", "accessionNumber", "index_url", "primary_url", "ixviewer_url"]
+    cols = ["ticker", "cik", "form", "filingDate", "reportDate", "accessionNumber", "index_url", "primary_url", "ixviewer_url"]
     cols = [c for c in cols if c in show_df.columns]
 
     st.dataframe(
@@ -1185,137 +1339,51 @@ else:
     st.caption("Use **EDGAR Index** as the default. ixviewer appears only when `isInlineXBRL=1`.")
 
 # =========================
-# Earnings Calendar (best-effort, robust)
+# Earnings Calendar (enhanced)
 # =========================
 st.markdown("#### Earnings Calendar")
 
-@st.cache_data(ttl=CACHE_TTL_META)
-def fetch_earnings_calendar_yf(ticker: str, limit: int = 12) -> pd.DataFrame:
-    """
-    Uses yfinance get_earnings_dates (if available). Returns a dataframe with:
-      earnings_date + (optional) EPS Estimate, Reported EPS, Surprise(%), Revenue Estimate, Reported Revenue
-    """
-    try:
-        t = yf.Ticker(ticker)
-        df = t.get_earnings_dates(limit=limit)
-        if df is None or isinstance(df, dict) or df.empty:
-            return pd.DataFrame()
-        out = df.reset_index()
-        if "Earnings Date" in out.columns:
-            out = out.rename(columns={"Earnings Date": "earnings_date"})
-        elif out.columns[0] != "earnings_date":
-            out = out.rename(columns={out.columns[0]: "earnings_date"})
-        out["earnings_date"] = pd.to_datetime(out["earnings_date"], errors="coerce", utc=True)
-        return out.sort_values("earnings_date", ascending=False)
-    except Exception:
-        return pd.DataFrame()
-
-@st.cache_data(ttl=CACHE_TTL_META)
-def fetch_earnings_calendar_from_calendar(ticker: str) -> pd.DataFrame:
-    """
-    Fallback #1: yf.Ticker(ticker).calendar (sometimes returns next earnings date)
-    """
-    try:
-        t = yf.Ticker(ticker)
-        cal = t.calendar
-        if cal is None:
-            return pd.DataFrame()
-        # yfinance sometimes returns a DataFrame or dict-like
-        if isinstance(cal, pd.DataFrame) and not cal.empty:
-            # try common keys
-            for key in ["Earnings Date", "EarningsDate", "Earnings"]:
-                if key in cal.index:
-                    v = cal.loc[key].values
-                    dts = [pd.to_datetime(x, errors="coerce", utc=True) for x in v]
-                    dts = [x for x in dts if pd.notna(x)]
-                    if dts:
-                        return pd.DataFrame({"earnings_date": sorted(set(dts), reverse=True)})
-        if isinstance(cal, dict):
-            for key in ["Earnings Date", "EarningsDate", "Earnings"]:
-                if key in cal:
-                    v = cal[key]
-                    if isinstance(v, (list, tuple)):
-                        dts = [pd.to_datetime(x, errors="coerce", utc=True) for x in v]
-                    else:
-                        dts = [pd.to_datetime(v, errors="coerce", utc=True)]
-                    dts = [x for x in dts if pd.notna(x)]
-                    if dts:
-                        return pd.DataFrame({"earnings_date": sorted(set(dts), reverse=True)})
-        return pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
-
-@st.cache_data(ttl=CACHE_TTL_META)
-def fetch_earnings_calendar_from_info(ticker: str) -> pd.DataFrame:
-    """
-    Fallback #2: timestamps in .info (earningsTimestamp / Start / End)
-    """
-    try:
-        info = fetch_info_one(ticker) or {}
-        keys = ["earningsTimestamp", "earningsTimestampStart", "earningsTimestampEnd"]
-        dts = []
-        for k in keys:
-            v = info.get(k)
-            if v is None:
-                continue
-            if isinstance(v, (list, tuple)):
-                for vv in v:
-                    if isinstance(vv, (int, float)) and vv > 0:
-                        dts.append(pd.to_datetime(int(vv), unit="s", utc=True))
-            else:
-                if isinstance(v, (int, float)) and v > 0:
-                    dts.append(pd.to_datetime(int(v), unit="s", utc=True))
-        if not dts:
-            return pd.DataFrame()
-        return pd.DataFrame({"earnings_date": sorted(set(dts), reverse=True)})
-    except Exception:
-        return pd.DataFrame()
-
-def nearest_earnings_catalyst(earn_df: pd.DataFrame) -> Optional[pd.Timestamp]:
-    """
-    Robust: converts everything to tz-naive UTC numpy datetime64 before comparing.
-    Avoids pandas InvalidComparison/TypeError.
-    """
-    if earn_df is None or earn_df.empty or "earnings_date" not in earn_df.columns:
-        return None
-
-    dts = pd.to_datetime(earn_df["earnings_date"], errors="coerce", utc=True).dropna()
-    if dts.empty:
-        return None
-
-    # convert to tz-naive UTC for safe comparisons
-    dts_naive = dts.dt.tz_convert("UTC").dt.tz_localize(None)
-    arr = dts_naive.astype("datetime64[ns]").to_numpy()
-
-    now = np.datetime64(pd.Timestamp.utcnow().to_datetime64())
-    future = arr[arr >= now]
-
-    if future.size > 0:
-        return pd.Timestamp(future.min())
-    return pd.Timestamp(arr.max())
-
-# --- fetch with fallbacks
 earn_df = fetch_earnings_calendar_yf(ticker_sel, limit=12)
+src_used = "yfinance.get_earnings_dates"
+
 if earn_df.empty:
     earn_df = fetch_earnings_calendar_from_calendar(ticker_sel)
+    src_used = "yfinance.calendar"
 if earn_df.empty:
     earn_df = fetch_earnings_calendar_from_info(ticker_sel)
+    src_used = "yfinance.info timestamps"
+if earn_df.empty:
+    earn_df = fetch_earnings_calendar_nasdaq(ticker_sel)
+    src_used = "nasdaq (best-effort)"
 
 if earn_df.empty:
-    st.info("Earnings dates unavailable from free sources on this host/IP (yfinance often limited on Streamlit Cloud).")
+    st.info("Earnings dates unavailable from free sources on this host/IP. (Common on Streamlit Cloud.)")
 else:
     earn_df = earn_df.copy()
     earn_df["earnings_date"] = pd.to_datetime(earn_df["earnings_date"], errors="coerce", utc=True)
 
-    show_cols = [c for c in ["earnings_date", "EPS Estimate", "Reported EPS", "Surprise(%)", "Revenue Estimate", "Reported Revenue"] if c in earn_df.columns]
+    show_cols = [c for c in ["earnings_date", "EPS Estimate", "Reported EPS", "Surprise(%)", "Revenue Estimate", "Reported Revenue", "source"] if c in earn_df.columns]
     if not show_cols:
         show_cols = ["earnings_date"]
 
+    st.caption(f"Source used: **{src_used}** (best available)")
     st.dataframe(earn_df[show_cols].head(12), use_container_width=True, height=260)
 
     nxt = nearest_earnings_catalyst(earn_df)
     if nxt is not None:
-        st.success(f"Nearest earnings catalyst (UTC): {nxt.strftime('%Y-%m-%d %H:%M')}")
+        # Show both UTC and America/Toronto for clarity
+        nxt_utc = nxt.replace(tzinfo=timezone.utc)
+        try:
+            import zoneinfo
+            tor = zoneinfo.ZoneInfo("America/Toronto")
+            nxt_tor = nxt_utc.astimezone(tor)
+            st.success(
+                "Nearest earnings catalyst: "
+                f"**{nxt_utc.strftime('%Y-%m-%d %H:%M')} UTC** / "
+                f"**{nxt_tor.strftime('%Y-%m-%d %H:%M')} America/Toronto**"
+            )
+        except Exception:
+            st.success(f"Nearest earnings catalyst (UTC): {nxt_utc.strftime('%Y-%m-%d %H:%M')}")
 
 # =========================
 # Investor Relations
