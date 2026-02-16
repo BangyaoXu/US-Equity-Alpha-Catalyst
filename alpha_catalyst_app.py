@@ -1309,13 +1309,6 @@ with tab_stock:
     with kpi4:
         st.metric("EPS Surprise", f"{_scalar_value('EPS Surprise'):.2f}%" if np.isfinite(_scalar_value("EPS Surprise")) else "N/A")
 
-    st.markdown("#### Earnings Estimate Revisions")
-    est = fetch_earnings_estimate_snapshot_yf(ticker_sel)
-    if est is None or est.empty:
-        st.info("No earnings estimate revisions table available from Yahoo/yfinance for this ticker.")
-    else:
-        st.dataframe(est, use_container_width=True, height=220)
-
     st.markdown("#### Earnings Surprise History")
     es = fetch_earnings_surprise_history(ticker_sel, limit=28)
     if es is None or es.empty:
@@ -1330,24 +1323,6 @@ with tab_stock:
         st.plotly_chart(fig, use_container_width=True)
 
     if sector_exact == "Medical":
-        st.markdown("#### Admissions Growth / Medical Cost Ratios")
-
-        # Admissions growth is rarely available from free sources via yfinance.
-        # Use Revenue YoY as a proxy for admissions/volume growth for providers,
-        # and show Total Cost Ratio as a proxy for medical cost ratio.
-        adm_proxy = _scalar_value("Revenue YoY")
-        cost_ratio = _scalar_value("Total Cost Ratio")
-
-        cA, cB = st.columns(2)
-        with cA:
-            st.write("**Admissions Growth (proxy)**")
-            st.caption("Proxy uses Revenue YoY from quarterly financials (volume/admissions data is typically not provided via Yahoo).")
-            st.metric("Proxy (Revenue YoY)", f"{adm_proxy:.2f}%" if np.isfinite(adm_proxy) else "N/A")
-        with cB:
-            st.write("**Medical Cost Ratio (proxy)**")
-            st.caption("Proxy uses Total Cost Ratio = 100% − Operating Margin (latest quarter).")
-            st.metric("Total Cost Ratio", f"{cost_ratio:.2f}%" if np.isfinite(cost_ratio) else "N/A")
-
         st.markdown("#### Policy + FDA Approvals News")
         news_window_label = st.selectbox("Medical catalysts news window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="med_news_window")
         days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
