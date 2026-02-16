@@ -50,6 +50,19 @@ SESSION.headers.update({"User-Agent": USER_AGENT})
 # =========================
 # UTILITIES
 # =========================
+def color_return(v):
+    try:
+        v = float(v)
+    except Exception:
+        return ""
+    if not np.isfinite(v):
+        return ""
+    if v > 0:
+        return "color: #16a34a; font-weight:600;"   # green
+    if v < 0:
+        return "color: #dc2626; font-weight:600;"   # red
+    return ""
+
 def parse_universe_date_from_filename(fn: str) -> Optional[str]:
     m = re.search(r"selected_universe_(\d{4}-\d{2}-\d{2})\.csv$", fn)
     return m.group(1) if m else None
@@ -1261,11 +1274,15 @@ if key_cols_present:
         show_uni = show_uni[cols2]
 
     show_uni = show_uni.rename(columns={"__Return": "Return"})
+    styled_uni = show_uni.style.map(color_return, subset=["Return"])
+    
     st.dataframe(
-        show_uni,
+        styled_uni,
         use_container_width=True,
         height=320,
-        column_config={"Return": st.column_config.NumberColumn("Return", format="%.2f%%")},
+        column_config={
+            "Return": st.column_config.NumberColumn("Return", format="%.2f%%"),
+        },
     )
 else:
     st.dataframe(uni.iloc[:, :12], use_container_width=True, height=320)
