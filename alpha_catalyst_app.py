@@ -176,10 +176,6 @@ def normalize_yf_ticker(t: str) -> str:
     return (t or "").upper().strip().replace(".", "-")
 
 def strip_trailing_parens(name: str) -> str:
-    """
-    Remove trailing parenthetical like 'EPS Surprise (most recent report)' -> 'EPS Surprise'
-    Only removes the LAST '(...)' at end.
-    """
     s = str(name or "").strip()
     return re.sub(r"\s*\([^)]*\)\s*$", "", s).strip()
 
@@ -206,10 +202,6 @@ def _get_text(url: str, timeout: int = 25, retries: int = 3) -> Optional[str]:
 # =========================
 @st.cache_data(ttl=CACHE_TTL_RETURNS)
 def fetch_returns_since(universe_date_str: str, tickers: List[str]) -> Dict[str, float]:
-    """
-    Return map: ticker -> (last_close / first_close_from_universe_date - 1)
-    Uses yfinance auto-adjusted close.
-    """
     if not tickers:
         return {}
     try:
@@ -296,9 +288,6 @@ def fetch_info_one(ticker: str) -> Dict:
 # =========================
 @st.cache_data(ttl=CACHE_TTL_NEWS)
 def fetch_google_news_rss_query(query: str, days: int) -> pd.DataFrame:
-    """
-    Google News RSS for arbitrary query (used for policy/FDA/M&A).
-    """
     q = (query or "").strip()
     if not q:
         return pd.DataFrame()
@@ -334,21 +323,15 @@ def fetch_google_news_rss_query(query: str, days: int) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-# Backward-compatible wrapper (keeps your existing call sites working)
 @st.cache_data(ttl=CACHE_TTL_NEWS)
 def fetch_google_news_rss(ticker: str, days: int) -> pd.DataFrame:
     return fetch_google_news_rss_query(f"{ticker} stock", days)
 
 # =========================
 # FRED: US Healthcare Policy Uncertainty Index (EPUHEALTHCARE)
-# Free CSV endpoint (no API key)
 # =========================
 @st.cache_data(ttl=24 * 60 * 60)
 def fetch_fred_epu_healthcare() -> pd.DataFrame:
-    """
-    Returns columns: date, value (monthly)
-    Source: FRED series EPUHEALTHCARE
-    """
     url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=EPUHEALTHCARE"
     txt = _get_text(url, timeout=25, retries=3)
     if not txt:
@@ -370,9 +353,6 @@ def fetch_fred_epu_healthcare() -> pd.DataFrame:
 # =========================
 @st.cache_data(ttl=CACHE_TTL_EARNINGS)
 def fetch_earnings_dates_yf(ticker: str, limit: int = 12) -> pd.DataFrame:
-    """
-    yfinance: includes EPS estimate / reported / surprise% for many names.
-    """
     try:
         t = yf.Ticker(normalize_yf_ticker(ticker))
         df = t.get_earnings_dates(limit=limit)
@@ -389,9 +369,6 @@ def fetch_earnings_dates_yf(ticker: str, limit: int = 12) -> pd.DataFrame:
         return pd.DataFrame()
 
 def nearest_earnings_catalyst(earn_df: pd.DataFrame) -> Optional[pd.Timestamp]:
-    """
-    Robust vs tz-aware dtype issues.
-    """
     if earn_df is None or earn_df.empty or "earnings_date" not in earn_df.columns:
         return None
 
@@ -409,9 +386,6 @@ def nearest_earnings_catalyst(earn_df: pd.DataFrame) -> Optional[pd.Timestamp]:
         return pd.Timestamp(future.min())
     return pd.Timestamp(arr.max())
 
-# =========================
-# Earnings Surprise history (from yfinance get_earnings_dates)
-# =========================
 @st.cache_data(ttl=CACHE_TTL_EARNINGS)
 def fetch_earnings_surprise_history(ticker: str, limit: int = 24) -> pd.DataFrame:
     df = fetch_earnings_dates_yf(ticker, limit=limit)
@@ -433,13 +407,10 @@ def fetch_earnings_surprise_history(ticker: str, limit: int = 24) -> pd.DataFram
     return out[["earnings_date", "surprise_pct"]]
 
 # =========================
-# Earnings estimates snapshot (Yahoo "trend" object via yfinance; not true revision history)
+# Earnings estimates snapshot (Yahoo "trend" object via yfinance)
 # =========================
 @st.cache_data(ttl=CACHE_TTL_ANALYST)
 def fetch_earnings_estimate_snapshot_yf(ticker: str) -> pd.DataFrame:
-    """
-    Best-effort snapshot (not a historical revision series).
-    """
     sym = normalize_yf_ticker(ticker)
     try:
         t = yf.Ticker(sym)
@@ -454,14 +425,10 @@ def fetch_earnings_estimate_snapshot_yf(ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 # =========================
-# FDA decision calendar (best-effort scraping; may break if site blocks bots/changes HTML)
+# FDA decision calendar scraping
 # =========================
 @st.cache_data(ttl=6 * 60 * 60)
-def fetch_fda_calendar_best_effort(ticker: str, company_name: str = "") -> pd.DataFrame:
-    """
-    Attempts to scrape an FDA calendar page and filter rows that mention the ticker/company.
-    If blocked or HTML changes => returns empty df.
-    """
+def fetch_fda_calendar(ticker: str, company_name: str = "") -> pd.DataFrame:
     targets = []
     t = (ticker or "").upper().strip()
     if t:
@@ -504,8 +471,8 @@ def fetch_fda_calendar_best_effort(ticker: str, company_name: str = "") -> pd.Da
             df = pd.DataFrame([r + [""] * (max_len - len(r)) for r in rows_out], columns=cols)
 
             for c in cols[:3]:
-                dt = pd.to_datetime(df[c], errors="coerce")
-                if dt.notna().mean() > 0.3:
+                dtv = pd.to_datetime(df[c], errors="coerce")
+                if dtv.notna().mean() > 0.3:
                     df = df.rename(columns={c: "date"})
                     df["date"] = pd.to_datetime(df["date"], errors="coerce")
                     break
@@ -520,6 +487,13 @@ def fetch_fda_calendar_best_effort(ticker: str, company_name: str = "") -> pd.Da
 # =========================
 # ANALYST RATINGS (yfinance)
 # =========================
+def _to_num(x) -> float:
+    try:
+        v = float(x)
+        return v
+    except Exception:
+        return np.nan
+
 @st.cache_data(ttl=CACHE_TTL_ANALYST)
 def fetch_analyst_price_targets_yf(ticker: str) -> Dict[str, float]:
     out = {"mean": np.nan, "high": np.nan, "low": np.nan, "median": np.nan}
@@ -579,15 +553,8 @@ def fetch_upgrades_downgrades_yf(ticker: str, max_rows: int = 50) -> pd.DataFram
         return pd.DataFrame()
 
 # =========================
-# SECTOR-SPECIFIC INDICATORS (sector names kept EXACT)
+# SECTOR/COMPANY INDICATORS (from Yahoo quarterly statements)
 # =========================
-def _to_num(x) -> float:
-    try:
-        v = float(x)
-        return v
-    except Exception:
-        return np.nan
-
 @st.cache_data(ttl=CACHE_TTL_SECTOR)
 def yf_quarterly_income(sym: str) -> pd.DataFrame:
     try:
@@ -702,15 +669,7 @@ def _ar_days(balance: pd.DataFrame, income: pd.DataFrame) -> float:
     return (ar_last / (rev_last * 4.0)) * 365.0
 
 @st.cache_data(ttl=CACHE_TTL_SECTOR)
-def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
-    """
-    Returns:
-      {
-        "scalars": DataFrame(columns=[Indicator, Value, Unit, Source, Definition, Update]),
-        "sector_etf_map": {...},
-        "driver_series_map": {...},
-      }
-    """
+def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
     sym = normalize_yf_ticker(ticker)
     info = fetch_info_one(sym) or {}
     inc = yf_quarterly_income(sym)
@@ -719,17 +678,8 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
 
     scalars: List[Dict[str, object]] = []
 
-    def add_scalar(name, value, unit, source, definition, update):
-        scalars.append(
-            {
-                "Indicator": name,
-                "Value": value,
-                "Unit": unit,
-                "Source": source,
-                "Definition": definition,
-                "Update": update,
-            }
-        )
+    def add_scalar(name, value, unit, update):
+        scalars.append({"Indicator": name, "Value": value, "Unit": unit, "Update": update})
 
     rev_s = _row_get(inc, ["total revenue", "totalrevenue", "revenue"])
     gp_s = _row_get(inc, ["gross profit", "grossprofit"])
@@ -737,64 +687,26 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
     rd_s = _row_get(inc, ["research development", "researchdevelopment", "research & development"])
 
     rev_yoy = _q_yoy_growth(rev_s) if rev_s is not None else np.nan
-    add_scalar(
-        "Revenue YoY (latest quarter)",
-        rev_yoy,
-        "%",
-        "Yahoo Finance via yfinance (quarterly_financials)",
-        "Latest quarterly revenue growth vs same quarter 1 year ago.",
-        "Quarterly",
-    )
+    add_scalar("Revenue YoY", rev_yoy, "%", "Quarterly")
 
     gm = _q_margin_pct(gp_s, rev_s) if gp_s is not None and rev_s is not None else np.nan
-    add_scalar(
-        "Gross Margin (latest quarter)",
-        gm,
-        "%",
-        "Yahoo Finance via yfinance (quarterly_financials)",
-        "Gross Profit / Revenue for the latest quarter.",
-        "Quarterly",
-    )
+    add_scalar("Gross Margin", gm, "%", "Quarterly")
 
     om = _q_margin_pct(opinc_s, rev_s) if opinc_s is not None and rev_s is not None else np.nan
-    add_scalar(
-        "Operating Margin (latest quarter)",
-        om,
-        "%",
-        "Yahoo Finance via yfinance (quarterly_financials)",
-        "Operating Income / Revenue for the latest quarter.",
-        "Quarterly",
-    )
+    add_scalar("Operating Margin", om, "%", "Quarterly")
+
+    # Medical cost ratio proxy: 1 - operating margin
+    cost_ratio = (100.0 - om) if np.isfinite(om) else np.nan
+    add_scalar("Total Cost Ratio", cost_ratio, "%", "Quarterly")
 
     rd_int = _q_margin_pct(rd_s, rev_s) if rd_s is not None and rev_s is not None else np.nan
-    add_scalar(
-        "R&D Intensity (latest quarter)",
-        rd_int,
-        "%",
-        "Yahoo Finance via yfinance (quarterly_financials)",
-        "R&D expense / Revenue (latest quarter).",
-        "Quarterly",
-    )
+    add_scalar("R&D Intensity", rd_int, "%", "Quarterly")
 
     dinv = _days_inventory(bal, inc)
-    add_scalar(
-        "Days Inventory (proxy)",
-        dinv,
-        "days",
-        "Yahoo Finance via yfinance (quarterly_balance_sheet + quarterly_financials)",
-        "Inventory / (COGS annualized) × 365.",
-        "Quarterly",
-    )
+    add_scalar("Days Inventory", dinv, "days", "Quarterly")
 
     dso = _ar_days(bal, inc)
-    add_scalar(
-        "Days Sales Outstanding (proxy)",
-        dso,
-        "days",
-        "Yahoo Finance via yfinance (quarterly_balance_sheet + quarterly_financials)",
-        "Accounts Receivable / (Revenue annualized) × 365.",
-        "Quarterly",
-    )
+    add_scalar("Days Sales Outstanding", dso, "days", "Quarterly")
 
     ocf = _row_get(cfs, ["total cash from operating activities", "operating cash flow", "totalcashfromoperatingactivities"])
     capex = _row_get(cfs, ["capital expenditures", "capitalexpenditures"])
@@ -803,14 +715,7 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
         fcf_latest = float(df_cf.iloc[-1, 0] + df_cf.iloc[-1, 1]) if not df_cf.empty else np.nan
     else:
         fcf_latest = np.nan
-    add_scalar(
-        "Free Cash Flow (latest quarter, proxy)",
-        fcf_latest,
-        "USD",
-        "Yahoo Finance via yfinance (quarterly_cashflow)",
-        "Operating Cash Flow + CapEx for latest quarter (CapEx usually negative).",
-        "Quarterly",
-    )
+    add_scalar("Free Cash Flow", fcf_latest, "USD", "Quarterly")
 
     earn = fetch_earnings_dates_yf(sym, limit=8)
     eps_surp = np.nan
@@ -819,67 +724,18 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
             if col in earn.columns:
                 eps_surp = _to_num(earn[col].iloc[0])
                 break
-    add_scalar(
-        "EPS Surprise (most recent report)",
-        eps_surp,
-        "%",
-        "Yahoo Finance via yfinance (get_earnings_dates)",
-        "Most recent EPS surprise percentage (reported vs estimate).",
-        "Quarterly (on earnings)",
-    )
+    add_scalar("EPS Surprise", eps_surp, "%", "Quarterly (earnings)")
 
-    add_scalar(
-        "Forward P/E",
-        _to_num(info.get("forwardPE")),
-        "x",
-        "Yahoo Finance via yfinance (.info)",
-        "Forward P/E multiple (if available).",
-        "Daily",
-    )
+    add_scalar("Forward P/E", _to_num(info.get("forwardPE")), "x", "Daily")
     rg = _to_num(info.get("revenueGrowth"))
-    add_scalar(
-        "Revenue Growth (Yahoo field)",
-        rg * 100.0 if np.isfinite(rg) else np.nan,
-        "%",
-        "Yahoo Finance via yfinance (.info)",
-        "Yahoo-provided revenue growth field (definition varies by name).",
-        "Daily",
-    )
+    add_scalar("Revenue Growth (Yahoo)", rg * 100.0 if np.isfinite(rg) else np.nan, "%", "Daily")
     eg = _to_num(info.get("earningsGrowth"))
-    add_scalar(
-        "Earnings Growth (Yahoo field)",
-        eg * 100.0 if np.isfinite(eg) else np.nan,
-        "%",
-        "Yahoo Finance via yfinance (.info)",
-        "Yahoo-provided earnings growth field (definition varies by name).",
-        "Daily",
-    )
+    add_scalar("Earnings Growth (Yahoo)", eg * 100.0 if np.isfinite(eg) else np.nan, "%", "Daily")
     roe = _to_num(info.get("returnOnEquity"))
-    add_scalar(
-        "Return on Equity",
-        roe * 100.0 if np.isfinite(roe) else np.nan,
-        "%",
-        "Yahoo Finance via yfinance (.info)",
-        "ROE (if available).",
-        "Daily",
-    )
-    add_scalar(
-        "Debt/Equity",
-        _to_num(info.get("debtToEquity")),
-        "x",
-        "Yahoo Finance via yfinance (.info)",
-        "Debt-to-Equity ratio (if available).",
-        "Daily",
-    )
+    add_scalar("Return on Equity", roe * 100.0 if np.isfinite(roe) else np.nan, "%", "Daily")
+    add_scalar("Debt/Equity", _to_num(info.get("debtToEquity")), "x", "Daily")
     dy = _to_num(info.get("dividendYield"))
-    add_scalar(
-        "Dividend Yield",
-        dy * 100.0 if np.isfinite(dy) else np.nan,
-        "%",
-        "Yahoo Finance via yfinance (.info)",
-        "Dividend yield (if available).",
-        "Daily",
-    )
+    add_scalar("Dividend Yield", dy * 100.0 if np.isfinite(dy) else np.nan, "%", "Daily")
 
     sector_etf_map = {
         "Medical": "XLV",
@@ -900,11 +756,11 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
     }
 
     driver_series_map = {
-        "Basic Materials": [("HG=F", "Copper Futures (HG=F)"), ("GC=F", "Gold Futures (GC=F)")],
-        "Energy": [("CL=F", "WTI Crude (CL=F)"), ("NG=F", "Nat Gas (NG=F)")],
-        "Transportation": [("CL=F", "WTI Crude (CL=F)"), ("BZ=F", "Brent (BZ=F)")],
-        "Aerospace": [("ITA", "Aerospace & Defense ETF (ITA)")],
-        "Construction": [("ITB", "Homebuilders ETF (ITB)")],
+        "Basic Materials": [("HG=F", "Copper Futures"), ("GC=F", "Gold Futures")],
+        "Energy": [("CL=F", "WTI Crude"), ("NG=F", "Natural Gas")],
+        "Transportation": [("CL=F", "WTI Crude"), ("BZ=F", "Brent Crude")],
+        "Aerospace": [("ITA", "Aerospace & Defense ETF")],
+        "Construction": [("ITB", "Homebuilders ETF")],
     }
 
     return {
@@ -913,10 +769,9 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
         "driver_series_map": driver_series_map,
     }
 
-def build_sector_indicator_view(sector_name_exact: str, ticker: str) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
-    payload = fetch_sector_indicator_panel(ticker)
+def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
+    payload = fetch_indicator_bundle(ticker)
     scalars = payload["scalars"].copy()
-
     if scalars is not None and not scalars.empty and "Indicator" in scalars.columns:
         scalars["Indicator"] = scalars["Indicator"].map(strip_trailing_parens)
 
@@ -949,61 +804,10 @@ def build_sector_indicator_view(sector_name_exact: str, ticker: str) -> Tuple[pd
         if ser is not None and not ser.empty:
             series[label] = ser
 
-    # =========================
-    # Medical (Healthcare) enhancements
-    # =========================
     if sector_name_exact == "Medical":
-        es = fetch_earnings_surprise_history(ticker, limit=28)
-        if es is not None and not es.empty:
-            ser = es.rename(columns={"earnings_date": "date", "surprise_pct": "value"}).copy()
-            ser["date"] = pd.to_datetime(ser["date"], errors="coerce")
-            ser["value"] = pd.to_numeric(ser["value"], errors="coerce")
-            ser = ser.dropna(subset=["date", "value"]).sort_values("date")
-            series["Earnings Surprise History (%, reported vs est.)"] = ser
-
         epu = fetch_fred_epu_healthcare()
         if epu is not None and not epu.empty:
-            series["U.S. Healthcare Policy Uncertainty Index (FRED)"] = epu
-
-    focus: Dict[str, List[str]] = {
-        "Medical": ["EPS Surprise", "R&D Intensity", "Revenue YoY", "Operating Margin"],
-        "Computer and Technology": ["EPS Surprise", "Revenue YoY", "Gross Margin", "R&D Intensity"],
-        "Finance": ["EPS Surprise", "Return on Equity", "Debt/Equity", "Revenue YoY"],
-        "Utilities": ["Dividend Yield", "Debt/Equity", "Operating Margin", "EPS Surprise"],
-        "Consumer Staples": ["Gross Margin", "Revenue YoY", "Days Inventory", "EPS Surprise"],
-        "Consumer Discretionary": ["Revenue YoY", "Gross Margin", "Days Inventory", "EPS Surprise"],
-        "Retail-Wholesale": ["Days Inventory", "Revenue YoY", "Gross Margin", "EPS Surprise"],
-        "Auto-Tires-Trucks": ["Days Inventory", "Revenue YoY", "Operating Margin", "EPS Surprise"],
-        "Basic Materials": ["Revenue YoY", "Operating Margin", "EPS Surprise", "Debt/Equity"],
-        "Industrial Products": ["Days Sales Outstanding", "Revenue YoY", "Operating Margin", "EPS Surprise"],
-        "Business Services": ["Days Sales Outstanding", "Revenue YoY", "Operating Margin", "EPS Surprise"],
-        "Transportation": ["Revenue YoY", "Operating Margin", "Days Sales Outstanding", "EPS Surprise"],
-        "Construction": ["Revenue YoY", "Operating Margin", "Days Inventory", "EPS Surprise"],
-        "Aerospace": ["Revenue YoY", "Operating Margin", "Days Sales Outstanding", "EPS Surprise"],
-        "Conglomerates": ["Return on Equity", "Revenue YoY", "Operating Margin", "EPS Surprise"],
-    }
-
-    if scalars is not None and not scalars.empty and "Indicator" in scalars.columns:
-        repl = {
-            "Revenue YoY (latest quarter)": "Revenue YoY",
-            "Gross Margin (latest quarter)": "Gross Margin",
-            "Operating Margin (latest quarter)": "Operating Margin",
-            "R&D Intensity (latest quarter)": "R&D Intensity",
-            "Days Inventory (proxy)": "Days Inventory",
-            "Days Sales Outstanding (proxy)": "Days Sales Outstanding",
-            "Free Cash Flow (latest quarter, proxy)": "Free Cash Flow",
-            "EPS Surprise (most recent report)": "EPS Surprise",
-            "Revenue Growth (Yahoo field)": "Revenue Growth",
-            "Earnings Growth (Yahoo field)": "Earnings Growth",
-        }
-        scalars["Indicator"] = scalars["Indicator"].replace(repl).map(strip_trailing_parens)
-
-        want = focus.get(sector_name_exact, [])
-        if want:
-            scalars = scalars[scalars["Indicator"].isin(want)].copy()
-            order = {k: i for i, k in enumerate(want)}
-            scalars["__ord"] = scalars["Indicator"].map(order).fillna(999)
-            scalars = scalars.sort_values("__ord").drop(columns=["__ord"])
+            series["U.S. Healthcare Policy Uncertainty Index"] = epu
 
     return scalars, series
 
@@ -1444,9 +1248,7 @@ if key_cols_present:
         styled_uni,
         use_container_width=True,
         height=320,
-        column_config={
-            "Return": st.column_config.NumberColumn("Return", format="%.2f%%"),
-        },
+        column_config={"Return": st.column_config.NumberColumn("Return", format="%.2f%%")},
     )
 else:
     st.dataframe(uni.iloc[:, :12], use_container_width=True, height=320)
@@ -1460,93 +1262,97 @@ sector_exact = str(row["sector_norm"].iloc[0]) if not row.empty else "Unknown"
 industry = str(row["industry_norm"].iloc[0]) if not row.empty else ""
 st.caption(f"Selected: **{ticker_sel}** | Sector: **{sector_exact}** | Industry: **{industry}**")
 
-# =========================
-# Sector-Specific Indicators (Enhanced for Medical)
-# =========================
-st.subheader("Sector-Specific Indicators")
-
-scalars_df, series_map = build_sector_indicator_view(sector_exact, ticker_sel)
-
-if scalars_df is None or scalars_df.empty:
-    st.info("No sector indicator data available for this ticker/sector (best-effort fields can be missing on Yahoo).")
-else:
-    scalars_df = scalars_df.copy()
-
-    if "Indicator" in scalars_df.columns:
-        scalars_df["Indicator"] = scalars_df["Indicator"].map(strip_trailing_parens)
-
-    if "Source" in scalars_df.columns:
-        scalars_df = scalars_df.drop(columns=["Source"])
-
-    if "Value" in scalars_df.columns:
-        scalars_df["Value"] = pd.to_numeric(scalars_df["Value"], errors="coerce")
-
-    scalars_df = scalars_df.dropna(axis=1, how="all")
-
-    st.dataframe(
-        scalars_df,
-        use_container_width=True,
-        height=280,
-        column_config={"Value": st.column_config.NumberColumn(format="%.4f")} if "Value" in scalars_df.columns else None,
-    )
-
-if series_map:
-    st.markdown("#### Sector Drivers")
-    cols = st.columns(2)
-    i = 0
-    for name, ser in series_map.items():
-        with cols[i % 2]:
-            st.write(f"**{name}**")
-            fig = px.line(ser.tail(3000), x="date", y="value")
-            fig.update_layout(height=280, margin=dict(l=10, r=10, t=20, b=10))
-            st.plotly_chart(fig, use_container_width=True)
-        i += 1
-
-# =========================
-# Medical (Healthcare) — extra catalyst panels
-# =========================
 info = fetch_info_one(normalize_yf_ticker(ticker_sel))
-with st.spinner("Loading medical catalysts…") if sector_exact == "Medical" else st.empty():
-    pass
+co_name = (info or {}).get("shortName", "") or (info or {}).get("longName", "")
 
-if sector_exact == "Medical":
-    with st.expander("Medical (Healthcare) — Earnings, Policy, FDA & M&A Catalysts", expanded=True):
+# =========================
+# Indicators (Sector vs Stock)
+# =========================
+st.subheader("Indicators")
 
-        st.markdown("##### Earnings Estimate Revisions (best-effort snapshot)")
-        est = fetch_earnings_estimate_snapshot_yf(ticker_sel)
-        if est is None or est.empty:
-            st.info("No earnings trend/estimate snapshot available from yfinance for this ticker.")
-        else:
-            st.dataframe(est, use_container_width=True, height=220)
+scalars_df, series_map = build_indicator_series(sector_exact, ticker_sel)
+scalars_df = scalars_df if isinstance(scalars_df, pd.DataFrame) else pd.DataFrame()
 
-        st.markdown("##### Earnings surprise history")
-        es = fetch_earnings_surprise_history(ticker_sel, limit=28)
-        if es is None or es.empty:
-            st.info("No earnings surprise history available from yfinance for this ticker.")
-        else:
-            es2 = es.rename(columns={"earnings_date": "date", "surprise_pct": "value"}).copy()
-            es2["date"] = pd.to_datetime(es2["date"], errors="coerce")
-            es2["value"] = pd.to_numeric(es2["value"], errors="coerce")
-            es2 = es2.dropna(subset=["date", "value"]).sort_values("date")
-            fig = px.line(es2, x="date", y="value", title="Earnings Surprise (%)")
-            fig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10))
-            st.plotly_chart(fig, use_container_width=True)
+tab_sector, tab_stock = st.tabs(["Sector Indicators", "Stock Indicators"])
 
-        st.markdown("##### U.S. Healthcare Policy Uncertainty Index (FRED)")
-        epu = fetch_fred_epu_healthcare()
-        if epu is None or epu.empty:
-            st.info("Failed to fetch FRED EPUHEALTHCARE series (network / endpoint).")
-        else:
-            fig = px.line(epu.tail(240), x="date", y="value", title="EPUHEALTHCARE (monthly)")
-            fig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10))
-            st.plotly_chart(fig, use_container_width=True)
+with tab_sector:
+    if not series_map:
+        st.info("No sector indicator series available for this sector.")
+    else:
+        cols = st.columns(2)
+        i = 0
+        for name, ser in series_map.items():
+            with cols[i % 2]:
+                st.write(f"**{name}**")
+                fig = px.line(ser.tail(3000), x="date", y="value")
+                fig.update_layout(height=280, margin=dict(l=10, r=10, t=20, b=10))
+                st.plotly_chart(fig, use_container_width=True)
+            i += 1
 
-        st.markdown("##### Policy + FDA approvals news")
+with tab_stock:
+    # --- quick KPI line (no table)
+    def _scalar_value(indicator: str) -> float:
+        if scalars_df.empty or "Indicator" not in scalars_df.columns:
+            return np.nan
+        hit = scalars_df[scalars_df["Indicator"].astype(str).str.lower().eq(indicator.lower())]
+        if hit.empty:
+            return np.nan
+        return pd.to_numeric(hit["Value"].iloc[0], errors="coerce")
+
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    with kpi1:
+        st.metric("Revenue YoY", f"{_scalar_value('Revenue YoY'):.2f}%" if np.isfinite(_scalar_value("Revenue YoY")) else "N/A")
+    with kpi2:
+        st.metric("Operating Margin", f"{_scalar_value('Operating Margin'):.2f}%" if np.isfinite(_scalar_value("Operating Margin")) else "N/A")
+    with kpi3:
+        st.metric("Total Cost Ratio", f"{_scalar_value('Total Cost Ratio'):.2f}%" if np.isfinite(_scalar_value("Total Cost Ratio")) else "N/A")
+    with kpi4:
+        st.metric("EPS Surprise", f"{_scalar_value('EPS Surprise'):.2f}%" if np.isfinite(_scalar_value("EPS Surprise")) else "N/A")
+
+    st.markdown("#### Earnings Estimate Revisions")
+    est = fetch_earnings_estimate_snapshot_yf(ticker_sel)
+    if est is None or est.empty:
+        st.info("No earnings estimate revisions table available from Yahoo/yfinance for this ticker.")
+    else:
+        st.dataframe(est, use_container_width=True, height=220)
+
+    st.markdown("#### Earnings Surprise History")
+    es = fetch_earnings_surprise_history(ticker_sel, limit=28)
+    if es is None or es.empty:
+        st.info("No earnings surprise history available from Yahoo/yfinance for this ticker.")
+    else:
+        es2 = es.rename(columns={"earnings_date": "date", "surprise_pct": "value"}).copy()
+        es2["date"] = pd.to_datetime(es2["date"], errors="coerce")
+        es2["value"] = pd.to_numeric(es2["value"], errors="coerce")
+        es2 = es2.dropna(subset=["date", "value"]).sort_values("date")
+        fig = px.line(es2, x="date", y="value", title="Earnings Surprise (%)")
+        fig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+    if sector_exact == "Medical":
+        st.markdown("#### Admissions Growth / Medical Cost Ratios")
+
+        # Admissions growth is rarely available from free sources via yfinance.
+        # Use Revenue YoY as a proxy for admissions/volume growth for providers,
+        # and show Total Cost Ratio as a proxy for medical cost ratio.
+        adm_proxy = _scalar_value("Revenue YoY")
+        cost_ratio = _scalar_value("Total Cost Ratio")
+
+        cA, cB = st.columns(2)
+        with cA:
+            st.write("**Admissions Growth (proxy)**")
+            st.caption("Proxy uses Revenue YoY from quarterly financials (volume/admissions data is typically not provided via Yahoo).")
+            st.metric("Proxy (Revenue YoY)", f"{adm_proxy:.2f}%" if np.isfinite(adm_proxy) else "N/A")
+        with cB:
+            st.write("**Medical Cost Ratio (proxy)**")
+            st.caption("Proxy uses Total Cost Ratio = 100% − Operating Margin (latest quarter).")
+            st.metric("Total Cost Ratio", f"{cost_ratio:.2f}%" if np.isfinite(cost_ratio) else "N/A")
+
+        st.markdown("#### Policy + FDA Approvals News")
         news_window_label = st.selectbox("Medical catalysts news window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="med_news_window")
         days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
         news_days = days_map.get(news_window_label, 7)
 
-        co_name = (info or {}).get("shortName", "") or (info or {}).get("longName", "")
         q_policy_fda = (
             f'({ticker_sel} OR "{co_name}") '
             f'(FDA approval OR PDUFA OR "complete response letter" OR CRL OR "FDA decision" '
@@ -1565,7 +1371,7 @@ if sector_exact == "Medical":
                 src = str(n.get("source", ""))
                 st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
 
-        st.markdown("##### M&A news")
+        st.markdown("#### M&A News")
         q_ma = (
             f'({ticker_sel} OR "{co_name}") '
             f'(acquisition OR acquire OR merger OR "merger agreement" OR "strategic review" '
@@ -1584,26 +1390,12 @@ if sector_exact == "Medical":
                 src = str(n.get("source", ""))
                 st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
 
-        st.markdown("##### FDA decision calendar (best-effort)")
-        fda_cal = fetch_fda_calendar_best_effort(ticker_sel, company_name=co_name)
+        st.markdown("#### FDA Decision Calendar")
+        fda_cal = fetch_fda_calendar(ticker_sel, company_name=co_name)
         if fda_cal is None or fda_cal.empty:
-            st.info("No FDA calendar rows found (or source blocked/changed). This is best-effort scraping.")
+            st.info("No FDA calendar rows found (source may be blocked or changed).")
         else:
             st.dataframe(fda_cal, use_container_width=True, height=240)
-
-        st.markdown("##### Patient volume growth (best-effort)")
-        st.caption(
-            "Yahoo/yfinance usually does not provide patient counts/volumes. "
-            "Proxy shown below uses Revenue YoY from quarterly financials. "
-            "If you have KPI data (visits/prescriptions/admissions), upload/maintain a KPI CSV and plot it here."
-        )
-        if scalars_df is not None and not scalars_df.empty and "Indicator" in scalars_df.columns:
-            proxy = scalars_df[scalars_df["Indicator"].astype(str).str.lower().eq("revenue yoy")]
-            if proxy is not None and not proxy.empty:
-                st.write("Proxy (Revenue YoY):")
-                st.dataframe(proxy, use_container_width=True, height=120)
-            else:
-                st.write("Proxy (Revenue YoY): unavailable for this ticker from Yahoo fields.")
 
 # =========================
 # Technical Analysis
@@ -1917,6 +1709,6 @@ else:
         if not links:
             st.write("No obvious IR/news links found on that page (site may be JS-rendered).")
         else:
-            st.markdown("**IR / Press / News links (best-effort extraction):**")
+            st.markdown("**IR / Press / News links:**")
             for txt, href in links:
                 st.markdown(f"- [{txt}]({href})")
