@@ -434,55 +434,96 @@ def fetch_fda_calendar(ticker: str, company_name: str = "") -> pd.DataFrame:
     if t:
         targets.append(t)
     if company_name:
-        targets.append(company_name.strip())
+        targets.append(company_name.strip().upper())
 
-    urls = [
-        "https://www.rttnews.com/corpinfo/fdacalendar.aspx",
-        "https://www.fdatracker.com/fda-calendar/",
-        "https://www.tipranks.com/calendars/fda",
-    ]
+    # RTTNews is the only one in your list that is reliably “static” enough to parse;
+    # but it is NOT an HTML table, so we parse by text lines.
+    url = "https://www.rttnews.com/corpinfo/fdacalendar.aspx"
+    html = fetch_html(url, timeout=18)
+    if not html:
+        return pd.DataFrame()
 
-    for url in urls:
-        html = fetch_html(url, timeout=18)
-        if not html:
-            continue
-        try:
-            soup = BeautifulSoup(html, "lxml")
-            tables = soup.find_all("table")
-            if not tables:
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        lines = [x.strip() for x in soup.get_text("\n", strip=True).split("\n")]
+        lines = [x for x in lines if x]
+
+        # Start after the header row
+        start_idx = None
+        for i, s in enumerate(lines):
+            if s.strip().upper() == "COMPANY NAME":
+                start_idx = i + 1
+                break
+        if start_idx is None:
+            return pd.DataFrame()
+
+        # Parse repeating blocks:
+        # Company
+        # (TICKER)
+        # Drug
+        # MM/DD/YYYY
+        # Event
+        # Outcome/Details (can be 1-2 lines)
+        rows = []
+        i = start_idx
+        while i < len(lines) - 4:
+            s = lines[i]
+
+            # Stop when we hit footer / paywall / pagination area
+            upper = s.upper()
+            if any(k in upper for k in ["GET FULL ACCESS", "BUY THIS CONTENT", "« PREVIOUS", "NEXT »"]):
+                break
+
+            company = s
+            tickers_line = lines[i + 1] if i + 1 < len(lines) else ""
+            drug = lines[i + 2] if i + 2 < len(lines) else ""
+            date_s = lines[i + 3] if i + 3 < len(lines) else ""
+            event = lines[i + 4] if i + 4 < len(lines) else ""
+
+            # Validate date
+            dtv = pd.to_datetime(date_s, errors="coerce")
+            if pd.isna(dtv):
+                i += 1
                 continue
 
-            rows_out = []
-            for tb in tables[:3]:
-                for tr in tb.find_all("tr"):
-                    tds = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
-                    if len(tds) < 3:
-                        continue
-                    row_txt = " ".join(tds).upper()
-                    if targets and not any(x.upper() in row_txt for x in targets if x):
-                        continue
-                    rows_out.append(tds)
+            # Extract tickers from "(XXX)" or "( XXX, YYY )"
+            tickers = re.findall(r"\b[A-Z]{1,5}\b", tickers_line.upper())
+            main_ticker = tickers[0] if tickers else ""
 
-            if not rows_out:
+            # Grab up to 2 more lines as outcome/details if they don't look like a new company block
+            outcome = lines[i + 5] if i + 5 < len(lines) else ""
+            details = lines[i + 6] if i + 6 < len(lines) else ""
+
+            # Filter by targets (ticker OR company substring)
+            blob = " ".join([company, tickers_line, drug, event, outcome, details]).upper()
+            if targets and not any(tg in blob for tg in targets if tg):
+                i += 1
                 continue
 
-            max_len = max(len(r) for r in rows_out)
-            cols = [f"col{i+1}" for i in range(max_len)]
-            df = pd.DataFrame([r + [""] * (max_len - len(r)) for r in rows_out], columns=cols)
+            rows.append({
+                "date": pd.Timestamp(dtv).date().isoformat(),
+                "company": company,
+                "ticker": main_ticker,
+                "drug": drug,
+                "event": event,
+                "outcome_or_status": outcome,
+                "details": details,
+                "source_url": url,
+            })
 
-            for c in cols[:3]:
-                dtv = pd.to_datetime(df[c], errors="coerce")
-                if dtv.notna().mean() > 0.3:
-                    df = df.rename(columns={c: "date"})
-                    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-                    break
+            # Advance: typical block is ~6-7 lines
+            i += 7
 
-            df.insert(0, "source_url", url)
-            return df.head(60)
-        except Exception:
-            continue
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return df
 
-    return pd.DataFrame()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date")
+        return df.reset_index(drop=True).head(60)
+
+    except Exception:
+        return pd.DataFrame()
 
 # =========================
 # ANALYST RATINGS (yfinance)
@@ -1391,11 +1432,29 @@ with tab_stock:
                 st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
 
         st.markdown("#### FDA Decision Calendar")
+        
         fda_cal = fetch_fda_calendar(ticker_sel, company_name=co_name)
-        if fda_cal is None or fda_cal.empty:
-            st.info("No FDA calendar rows found (source may be blocked or changed).")
-        else:
+        
+        if fda_cal is not None and not fda_cal.empty:
             st.dataframe(fda_cal, use_container_width=True, height=240)
+        else:
+            st.info("FDA calendar not available (source layout/protection). Showing RSS-based FDA catalyst headlines instead.")
+        
+            q_fda = (
+                f'({ticker_sel} OR "{co_name}") '
+                f'(PDUFA OR "FDA decision" OR "FDA approval" OR "complete response letter" OR CRL OR "advisory committee")'
+            )
+            fda_news = fetch_google_news_rss_query(q_fda, days=news_days)
+            if fda_news is None or fda_news.empty:
+                st.write("No recent FDA-catalyst headlines found in RSS.")
+            else:
+                for _, n in fda_news.head(15).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    title = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
 
 # =========================
 # Technical Analysis
