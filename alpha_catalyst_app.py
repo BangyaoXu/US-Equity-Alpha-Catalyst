@@ -1268,7 +1268,7 @@ co_name = (info or {}).get("shortName", "") or (info or {}).get("longName", "")
 # =========================
 # Indicators (Sector vs Stock)
 # =========================
-st.subheader("Indicators")
+st.subheader("Fundamental Indicators")
 
 scalars_df, series_map = build_indicator_series(sector_exact, ticker_sel)
 scalars_df = scalars_df if isinstance(scalars_df, pd.DataFrame) else pd.DataFrame()
@@ -1493,7 +1493,7 @@ sig_df = pd.DataFrame([
     {"Indicator": "CCI(20)", "Score": score_cci(cci20)},
 ])
 composite = float(sig_df["Score"].mean()) if not sig_df.empty else 0.0
-st.markdown(f"#### Indicator Signals (Composite Score: **{composite:+.2f}**)")
+st.markdown(f"#### Technical Analysis Composite Score: **{composite:+.2f}**")
 
 st.dataframe(sig_df, use_container_width=True, height=260, column_config={"Score": st.column_config.NumberColumn(format="%.2f")})
 fig_sig = px.bar(sig_df, x="Indicator", y="Score", title="Technical Indicator Scores")
