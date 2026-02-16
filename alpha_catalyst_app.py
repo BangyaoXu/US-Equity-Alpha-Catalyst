@@ -882,7 +882,7 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
     )
 
     sector_etf_map = {
-        "Medical (Healthcare)": "XLV",
+        "Medical": "XLV",
         "Computer and Technology": "XLK",
         "Finance": "XLF",
         "Utilities": "XLU",
@@ -952,7 +952,7 @@ def build_sector_indicator_view(sector_name_exact: str, ticker: str) -> Tuple[pd
     # =========================
     # Medical (Healthcare) enhancements
     # =========================
-    if sector_name_exact == "Medical (Healthcare)":
+    if sector_name_exact == "Medical":
         es = fetch_earnings_surprise_history(ticker, limit=28)
         if es is not None and not es.empty:
             ser = es.rename(columns={"earnings_date": "date", "surprise_pct": "value"}).copy()
@@ -966,7 +966,7 @@ def build_sector_indicator_view(sector_name_exact: str, ticker: str) -> Tuple[pd
             series["U.S. Healthcare Policy Uncertainty Index (FRED)"] = epu
 
     focus: Dict[str, List[str]] = {
-        "Medical (Healthcare)": ["EPS Surprise", "R&D Intensity", "Revenue YoY", "Operating Margin"],
+        "Medical": ["EPS Surprise", "R&D Intensity", "Revenue YoY", "Operating Margin"],
         "Computer and Technology": ["EPS Surprise", "Revenue YoY", "Gross Margin", "R&D Intensity"],
         "Finance": ["EPS Surprise", "Return on Equity", "Debt/Equity", "Revenue YoY"],
         "Utilities": ["Dividend Yield", "Debt/Equity", "Operating Margin", "EPS Surprise"],
@@ -1506,10 +1506,10 @@ if series_map:
 # Medical (Healthcare) — extra catalyst panels
 # =========================
 info = fetch_info_one(normalize_yf_ticker(ticker_sel))
-with st.spinner("Loading medical catalysts…") if sector_exact == "Medical (Healthcare)" else st.empty():
+with st.spinner("Loading medical catalysts…") if sector_exact == "Medical" else st.empty():
     pass
 
-if sector_exact == "Medical (Healthcare)":
+if sector_exact == "Medical":
     with st.expander("Medical (Healthcare) — Earnings, Policy, FDA & M&A Catalysts", expanded=True):
 
         st.markdown("##### Earnings Estimate Revisions (best-effort snapshot)")
