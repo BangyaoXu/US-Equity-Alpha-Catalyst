@@ -717,14 +717,32 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
         fcf_latest = np.nan
     add_scalar("Free Cash Flow", fcf_latest, "USD", "Quarterly")
 
-    earn = fetch_earnings_dates_yf(sym, limit=8)
+    earn = fetch_earnings_dates_yf(sym, limit=24)
+    
     eps_surp = np.nan
     if earn is not None and not earn.empty:
+        s_col = None
         for col in ["Surprise(%)", "Surprise (%)", "Surprise %", "Surprise"]:
             if col in earn.columns:
-                eps_surp = _to_num(earn[col].iloc[0])
+                s_col = col
                 break
-    add_scalar("EPS Surprise", eps_surp, "%", "Quarterly (earnings)")
+    
+        if s_col is not None:
+            tmp = earn.copy()
+            tmp["earnings_date"] = pd.to_datetime(tmp["earnings_date"], errors="coerce", utc=True)
+            tmp["surprise_pct"] = pd.to_numeric(tmp[s_col], errors="coerce")
+            tmp = tmp.dropna(subset=["earnings_date", "surprise_pct"]).sort_values("earnings_date", ascending=False)
+            if not tmp.empty:
+                eps_surp = float(tmp["surprise_pct"].iloc[0])
+    
+    add_scalar(
+        "EPS Surprise (most recent report)",
+        eps_surp,
+        "%",
+        "Yahoo Finance via yfinance (get_earnings_dates)",
+        "Most recent available EPS surprise percentage (reported vs estimate).",
+        "Quarterly (on earnings)",
+    )
 
     add_scalar("Forward P/E", _to_num(info.get("forwardPE")), "x", "Daily")
     rg = _to_num(info.get("revenueGrowth"))
