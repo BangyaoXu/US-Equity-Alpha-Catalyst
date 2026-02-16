@@ -164,7 +164,12 @@ def normalize_universe_keep_original(df: pd.DataFrame) -> Tuple[pd.DataFrame, Li
         if c and c not in present:
             present.append(c)
 
-    canonical = {"company": company_col or "", "ticker": ticker_col, "sector": sector_col or "", "industry": industry_col or ""}
+    canonical = {
+        "company": company_col or "",
+        "ticker": ticker_col,
+        "sector": sector_col or "",
+        "industry": industry_col or "",
+    }
     return df, present, canonical
 
 def normalize_yf_ticker(t: str) -> str:
@@ -286,9 +291,18 @@ def fetch_info_one(ticker: str) -> Dict:
     except Exception:
         return {}
 
+# =========================
+# News RSS (generalized query)
+# =========================
 @st.cache_data(ttl=CACHE_TTL_NEWS)
-def fetch_google_news_rss(ticker: str, days: int) -> pd.DataFrame:
-    q = f"{ticker} stock"
+def fetch_google_news_rss_query(query: str, days: int) -> pd.DataFrame:
+    """
+    Google News RSS for arbitrary query (used for policy/FDA/M&A).
+    """
+    q = (query or "").strip()
+    if not q:
+        return pd.DataFrame()
+
     url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl=en-US&gl=US&ceid=US:en"
     try:
         feed = feedparser.parse(url)
@@ -316,6 +330,37 @@ def fetch_google_news_rss(ticker: str, days: int) -> pd.DataFrame:
         df = pd.DataFrame(rows)
         if not df.empty:
             df = df.dropna(subset=["title"]).sort_values("time", ascending=False)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+# Backward-compatible wrapper (keeps your existing call sites working)
+@st.cache_data(ttl=CACHE_TTL_NEWS)
+def fetch_google_news_rss(ticker: str, days: int) -> pd.DataFrame:
+    return fetch_google_news_rss_query(f"{ticker} stock", days)
+
+# =========================
+# FRED: US Healthcare Policy Uncertainty Index (EPUHEALTHCARE)
+# Free CSV endpoint (no API key)
+# =========================
+@st.cache_data(ttl=24 * 60 * 60)
+def fetch_fred_epu_healthcare() -> pd.DataFrame:
+    """
+    Returns columns: date, value (monthly)
+    Source: FRED series EPUHEALTHCARE
+    """
+    url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=EPUHEALTHCARE"
+    txt = _get_text(url, timeout=25, retries=3)
+    if not txt:
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(StringIO(txt))
+        if df.shape[1] < 2:
+            return pd.DataFrame()
+        df.columns = ["date", "value"]
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        df = df.dropna(subset=["date", "value"]).sort_values("date")
         return df
     except Exception:
         return pd.DataFrame()
@@ -363,6 +408,114 @@ def nearest_earnings_catalyst(earn_df: pd.DataFrame) -> Optional[pd.Timestamp]:
     if future.size > 0:
         return pd.Timestamp(future.min())
     return pd.Timestamp(arr.max())
+
+# =========================
+# Earnings Surprise history (from yfinance get_earnings_dates)
+# =========================
+@st.cache_data(ttl=CACHE_TTL_EARNINGS)
+def fetch_earnings_surprise_history(ticker: str, limit: int = 24) -> pd.DataFrame:
+    df = fetch_earnings_dates_yf(ticker, limit=limit)
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    s_col = None
+    for c in ["Surprise(%)", "Surprise (%)", "Surprise %", "Surprise"]:
+        if c in df.columns:
+            s_col = c
+            break
+    if s_col is None:
+        return pd.DataFrame()
+
+    out = df.copy()
+    out["earnings_date"] = pd.to_datetime(out["earnings_date"], errors="coerce", utc=True)
+    out["surprise_pct"] = pd.to_numeric(out[s_col], errors="coerce")
+    out = out.dropna(subset=["earnings_date", "surprise_pct"]).sort_values("earnings_date")
+    return out[["earnings_date", "surprise_pct"]]
+
+# =========================
+# Earnings estimates snapshot (Yahoo "trend" object via yfinance; not true revision history)
+# =========================
+@st.cache_data(ttl=CACHE_TTL_ANALYST)
+def fetch_earnings_estimate_snapshot_yf(ticker: str) -> pd.DataFrame:
+    """
+    Best-effort snapshot (not a historical revision series).
+    """
+    sym = normalize_yf_ticker(ticker)
+    try:
+        t = yf.Ticker(sym)
+        et = getattr(t, "earnings_trend", None)
+        if et is None:
+            return pd.DataFrame()
+        if isinstance(et, pd.DataFrame) and not et.empty:
+            df = et.copy().reset_index(drop=False)
+            return df.head(12)
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+# =========================
+# FDA decision calendar (best-effort scraping; may break if site blocks bots/changes HTML)
+# =========================
+@st.cache_data(ttl=6 * 60 * 60)
+def fetch_fda_calendar_best_effort(ticker: str, company_name: str = "") -> pd.DataFrame:
+    """
+    Attempts to scrape an FDA calendar page and filter rows that mention the ticker/company.
+    If blocked or HTML changes => returns empty df.
+    """
+    targets = []
+    t = (ticker or "").upper().strip()
+    if t:
+        targets.append(t)
+    if company_name:
+        targets.append(company_name.strip())
+
+    urls = [
+        "https://www.rttnews.com/corpinfo/fdacalendar.aspx",
+        "https://www.fdatracker.com/fda-calendar/",
+        "https://www.tipranks.com/calendars/fda",
+    ]
+
+    for url in urls:
+        html = fetch_html(url, timeout=18)
+        if not html:
+            continue
+        try:
+            soup = BeautifulSoup(html, "lxml")
+            tables = soup.find_all("table")
+            if not tables:
+                continue
+
+            rows_out = []
+            for tb in tables[:3]:
+                for tr in tb.find_all("tr"):
+                    tds = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
+                    if len(tds) < 3:
+                        continue
+                    row_txt = " ".join(tds).upper()
+                    if targets and not any(x.upper() in row_txt for x in targets if x):
+                        continue
+                    rows_out.append(tds)
+
+            if not rows_out:
+                continue
+
+            max_len = max(len(r) for r in rows_out)
+            cols = [f"col{i+1}" for i in range(max_len)]
+            df = pd.DataFrame([r + [""] * (max_len - len(r)) for r in rows_out], columns=cols)
+
+            for c in cols[:3]:
+                dt = pd.to_datetime(df[c], errors="coerce")
+                if dt.notna().mean() > 0.3:
+                    df = df.rename(columns={c: "date"})
+                    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                    break
+
+            df.insert(0, "source_url", url)
+            return df.head(60)
+        except Exception:
+            continue
+
+    return pd.DataFrame()
 
 # =========================
 # ANALYST RATINGS (yfinance)
@@ -728,7 +881,6 @@ def fetch_sector_indicator_panel(ticker: str) -> Dict[str, object]:
         "Daily",
     )
 
-    # Benchmarks/Drivers (sector-ish, not SPX/VIX)
     sector_etf_map = {
         "Medical (Healthcare)": "XLV",
         "Computer and Technology": "XLK",
@@ -765,7 +917,6 @@ def build_sector_indicator_view(sector_name_exact: str, ticker: str) -> Tuple[pd
     payload = fetch_sector_indicator_panel(ticker)
     scalars = payload["scalars"].copy()
 
-    # ---- strip trailing parentheses from indicator names
     if scalars is not None and not scalars.empty and "Indicator" in scalars.columns:
         scalars["Indicator"] = scalars["Indicator"].map(strip_trailing_parens)
 
@@ -798,7 +949,22 @@ def build_sector_indicator_view(sector_name_exact: str, ticker: str) -> Tuple[pd
         if ser is not None and not ser.empty:
             series[label] = ser
 
-    # ---- sector focus list (strip parens already, so list uses cleaned names)
+    # =========================
+    # Medical (Healthcare) enhancements
+    # =========================
+    if sector_name_exact == "Medical (Healthcare)":
+        es = fetch_earnings_surprise_history(ticker, limit=28)
+        if es is not None and not es.empty:
+            ser = es.rename(columns={"earnings_date": "date", "surprise_pct": "value"}).copy()
+            ser["date"] = pd.to_datetime(ser["date"], errors="coerce")
+            ser["value"] = pd.to_numeric(ser["value"], errors="coerce")
+            ser = ser.dropna(subset=["date", "value"]).sort_values("date")
+            series["Earnings Surprise History (%, reported vs est.)"] = ser
+
+        epu = fetch_fred_epu_healthcare()
+        if epu is not None and not epu.empty:
+            series["U.S. Healthcare Policy Uncertainty Index (FRED)"] = epu
+
     focus: Dict[str, List[str]] = {
         "Medical (Healthcare)": ["EPS Surprise", "R&D Intensity", "Revenue YoY", "Operating Margin"],
         "Computer and Technology": ["EPS Surprise", "Revenue YoY", "Gross Margin", "R&D Intensity"],
@@ -817,9 +983,7 @@ def build_sector_indicator_view(sector_name_exact: str, ticker: str) -> Tuple[pd
         "Conglomerates": ["Return on Equity", "Revenue YoY", "Operating Margin", "EPS Surprise"],
     }
 
-    # ---- shorten Indicator labels to remove any trailing details
     if scalars is not None and not scalars.empty and "Indicator" in scalars.columns:
-        # normalize a few patterns BEFORE stripping parentheses
         repl = {
             "Revenue YoY (latest quarter)": "Revenue YoY",
             "Gross Margin (latest quarter)": "Gross Margin",
@@ -1275,7 +1439,7 @@ if key_cols_present:
 
     show_uni = show_uni.rename(columns={"__Return": "Return"})
     styled_uni = show_uni.style.map(color_return, subset=["Return"])
-    
+
     st.dataframe(
         styled_uni,
         use_container_width=True,
@@ -1297,13 +1461,7 @@ industry = str(row["industry_norm"].iloc[0]) if not row.empty else ""
 st.caption(f"Selected: **{ticker_sel}** | Sector: **{sector_exact}** | Industry: **{industry}**")
 
 # =========================
-# Sector-Specific Indicators (REWRITTEN)
-# Requirements:
-# 1) remove "What you are seeing"
-# 2) indicator table: remove trailing (...) in names
-# 3) remove source column
-# 4) filter out None value columns
-# 5) rename "Sector Drivers (best-effort)" -> "Sector Drivers"
+# Sector-Specific Indicators (Enhanced for Medical)
 # =========================
 st.subheader("Sector-Specific Indicators")
 
@@ -1314,19 +1472,15 @@ if scalars_df is None or scalars_df.empty:
 else:
     scalars_df = scalars_df.copy()
 
-    # 2) already stripped in builder; do again defensively
     if "Indicator" in scalars_df.columns:
         scalars_df["Indicator"] = scalars_df["Indicator"].map(strip_trailing_parens)
 
-    # 3) remove Source column
     if "Source" in scalars_df.columns:
         scalars_df = scalars_df.drop(columns=["Source"])
 
-    # make Value numeric (best-effort)
     if "Value" in scalars_df.columns:
         scalars_df["Value"] = pd.to_numeric(scalars_df["Value"], errors="coerce")
 
-    # 4) drop columns that are entirely null
     scalars_df = scalars_df.dropna(axis=1, how="all")
 
     st.dataframe(
@@ -1337,7 +1491,6 @@ else:
     )
 
 if series_map:
-    # 5) rename header
     st.markdown("#### Sector Drivers")
     cols = st.columns(2)
     i = 0
@@ -1350,6 +1503,109 @@ if series_map:
         i += 1
 
 # =========================
+# Medical (Healthcare) — extra catalyst panels
+# =========================
+info = fetch_info_one(normalize_yf_ticker(ticker_sel))
+with st.spinner("Loading medical catalysts…") if sector_exact == "Medical (Healthcare)" else st.empty():
+    pass
+
+if sector_exact == "Medical (Healthcare)":
+    with st.expander("Medical (Healthcare) — Earnings, Policy, FDA & M&A Catalysts", expanded=True):
+
+        st.markdown("##### Earnings Estimate Revisions (best-effort snapshot)")
+        est = fetch_earnings_estimate_snapshot_yf(ticker_sel)
+        if est is None or est.empty:
+            st.info("No earnings trend/estimate snapshot available from yfinance for this ticker.")
+        else:
+            st.dataframe(est, use_container_width=True, height=220)
+
+        st.markdown("##### Earnings surprise history")
+        es = fetch_earnings_surprise_history(ticker_sel, limit=28)
+        if es is None or es.empty:
+            st.info("No earnings surprise history available from yfinance for this ticker.")
+        else:
+            es2 = es.rename(columns={"earnings_date": "date", "surprise_pct": "value"}).copy()
+            es2["date"] = pd.to_datetime(es2["date"], errors="coerce")
+            es2["value"] = pd.to_numeric(es2["value"], errors="coerce")
+            es2 = es2.dropna(subset=["date", "value"]).sort_values("date")
+            fig = px.line(es2, x="date", y="value", title="Earnings Surprise (%)")
+            fig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("##### U.S. Healthcare Policy Uncertainty Index (FRED)")
+        epu = fetch_fred_epu_healthcare()
+        if epu is None or epu.empty:
+            st.info("Failed to fetch FRED EPUHEALTHCARE series (network / endpoint).")
+        else:
+            fig = px.line(epu.tail(240), x="date", y="value", title="EPUHEALTHCARE (monthly)")
+            fig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("##### Policy + FDA approvals news")
+        news_window_label = st.selectbox("Medical catalysts news window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="med_news_window")
+        days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
+        news_days = days_map.get(news_window_label, 7)
+
+        co_name = (info or {}).get("shortName", "") or (info or {}).get("longName", "")
+        q_policy_fda = (
+            f'({ticker_sel} OR "{co_name}") '
+            f'(FDA approval OR PDUFA OR "complete response letter" OR CRL OR "FDA decision" '
+            f'OR "advisory committee" OR CMS OR Medicare OR Medicaid OR "healthcare policy")'
+        )
+        n1 = fetch_google_news_rss_query(q_policy_fda, days=news_days)
+        if n1 is None or n1.empty:
+            st.write("No recent policy/FDA-related RSS news found.")
+        else:
+            n1 = n1.head(20).copy()
+            for _, n in n1.iterrows():
+                t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                title = str(n.get("title", ""))
+                link = str(n.get("link", ""))
+                src = str(n.get("source", ""))
+                st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
+
+        st.markdown("##### M&A news")
+        q_ma = (
+            f'({ticker_sel} OR "{co_name}") '
+            f'(acquisition OR acquire OR merger OR "merger agreement" OR "strategic review" '
+            f'OR takeover OR "go-private")'
+        )
+        n2 = fetch_google_news_rss_query(q_ma, days=news_days)
+        if n2 is None or n2.empty:
+            st.write("No recent M&A RSS news found.")
+        else:
+            n2 = n2.head(15).copy()
+            for _, n in n2.iterrows():
+                t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                title = str(n.get("title", ""))
+                link = str(n.get("link", ""))
+                src = str(n.get("source", ""))
+                st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
+
+        st.markdown("##### FDA decision calendar (best-effort)")
+        fda_cal = fetch_fda_calendar_best_effort(ticker_sel, company_name=co_name)
+        if fda_cal is None or fda_cal.empty:
+            st.info("No FDA calendar rows found (or source blocked/changed). This is best-effort scraping.")
+        else:
+            st.dataframe(fda_cal, use_container_width=True, height=240)
+
+        st.markdown("##### Patient volume growth (best-effort)")
+        st.caption(
+            "Yahoo/yfinance usually does not provide patient counts/volumes. "
+            "Proxy shown below uses Revenue YoY from quarterly financials. "
+            "If you have KPI data (visits/prescriptions/admissions), upload/maintain a KPI CSV and plot it here."
+        )
+        if scalars_df is not None and not scalars_df.empty and "Indicator" in scalars_df.columns:
+            proxy = scalars_df[scalars_df["Indicator"].astype(str).str.lower().eq("revenue yoy")]
+            if proxy is not None and not proxy.empty:
+                st.write("Proxy (Revenue YoY):")
+                st.dataframe(proxy, use_container_width=True, height=120)
+            else:
+                st.write("Proxy (Revenue YoY): unavailable for this ticker from Yahoo fields.")
+
+# =========================
 # Technical Analysis
 # =========================
 st.subheader("Technical Analysis")
@@ -1357,7 +1613,6 @@ st.subheader("Technical Analysis")
 with st.spinner("Fetching price history…"):
     px_panel = fetch_prices_panel([normalize_yf_ticker(ticker_sel)], period=DEFAULT_PRICE_PERIOD, interval=DEFAULT_PRICE_INTERVAL)
 
-info = fetch_info_one(normalize_yf_ticker(ticker_sel))
 df_t = get_ohlc_from_panel(px_panel, normalize_yf_ticker(ticker_sel))
 
 if df_t.empty or "Close" not in df_t.columns:
@@ -1420,8 +1675,10 @@ fig_macd.update_layout(
     title="MACD(12,26,9)",
     height=320,
     margin=dict(l=10, r=10, t=60, b=40),
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0, font=dict(size=10),
-                bgcolor="rgba(255,255,255,0.0)"),
+    legend=dict(
+        orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0, font=dict(size=10),
+        bgcolor="rgba(255,255,255,0.0)"
+    ),
 )
 st.plotly_chart(fig_macd, use_container_width=True)
 
@@ -1481,7 +1738,7 @@ st.plotly_chart(fig_sig, use_container_width=True)
 # =========================
 st.subheader("News Sentiment")
 
-news_window_label = st.selectbox("News window", ["1w", "2w", "1m", "2m", "3m"], index=0)
+news_window_label = st.selectbox("News window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="news_window_main")
 days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
 news_days = days_map.get(news_window_label, 7)
 
@@ -1620,7 +1877,6 @@ else:
 
     nxt = nearest_earnings_catalyst(earn_df)
     if nxt is not None:
-        # ensure tz-aware UTC timestamp (no double-localize)
         nxt_ts = pd.Timestamp(nxt)
         if nxt_ts.tzinfo is None:
             nxt_utc = nxt_ts.tz_localize("UTC")
