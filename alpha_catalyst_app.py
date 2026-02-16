@@ -677,9 +677,17 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
     cfs = yf_quarterly_cashflow(sym)
 
     scalars: List[Dict[str, object]] = []
-
-    def add_scalar(name, value, unit, update):
-        scalars.append({"Indicator": name, "Value": value, "Unit": unit, "Update": update})
+    def add_scalar(name, value, unit=None, update=None, source=None, definition=None):
+        scalars.append(
+            {
+                "Indicator": name,
+                "Value": value,
+                "Unit": unit,
+                "Update": update,
+                "Source": source,
+                "Definition": definition,
+            }
+        )
 
     rev_s = _row_get(inc, ["total revenue", "totalrevenue", "revenue"])
     gp_s = _row_get(inc, ["gross profit", "grossprofit"])
@@ -687,26 +695,25 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
     rd_s = _row_get(inc, ["research development", "researchdevelopment", "research & development"])
 
     rev_yoy = _q_yoy_growth(rev_s) if rev_s is not None else np.nan
-    add_scalar("Revenue YoY", rev_yoy, "%", "Quarterly")
+    add_scalar("Revenue YoY", rev_yoy, unit="%", update="Quarterly")
 
     gm = _q_margin_pct(gp_s, rev_s) if gp_s is not None and rev_s is not None else np.nan
-    add_scalar("Gross Margin", gm, "%", "Quarterly")
+    add_scalar("Gross Margin", gm, unit="%", update="Quarterly")
 
     om = _q_margin_pct(opinc_s, rev_s) if opinc_s is not None and rev_s is not None else np.nan
-    add_scalar("Operating Margin", om, "%", "Quarterly")
+    add_scalar("Operating Margin", om, unit="%", update="Quarterly")
 
-    # Medical cost ratio proxy: 1 - operating margin
     cost_ratio = (100.0 - om) if np.isfinite(om) else np.nan
-    add_scalar("Total Cost Ratio", cost_ratio, "%", "Quarterly")
+    add_scalar("Total Cost Ratio", cost_ratio, unit="%", update="Quarterly")
 
     rd_int = _q_margin_pct(rd_s, rev_s) if rd_s is not None and rev_s is not None else np.nan
-    add_scalar("R&D Intensity", rd_int, "%", "Quarterly")
+    add_scalar("R&D Intensity", rd_int, unit="%", update="Quarterly")
 
     dinv = _days_inventory(bal, inc)
-    add_scalar("Days Inventory", dinv, "days", "Quarterly")
+    add_scalar("Days Inventory", dinv, unit="days", update="Quarterly")
 
     dso = _ar_days(bal, inc)
-    add_scalar("Days Sales Outstanding", dso, "days", "Quarterly")
+    add_scalar("Days Sales Outstanding", dso, unit="days", update="Quarterly")
 
     ocf = _row_get(cfs, ["total cash from operating activities", "operating cash flow", "totalcashfromoperatingactivities"])
     capex = _row_get(cfs, ["capital expenditures", "capitalexpenditures"])
@@ -715,10 +722,10 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
         fcf_latest = float(df_cf.iloc[-1, 0] + df_cf.iloc[-1, 1]) if not df_cf.empty else np.nan
     else:
         fcf_latest = np.nan
-    add_scalar("Free Cash Flow", fcf_latest, "USD", "Quarterly")
+    add_scalar("Free Cash Flow", fcf_latest, unit="USD", update="Quarterly")
 
+    # EPS surprise: latest non-null
     earn = fetch_earnings_dates_yf(sym, limit=24)
-    
     eps_surp = np.nan
     if earn is not None and not earn.empty:
         s_col = None
@@ -726,7 +733,6 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
             if c in earn.columns:
                 s_col = c
                 break
-    
         if s_col is not None:
             tmp = earn.copy()
             tmp["earnings_date"] = pd.to_datetime(tmp["earnings_date"], errors="coerce", utc=True)
@@ -734,26 +740,27 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
             tmp = tmp.dropna(subset=["earnings_date", "surprise_pct"]).sort_values("earnings_date", ascending=False)
             if not tmp.empty:
                 eps_surp = float(tmp["surprise_pct"].iloc[0])
-    
+
+    # FIX: use "EPS Surprise" (matches your KPI lookup)
     add_scalar(
-        "EPS Surprise (most recent report)",
+        "EPS Surprise",
         eps_surp,
-        "%",
-        "Yahoo Finance via yfinance (get_earnings_dates)",
-        "Most recent available EPS surprise percentage (reported vs estimate).",
-        "Quarterly (on earnings)",
+        unit="%",
+        update="Quarterly (on earnings)",
+        source="Yahoo Finance via yfinance (get_earnings_dates)",
+        definition="Most recent available EPS surprise percentage (reported vs estimate).",
     )
 
-    add_scalar("Forward P/E", _to_num(info.get("forwardPE")), "x", "Daily")
+    add_scalar("Forward P/E", _to_num(info.get("forwardPE")), unit="x", update="Daily")
     rg = _to_num(info.get("revenueGrowth"))
-    add_scalar("Revenue Growth (Yahoo)", rg * 100.0 if np.isfinite(rg) else np.nan, "%", "Daily")
+    add_scalar("Revenue Growth (Yahoo)", rg * 100.0 if np.isfinite(rg) else np.nan, unit="%", update="Daily")
     eg = _to_num(info.get("earningsGrowth"))
-    add_scalar("Earnings Growth (Yahoo)", eg * 100.0 if np.isfinite(eg) else np.nan, "%", "Daily")
+    add_scalar("Earnings Growth (Yahoo)", eg * 100.0 if np.isfinite(eg) else np.nan, unit="%", update="Daily")
     roe = _to_num(info.get("returnOnEquity"))
-    add_scalar("Return on Equity", roe * 100.0 if np.isfinite(roe) else np.nan, "%", "Daily")
-    add_scalar("Debt/Equity", _to_num(info.get("debtToEquity")), "x", "Daily")
+    add_scalar("Return on Equity", roe * 100.0 if np.isfinite(roe) else np.nan, unit="%", update="Daily")
+    add_scalar("Debt/Equity", _to_num(info.get("debtToEquity")), unit="x", update="Daily")
     dy = _to_num(info.get("dividendYield"))
-    add_scalar("Dividend Yield", dy * 100.0 if np.isfinite(dy) else np.nan, "%", "Daily")
+    add_scalar("Dividend Yield", dy * 100.0 if np.isfinite(dy) else np.nan, unit="%", update="Daily")
 
     sector_etf_map = {
         "Medical": "XLV",
