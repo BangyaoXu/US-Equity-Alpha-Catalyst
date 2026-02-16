@@ -722,9 +722,9 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
     eps_surp = np.nan
     if earn is not None and not earn.empty:
         s_col = None
-        for col in ["Surprise(%)", "Surprise (%)", "Surprise %", "Surprise"]:
-            if col in earn.columns:
-                s_col = col
+        for c in ["Surprise(%)", "Surprise (%)", "Surprise %", "Surprise"]:
+            if c in earn.columns:
+                s_col = c
                 break
     
         if s_col is not None:
