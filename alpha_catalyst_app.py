@@ -1243,9 +1243,9 @@ if key_cols_present:
             ticker_col = c
 
     returns = (
-        show_uni[ticker_col].astype(str).str.upper().str.strip().map(ret_map)
+        show_uni[ticker_col].astype(str).str.upper().str.strip().map(ret_map) * 100
         if ticker_col is not None
-        else uni["ticker_norm"].astype(str).str.upper().str.strip().map(ret_map)
+        else uni["ticker_norm"].astype(str).str.upper().str.strip().map(ret_map) * 100
     )
     show_uni.insert(0, "__Return", returns)
 
