@@ -1265,7 +1265,7 @@ if key_cols_present:
         show_uni,
         use_container_width=True,
         height=320,
-        column_config={"Return": st.column_config.NumberColumn("Return", format="%.2%%")},
+        column_config={"Return": st.column_config.NumberColumn("Return", format="%.2f%%")},
     )
 else:
     st.dataframe(uni.iloc[:, :12], use_container_width=True, height=320)
