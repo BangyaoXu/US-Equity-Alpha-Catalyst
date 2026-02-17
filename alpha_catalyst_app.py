@@ -1540,19 +1540,6 @@ with tab_stock:
                 src = str(n.get("source", ""))
                 st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
 
-        st.markdown("#### Earnings Surprise History")
-        es = fetch_earnings_surprise_history(ticker_sel, limit=28)
-        if es is None or es.empty:
-            st.info("No earnings surprise history available from Yahoo/yfinance for this ticker.")
-        else:
-            es2 = es.rename(columns={"earnings_date": "date", "surprise_pct": "value"}).copy()
-            es2["date"] = pd.to_datetime(es2["date"], errors="coerce")
-            es2["value"] = pd.to_numeric(es2["value"], errors="coerce")
-            es2 = es2.dropna(subset=["date", "value"]).sort_values("date")
-            fig = px.line(es2, x="date", y="value", title="Earnings Surprise (%)")
-            fig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10))
-            st.plotly_chart(fig, use_container_width=True)
-
     # All other sectors: keep original KPIs
     else:
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
@@ -1579,6 +1566,19 @@ with tab_stock:
             st.plotly_chart(fig, use_container_width=True)
 
         if sector_exact == "Medical":
+            st.markdown("#### Earnings Surprise History")
+            es = fetch_earnings_surprise_history(ticker_sel, limit=28)
+            if es is None or es.empty:
+                st.info("No earnings surprise history available from Yahoo/yfinance for this ticker.")
+            else:
+                es2 = es.rename(columns={"earnings_date": "date", "surprise_pct": "value"}).copy()
+                es2["date"] = pd.to_datetime(es2["date"], errors="coerce")
+                es2["value"] = pd.to_numeric(es2["value"], errors="coerce")
+                es2 = es2.dropna(subset=["date", "value"]).sort_values("date")
+                fig = px.line(es2, x="date", y="value", title="Earnings Surprise (%)")
+                fig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(fig, use_container_width=True)
+                
             st.markdown("#### Policy + FDA Approvals News")
             news_window_label = st.selectbox("Medical catalysts news window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="med_news_window")
             days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
