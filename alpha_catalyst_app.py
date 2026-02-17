@@ -717,10 +717,6 @@ def _sec_get_json(url: str, timeout: int = 25, retries: int = 4, throttle_s: flo
 
 @st.cache_data(ttl=24 * 60 * 60)
 def fetch_sec_companyfacts(cik_int: int) -> dict:
-    """
-    SEC XBRL Company Facts API. Not all banks report Tier 1 ratios in XBRL,
-    so this is best-effort and may return empty.
-    """
     url = f"{SEC_BASE}/api/xbrl/companyfacts/CIK{cik10(cik_int)}.json"
     data = _sec_get_json(url, timeout=25, retries=4, throttle_s=0.12)
     return data or {}
@@ -1034,6 +1030,13 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
     pb = _to_num(info.get("priceToBook"))
     add_scalar("Price/Book", pb if np.isfinite(pb) else np.nan, unit="x", update="Daily")
 
+    # ===== Basic Materials additions (stock valuation only; does not affect other sectors) =====
+    ev_ebitda = _to_num(info.get("enterpriseToEbitda"))
+    add_scalar("EV/EBITDA", ev_ebitda if np.isfinite(ev_ebitda) else np.nan, unit="x", update="Daily")
+
+    bvps = _to_num(info.get("bookValue"))
+    add_scalar("Net Asset Value (proxy, BVPS)", bvps if np.isfinite(bvps) else np.nan, unit="USD/share", update="Daily")
+
     # Finance-specific best-effort items (only populate; UI panel uses them only in Finance)
     tier1 = fetch_tier1_ratio_best_effort(sym)
     add_scalar(
@@ -1045,8 +1048,6 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
         definition="Tier 1 ratio if obtainable from SEC XBRL tags or Yahoo fields (often unavailable).",
     )
 
-    # (Optional) cashflow-based buyback proxy: if available, users still might like a numeric gauge.
-    # Many firms don't have clean 'Repurchase of Stock' tags in Yahoo cashflow; this may be NaN.
     rep = _row_get(cfs, ["repurchase of stock", "repurchaseofstock", "repurchase of capital stock"])
     mc = _to_num(info.get("marketCap"))
     buyback_yield = np.nan
@@ -1054,7 +1055,6 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
         r = rep.dropna().sort_index()
         if not r.empty:
             try:
-                # cashflow is usually negative (cash out); convert to positive yield
                 buyback_yield = (abs(float(r.iloc[-1])) * 4.0) / float(mc) * 100.0
             except Exception:
                 buyback_yield = np.nan
@@ -1078,9 +1078,20 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
         "Conglomerates": "XLI",
     }
 
-    # Finance: keep series, but remove "(FRED)" and "(H.8, weekly, FRED)" from labels (per request)
     driver_series_map = {
-        "Basic Materials": [("HG=F", "Copper Futures"), ("GC=F", "Gold Futures")],
+        # ===== Basic Materials UPDATED ONLY =====
+        "Basic Materials": [
+            ("CL=F", "WTI Crude"),
+            ("NG=F", "Natural Gas"),
+            ("GC=F", "Gold Futures"),
+            ("SI=F", "Silver Futures"),
+            ("HG=F", "Copper Futures"),
+            ("ALI=F", "Aluminum Futures"),
+            ("DX-Y.NYB", "US Dollar Index (DXY)"),
+            ("TE:https://tradingeconomics.com/united-states/manufacturing-pmi", "US Manufacturing PMI"),
+            ("TE:https://tradingeconomics.com/china/manufacturing-pmi", "China Manufacturing PMI"),
+        ],
+
         "Energy": [("CL=F", "WTI Crude"), ("NG=F", "Natural Gas")],
         "Transportation": [("CL=F", "WTI Crude"), ("BZ=F", "Brent Crude")],
         "Aerospace": [("ITA", "Aerospace & Defense ETF")],
@@ -1113,9 +1124,12 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
     def _yf_series(symbol: str, period="5y") -> Optional[pd.DataFrame]:
         try:
             px = yf.download(symbol, period=period, interval="1d", auto_adjust=True, progress=False, threads=False)
-            if px is None or px.empty or "Close" not in px.columns:
+            if px is None or px.empty:
                 return None
-            out = px[["Close"]].dropna().reset_index()
+            col = "Close" if "Close" in px.columns else ("Adj Close" if "Adj Close" in px.columns else None)
+            if col is None:
+                return None
+            out = px[[col]].dropna().reset_index()
             out.columns = ["date", "value"]
             out["date"] = pd.to_datetime(out["date"], errors="coerce")
             out["value"] = pd.to_numeric(out["value"], errors="coerce")
@@ -1128,12 +1142,21 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
         s = (symbol or "").strip()
         if not s:
             return None
+
+        if s.upper().startswith("TE:"):
+            url = s.split(":", 1)[1].strip()
+            df = fetch_tradingeconomics_hist_from_page(url)
+            if df is None or df.empty:
+                return None
+            return df[["date", "value"]].copy()
+
         if s.upper().startswith("FRED:"):
             sid = s.split(":", 1)[1].strip()
             df = fetch_fred_series(sid)
             if df is None or df.empty:
                 return None
             return df[["date", "value"]].copy()
+
         return _yf_series(s)
 
     etf_map = payload.get("sector_etf_map", {})
@@ -1175,6 +1198,50 @@ def fetch_html(url: str, timeout=12) -> Optional[str]:
         return None
     except Exception:
         return None
+
+# =========================
+# TradingEconomics (PMI) – best-effort HTML table scrape (used by Basic Materials only)
+# =========================
+@st.cache_data(ttl=12 * 60 * 60)
+def fetch_tradingeconomics_hist_from_page(url: str) -> pd.DataFrame:
+    html = fetch_html(url, timeout=16)
+    if not html:
+        return pd.DataFrame()
+
+    try:
+        tables = pd.read_html(html)
+    except Exception:
+        tables = []
+
+    best = None
+    for tb in tables:
+        if tb is None or tb.empty:
+            continue
+        cols = [str(c).strip().lower() for c in tb.columns]
+        if any("date" in c for c in cols) and (any("value" in c for c in cols) or any("last" in c for c in cols)):
+            best = tb.copy()
+            break
+
+    if best is None or best.empty:
+        return pd.DataFrame()
+
+    c_date, c_val = None, None
+    for c in best.columns:
+        lc = str(c).strip().lower()
+        if c_date is None and "date" in lc:
+            c_date = c
+        if c_val is None and ("value" in lc or "last" in lc or lc == "actual"):
+            c_val = c
+
+    if c_date is None or c_val is None:
+        return pd.DataFrame()
+
+    out = best[[c_date, c_val]].copy()
+    out.columns = ["date", "value"]
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+    out = out.dropna(subset=["date", "value"]).sort_values("date").drop_duplicates(subset=["date"], keep="last")
+    return out
 
 def try_urls_exist(urls: List[str]) -> Optional[str]:
     for u in urls:
@@ -1471,8 +1538,28 @@ with tab_sector:
                 st.write(f"**{name}**")
                 fig = px.line(ser.tail(3000), x="date", y="value")
                 fig.update_layout(height=280, margin=dict(l=10, r=10, t=20, b=10))
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"sector_series_{sector_exact}_{i}")
             i += 1
+
+        # ===== Basic Materials additions (sector tab only) =====
+        if sector_exact == "Basic Materials":
+            st.markdown("#### Inventories / Supply (Headlines)")
+            q_supply = (
+                '(LME warehouse stocks OR "LME stock" OR "EIA inventories" OR "crude inventories" '
+                'OR gasoline inventories OR "Baker Hughes rig count" OR rig counts) '
+                'AND (metals OR copper OR aluminum OR steel OR oil OR gasoline)'
+            )
+            supp_news = fetch_google_news_rss_query(q_supply, days=30)
+            if supp_news is None or supp_news.empty:
+                st.info("No recent supply/inventory RSS headlines found.")
+            else:
+                for _, n in supp_news.head(12).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    title = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
 
 with tab_stock:
     def _scalar_value(indicator: str) -> float:
@@ -1551,6 +1638,21 @@ with tab_stock:
             st.metric("Total Cost Ratio", f"{_scalar_value('Total Cost Ratio'):.2f}%" if np.isfinite(_scalar_value("Total Cost Ratio")) else "N/A")
         with kpi4:
             st.metric("EPS Surprise", f"{_scalar_value('EPS Surprise'):.2f}%" if np.isfinite(_scalar_value("EPS Surprise")) else "N/A")
+
+        # ===== Basic Materials additions (stock tab only) =====
+        if sector_exact == "Basic Materials":
+            st.markdown("#### Valuation (Basic Materials)")
+            v1, v2, v3 = st.columns(3)
+            with v1:
+                st.metric("P/B", f"{_scalar_value('Price/Book'):.2f}x" if np.isfinite(_scalar_value("Price/Book")) else "N/A")
+            with v2:
+                st.metric("EV/EBITDA", f"{_scalar_value('EV/EBITDA'):.2f}x" if np.isfinite(_scalar_value("EV/EBITDA")) else "N/A")
+            with v3:
+                st.metric(
+                    "Net Asset Value (proxy, BVPS)",
+                    f"{_scalar_value('Net Asset Value (proxy, BVPS)'):.2f}" if np.isfinite(_scalar_value("Net Asset Value (proxy, BVPS)")) else "N/A",
+                )
+            st.caption("NAV shown is a **BVPS proxy** from Yahoo fields (not a full NAV model).")
 
         # ✅ Earnings Surprise History: Medical-only (and only rendered once)
         if sector_exact == "Medical":
