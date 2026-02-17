@@ -179,6 +179,30 @@ def strip_trailing_parens(name: str) -> str:
     s = str(name or "").strip()
     return re.sub(r"\s*\([^)]*\)\s*$", "", s).strip()
 
+def _remember_last_good_series(key: str, df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """
+    Prevent 'blank chart after rerun' when upstream returns empty frames.
+    If df is valid, store it; if df is empty/None, return last stored version if available.
+    """
+    if "LAST_GOOD_SERIES" not in st.session_state:
+        st.session_state["LAST_GOOD_SERIES"] = {}
+    store = st.session_state["LAST_GOOD_SERIES"]
+
+    def _is_good(x: Optional[pd.DataFrame]) -> bool:
+        if x is None or x.empty:
+            return False
+        if "date" not in x.columns or "value" not in x.columns:
+            return False
+        v = pd.to_numeric(x["value"], errors="coerce").dropna()
+        return not v.empty
+
+    if _is_good(df):
+        store[key] = df
+        return df
+
+    prev = store.get(key)
+    return prev if _is_good(prev) else df
+
 # =========================
 # HTTP helpers
 # =========================
@@ -1122,21 +1146,47 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
     series: Dict[str, pd.DataFrame] = {}
 
     def _yf_series(symbol: str, period="5y") -> Optional[pd.DataFrame]:
-        try:
-            px = yf.download(symbol, period=period, interval="1d", auto_adjust=True, progress=False, threads=False)
-            if px is None or px.empty:
+        sym = (symbol or "").strip()
+        if not sym:
+            return None
+
+        cache_key = f"YF::{sym}::{period}"
+
+        def _to_df(px_df: pd.DataFrame) -> Optional[pd.DataFrame]:
+            if px_df is None or px_df.empty:
                 return None
-            col = "Close" if "Close" in px.columns else ("Adj Close" if "Adj Close" in px.columns else None)
+            col = "Close" if "Close" in px_df.columns else ("Adj Close" if "Adj Close" in px_df.columns else None)
             if col is None:
                 return None
-            out = px[[col]].dropna().reset_index()
+            out = px_df[[col]].dropna().reset_index()
+            if out is None or out.empty:
+                return None
             out.columns = ["date", "value"]
             out["date"] = pd.to_datetime(out["date"], errors="coerce")
             out["value"] = pd.to_numeric(out["value"], errors="coerce")
             out = out.dropna(subset=["date", "value"]).sort_values("date")
-            return out
+            return out if not out.empty else None
+
+        # Try download first
+        try:
+            px_df = yf.download(sym, period=period, interval="1d", auto_adjust=True, progress=False, threads=False)
+            out = _to_df(px_df)
+            if out is not None and not out.empty:
+                return _remember_last_good_series(cache_key, out)
         except Exception:
-            return None
+            pass
+
+        # Fallback to history() (sometimes more reliable)
+        try:
+            t = yf.Ticker(sym)
+            hx = t.history(period=period, interval="1d", auto_adjust=True)
+            out = _to_df(hx)
+            if out is not None and not out.empty:
+                return _remember_last_good_series(cache_key, out)
+        except Exception:
+            pass
+
+        return _remember_last_good_series(cache_key, None)
 
     def _any_series(symbol: str) -> Optional[pd.DataFrame]:
         s = (symbol or "").strip()
@@ -1525,6 +1575,11 @@ st.subheader("Fundamental Indicators")
 scalars_df, series_map = build_indicator_series(sector_exact, ticker_sel)
 scalars_df = scalars_df if isinstance(scalars_df, pd.DataFrame) else pd.DataFrame()
 
+# REMOVE these indicators for Basic Materials only (do not display them anywhere)
+if sector_exact == "Basic Materials" and not scalars_df.empty and "Indicator" in scalars_df.columns:
+    drop_inds = {"Revenue YoY", "Operating Margin", "Total Cost Ratio", "EPS Surprise"}
+    scalars_df = scalars_df[~scalars_df["Indicator"].astype(str).isin(drop_inds)].copy()
+
 tab_sector, tab_stock = st.tabs(["Sector Indicators", "Stock Indicators"])
 
 with tab_sector:
@@ -1538,7 +1593,8 @@ with tab_sector:
                 st.write(f"**{name}**")
                 fig = px.line(ser.tail(3000), x="date", y="value")
                 fig.update_layout(height=280, margin=dict(l=10, r=10, t=20, b=10))
-                st.plotly_chart(fig, use_container_width=True, key=f"sector_series_{sector_exact}_{i}")
+                safe_key = re.sub(r"[^A-Za-z0-9_]+", "_", f"{sector_exact}_{name}")[:180]
+                st.plotly_chart(fig, use_container_width=True, key=f"sector_series_{safe_key}")
             i += 1
 
         # ===== Basic Materials additions (sector tab only) =====
@@ -1629,15 +1685,17 @@ with tab_stock:
 
     # All other sectors
     else:
-        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-        with kpi1:
-            st.metric("Revenue YoY", f"{_scalar_value('Revenue YoY'):.2f}%" if np.isfinite(_scalar_value("Revenue YoY")) else "N/A")
-        with kpi2:
-            st.metric("Operating Margin", f"{_scalar_value('Operating Margin'):.2f}%" if np.isfinite(_scalar_value("Operating Margin")) else "N/A")
-        with kpi3:
-            st.metric("Total Cost Ratio", f"{_scalar_value('Total Cost Ratio'):.2f}%" if np.isfinite(_scalar_value("Total Cost Ratio")) else "N/A")
-        with kpi4:
-            st.metric("EPS Surprise", f"{_scalar_value('EPS Surprise'):.2f}%" if np.isfinite(_scalar_value("EPS Surprise")) else "N/A")
+        # Basic Materials: remove those KPI cards entirely (Revenue YoY / Operating Margin / Total Cost Ratio / EPS Surprise)
+        if sector_exact != "Basic Materials":
+            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+            with kpi1:
+                st.metric("Revenue YoY", f"{_scalar_value('Revenue YoY'):.2f}%" if np.isfinite(_scalar_value("Revenue YoY")) else "N/A")
+            with kpi2:
+                st.metric("Operating Margin", f"{_scalar_value('Operating Margin'):.2f}%" if np.isfinite(_scalar_value("Operating Margin")) else "N/A")
+            with kpi3:
+                st.metric("Total Cost Ratio", f"{_scalar_value('Total Cost Ratio'):.2f}%" if np.isfinite(_scalar_value("Total Cost Ratio")) else "N/A")
+            with kpi4:
+                st.metric("EPS Surprise", f"{_scalar_value('EPS Surprise'):.2f}%" if np.isfinite(_scalar_value("EPS Surprise")) else "N/A")
 
         # ===== Basic Materials additions (stock tab only) =====
         if sector_exact == "Basic Materials":
