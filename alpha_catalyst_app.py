@@ -328,14 +328,14 @@ def fetch_google_news_rss(ticker: str, days: int) -> pd.DataFrame:
     return fetch_google_news_rss_query(f"{ticker} stock", days)
 
 # =========================
-# FRED helpers (generic)
+# FRED generic (for sector series like Finance)
 # =========================
 @st.cache_data(ttl=24 * 60 * 60)
 def fetch_fred_series(series_id: str) -> pd.DataFrame:
     sid = (series_id or "").strip()
     if not sid:
         return pd.DataFrame()
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={requests.utils.quote(sid)}"
     txt = _get_text(url, timeout=25, retries=3)
     if not txt:
         return pd.DataFrame()
@@ -350,13 +350,6 @@ def fetch_fred_series(series_id: str) -> pd.DataFrame:
         return df
     except Exception:
         return pd.DataFrame()
-
-# =========================
-# FRED: US Healthcare Policy Uncertainty Index (EPUHEALTHCARE)
-# =========================
-@st.cache_data(ttl=24 * 60 * 60)
-def fetch_fred_epu_healthcare() -> pd.DataFrame:
-    return fetch_fred_series("EPUHEALTHCARE")
 
 # =========================
 # EARNINGS (forecasts/actual/surprises via yfinance)
@@ -678,8 +671,272 @@ def _ar_days(balance: pd.DataFrame, income: pd.DataFrame) -> float:
         return np.nan
     return (ar_last / (rev_last * 4.0)) * 365.0
 
+# =========================
+# SEC EDGAR (robust)
+# =========================
+SEC_BASE = "https://data.sec.gov"
+SEC_TICKER_MAP_URLS = [
+    "https://www.sec.gov/files/company_tickers.json",
+    "https://www.sec.gov/files/company_tickers_exchange.json",
+]
+
+def normalize_sec_ticker(t: str) -> str:
+    return (t or "").upper().strip().replace(".", "-")
+
+def _sec_headers() -> Dict[str, str]:
+    contact = ""
+    try:
+        contact = st.secrets.get("SEC_CONTACT", "")
+    except Exception:
+        contact = ""
+    ua = USER_AGENT
+    if contact and contact not in ua:
+        ua = f"{USER_AGENT} ({contact})"
+    return {
+        "User-Agent": ua,
+        "Accept": "application/json,text/html,*/*",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+    }
+
+def _sec_get_json(url: str, timeout: int = 25, retries: int = 4, throttle_s: float = 0.12) -> Optional[dict]:
+    for i in range(retries):
+        try:
+            time.sleep(throttle_s)
+            r = SESSION.get(url, headers=_sec_headers(), timeout=timeout)
+            if 200 <= r.status_code < 300:
+                return r.json()
+            if r.status_code in (403, 429, 500, 502, 503, 504):
+                time.sleep(0.6 * (2 ** i))
+                continue
+            return None
+        except Exception:
+            time.sleep(0.6 * (2 ** i))
+            continue
+    return None
+
+@st.cache_data(ttl=24 * 60 * 60)
+def fetch_sec_companyfacts(cik_int: int) -> dict:
+    """
+    SEC XBRL Company Facts API. Not all banks report Tier 1 ratios in XBRL,
+    so this is best-effort and may return empty.
+    """
+    url = f"{SEC_BASE}/api/xbrl/companyfacts/CIK{cik10(cik_int)}.json"
+    data = _sec_get_json(url, timeout=25, retries=4, throttle_s=0.12)
+    return data or {}
+
+def _latest_fact_value(companyfacts: dict, tags: List[str]) -> float:
+    if not companyfacts:
+        return np.nan
+
+    facts = (companyfacts.get("facts") or {})
+    usg = (facts.get("us-gaap") or {})
+    for tag in tags:
+        obj = usg.get(tag)
+        if not obj:
+            continue
+        units = obj.get("units") or {}
+        for _, arr in units.items():
+            if not isinstance(arr, list) or not arr:
+                continue
+            best = None
+            for it in arr:
+                v = it.get("val", None)
+                end = it.get("end", it.get("fy", None))
+                if v is None:
+                    continue
+                try:
+                    v = float(v)
+                except Exception:
+                    continue
+                if not np.isfinite(v):
+                    continue
+                key = str(end) if end is not None else ""
+                if best is None or key > best[0]:
+                    best = (key, v)
+            if best is not None:
+                return float(best[1])
+
+    for ns, ns_obj in facts.items():
+        if not isinstance(ns_obj, dict):
+            continue
+        for tag in tags:
+            obj = ns_obj.get(tag)
+            if not obj:
+                continue
+            units = obj.get("units") or {}
+            for _, arr in units.items():
+                if not isinstance(arr, list) or not arr:
+                    continue
+                best = None
+                for it in arr:
+                    v = it.get("val", None)
+                    end = it.get("end", it.get("fy", None))
+                    if v is None:
+                        continue
+                    try:
+                        v = float(v)
+                    except Exception:
+                        continue
+                    if not np.isfinite(v):
+                        continue
+                    key = str(end) if end is not None else ""
+                    if best is None or key > best[0]:
+                        best = (key, v)
+                if best is not None:
+                    return float(best[1])
+
+    return np.nan
+
+@st.cache_data(ttl=24 * 60 * 60)
+def fetch_sec_ticker_map() -> pd.DataFrame:
+    for url in SEC_TICKER_MAP_URLS:
+        data = _sec_get_json(url)
+        if not data:
+            continue
+        rows = []
+        if isinstance(data, dict):
+            for _, obj in data.items():
+                t = str(obj.get("ticker", "")).upper().strip()
+                cik = obj.get("cik_str", obj.get("cik", None))
+                title = obj.get("title", obj.get("name", ""))
+                if t and cik is not None:
+                    rows.append({"ticker": t, "cik": int(cik), "title": title})
+        elif isinstance(data, list):
+            for obj in data:
+                t = str(obj.get("ticker", "")).upper().strip()
+                cik = obj.get("cik_str", obj.get("cik", None))
+                title = obj.get("title", obj.get("name", ""))
+                if t and cik is not None:
+                    rows.append({"ticker": t, "cik": int(cik), "title": title})
+        df = pd.DataFrame(rows).drop_duplicates(subset=["ticker"])
+        if not df.empty:
+            return df
+    return pd.DataFrame(columns=["ticker", "cik", "title"])
+
+def cik10(cik_int: int) -> str:
+    return str(int(cik_int)).zfill(10)
+
+@st.cache_data(ttl=CACHE_TTL_META)
+def fetch_sec_submissions(cik_int: int) -> dict:
+    url = f"{SEC_BASE}/submissions/CIK{cik10(cik_int)}.json"
+    data = _sec_get_json(url)
+    return data or {}
+
+def _sec_index_url(cik_int: int, accession: str) -> str:
+    acc_nodash = accession.replace("-", "")
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{accession}-index.html"
+
+def _sec_primary_url(cik_int: int, accession: str, primary_doc: str) -> str:
+    acc_nodash = accession.replace("-", "")
+    return f"https://www.sec.gov/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{primary_doc}"
+
+def _resolve_cik_for_ticker(ticker: str) -> Optional[int]:
+    t = (ticker or "").upper().strip()
+    if not t:
+        return None
+
+    overrides = st.session_state.get("CIK_OVERRIDES", {})
+    if isinstance(overrides, dict) and t in overrides:
+        try:
+            return int(overrides[t])
+        except Exception:
+            pass
+
+    m = fetch_sec_ticker_map()
+    if m.empty:
+        return None
+
+    t_norm = normalize_sec_ticker(t)
+    hit = m[m["ticker"] == t_norm].head(1)
+    if hit.empty:
+        hit = m[m["ticker"] == t].head(1)
+
+    if hit.empty:
+        return None
+    return int(hit["cik"].iloc[0])
+
+def fetch_tier1_ratio_best_effort(ticker: str) -> float:
+    sym = normalize_yf_ticker(ticker)
+    info = fetch_info_one(sym) or {}
+
+    for k in ["tier1CapitalRatio", "tier1RiskBasedCapitalRatio", "cet1Ratio", "commonEquityTier1Ratio"]:
+        v = info.get(k)
+        try:
+            v = float(v)
+            if np.isfinite(v):
+                return v * 100.0 if v <= 1.5 else v
+        except Exception:
+            pass
+
+    cik_int = _resolve_cik_for_ticker(sym)
+    if cik_int is None:
+        return np.nan
+
+    cf = fetch_sec_companyfacts(int(cik_int))
+    cand_tags = [
+        "Tier1CapitalRatio",
+        "Tier1RiskBasedCapitalRatio",
+        "CommonEquityTier1CapitalRatio",
+        "CommonEquityTier1Ratio",
+        "CET1CapitalRatio",
+        "CET1Ratio",
+        "TotalRiskBasedCapitalRatio",
+    ]
+    v = _latest_fact_value(cf, cand_tags)
+    if np.isfinite(v):
+        return v * 100.0 if v <= 1.5 else v
+
+    return np.nan
+
+def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None, limit: int = 8) -> pd.DataFrame:
+    cik_int = _resolve_cik_for_ticker(ticker)
+    if cik_int is None:
+        return pd.DataFrame()
+
+    sub = fetch_sec_submissions(cik_int)
+    recent = (((sub or {}).get("filings") or {}).get("recent") or {})
+    if not recent:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(recent)
+    if df.empty:
+        return pd.DataFrame()
+
+    keep = [c for c in [
+        "filingDate", "reportDate", "acceptanceDateTime",
+        "form", "accessionNumber", "primaryDocument",
+        "isXBRL", "isInlineXBRL"
+    ] if c in df.columns]
+
+    df = df[keep].copy()
+    df["filingDate"] = pd.to_datetime(df.get("filingDate"), errors="coerce")
+
+    if forms:
+        df = df[df["form"].isin(forms)]
+    df = df.sort_values("filingDate", ascending=False).head(limit)
+
+    def build_links(row):
+        acc = str(row.get("accessionNumber", "") or "")
+        doc = str(row.get("primaryDocument", "") or "")
+        if not acc:
+            return pd.Series({"index_url": "", "primary_url": ""})
+        index_url = _sec_index_url(cik_int, acc)
+        primary_url = _sec_primary_url(cik_int, acc, doc) if doc else ""
+        return pd.Series({"index_url": index_url, "primary_url": primary_url})
+
+    links = df.apply(build_links, axis=1)
+    df = pd.concat([df, links], axis=1)
+
+    df.insert(0, "ticker", ticker.upper())
+    df.insert(1, "cik", int(cik_int))
+    return df
+
+# =========================
+# Indicator bundle (stock + sector maps)
+# =========================
 @st.cache_data(ttl=CACHE_TTL_SECTOR)
-def fetch_indicator_bundle(ticker: str, sector_name_exact: str = "") -> Dict[str, object]:
+def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
     sym = normalize_yf_ticker(ticker)
     info = fetch_info_one(sym) or {}
     inc = yf_quarterly_income(sym)
@@ -687,7 +944,6 @@ def fetch_indicator_bundle(ticker: str, sector_name_exact: str = "") -> Dict[str
     cfs = yf_quarterly_cashflow(sym)
 
     scalars: List[Dict[str, object]] = []
-
     def add_scalar(name, value, unit=None, update=None, source=None, definition=None):
         scalars.append(
             {
@@ -700,190 +956,6 @@ def fetch_indicator_bundle(ticker: str, sector_name_exact: str = "") -> Dict[str
             }
         )
 
-    sector_name_exact = (sector_name_exact or "").strip()
-
-    # ---------------------------------------------------------
-    # Finance sector: banking-focused fundamentals (only here)
-    # ---------------------------------------------------------
-    if sector_name_exact == "Finance":
-        # Loan Book YoY (from company balance sheet when available)
-        loans_s = _row_get(bal, [
-            "net loans", "netloans", "loans", "total loans", "totalloans",
-            "loans and leases", "loansandleases"
-        ])
-        loan_yoy = _q_yoy_growth(loans_s) if loans_s is not None else np.nan
-        add_scalar(
-            "Loan Book YoY (Yahoo)",
-            loan_yoy,
-            unit="%",
-            update="Quarterly",
-            source="Yahoo Finance via yfinance (quarterly_balance_sheet)",
-            definition="YoY growth of company loan book if the balance sheet provides a loans line (may be missing).",
-        )
-
-        # Net Interest Income YoY (if provided in income statement)
-        nii_s = _row_get(inc, ["net interest income", "netinterestincome"])
-        nii_yoy = _q_yoy_growth(nii_s) if nii_s is not None else np.nan
-        add_scalar(
-            "Net Interest Income YoY",
-            nii_yoy,
-            unit="%",
-            update="Quarterly",
-            source="Yahoo Finance via yfinance (quarterly_financials)",
-            definition="YoY growth of net interest income if available (banks; may be missing for non-banks).",
-        )
-
-        # NIM (approx): annualized NII / total assets (rough proxy)
-        assets_s = _row_get(bal, ["total assets", "totalassets"])
-        nim = np.nan
-        try:
-            if nii_s is not None and assets_s is not None:
-                nii = nii_s.dropna().sort_index()
-                assets = assets_s.dropna().sort_index()
-                df_na = pd.concat([nii, assets], axis=1, join="inner")
-                if not df_na.empty:
-                    nii_last = float(df_na.iloc[-1, 0])
-                    assets_last = float(df_na.iloc[-1, 1])
-                    if np.isfinite(nii_last) and np.isfinite(assets_last) and assets_last != 0:
-                        nim = (nii_last * 4.0 / assets_last) * 100.0
-        except Exception:
-            nim = np.nan
-
-        add_scalar(
-            "Net Interest Margin (approx)",
-            nim,
-            unit="%",
-            update="Quarterly",
-            source="Yahoo Finance via yfinance (quarterly_financials + quarterly_balance_sheet)",
-            definition="Approx proxy: (latest quarterly NII × 4) / total assets. Not a true NIM; best-effort when fields exist.",
-        )
-
-        # Capital returns: Dividend yield + Buyback yield (approx from cashflow)
-        dy = _to_num(info.get("dividendYield"))
-        add_scalar(
-            "Dividend Yield",
-            dy * 100.0 if np.isfinite(dy) else np.nan,
-            unit="%",
-            update="Daily",
-            source="Yahoo Finance via yfinance .info",
-            definition="Trailing dividend yield from Yahoo.",
-        )
-
-        mcap = _to_num(info.get("marketCap"))
-        rep_s = _row_get(cfs, [
-            "repurchase of stock", "repurchaseofstock",
-            "repurchases of stock", "repurchasesofstock",
-            "repurchase of capital stock", "repurchaseofcapitalstock",
-        ])
-        buyback_yield = np.nan
-        try:
-            if rep_s is not None and np.isfinite(mcap) and mcap > 0:
-                rep = rep_s.dropna().sort_index()
-                if not rep.empty:
-                    rep_last = float(rep.iloc[-1])
-                    buyback_yield = (abs(rep_last) * 4.0 / mcap) * 100.0
-        except Exception:
-            buyback_yield = np.nan
-
-        add_scalar(
-            "Buyback Yield (approx)",
-            buyback_yield,
-            unit="%",
-            update="Quarterly",
-            source="Yahoo Finance via yfinance (quarterly_cashflow + marketCap)",
-            definition="Approx proxy: (abs(latest quarterly repurchases) × 4) / market cap. Missing for many tickers.",
-        )
-
-        # Valuation / profitability (Finance screen staples)
-        pb = _to_num(info.get("priceToBook"))
-        add_scalar(
-            "Price/Book",
-            pb,
-            unit="x",
-            update="Daily",
-            source="Yahoo Finance via yfinance .info",
-            definition="Price-to-book ratio from Yahoo.",
-        )
-
-        roe = _to_num(info.get("returnOnEquity"))
-        add_scalar(
-            "Return on Equity",
-            roe * 100.0 if np.isfinite(roe) else np.nan,
-            unit="%",
-            update="Daily",
-            source="Yahoo Finance via yfinance .info",
-            definition="ROE from Yahoo (can be missing).",
-        )
-
-        # EPS surprise: latest non-null (keep as-is)
-        earn = fetch_earnings_dates_yf(sym, limit=24)
-        eps_surp = np.nan
-        if earn is not None and not earn.empty:
-            s_col = None
-            for c in ["Surprise(%)", "Surprise (%)", "Surprise %", "Surprise"]:
-                if c in earn.columns:
-                    s_col = c
-                    break
-            if s_col is not None:
-                tmp = earn.copy()
-                tmp["earnings_date"] = pd.to_datetime(tmp["earnings_date"], errors="coerce", utc=True)
-                tmp["surprise_pct"] = pd.to_numeric(tmp[s_col], errors="coerce")
-                tmp = tmp.dropna(subset=["earnings_date", "surprise_pct"]).sort_values("earnings_date", ascending=False)
-                if not tmp.empty:
-                    eps_surp = float(tmp["surprise_pct"].iloc[0])
-
-        add_scalar(
-            "EPS Surprise",
-            eps_surp,
-            unit="%",
-            update="Quarterly (on earnings)",
-            source="Yahoo Finance via yfinance (get_earnings_dates)",
-            definition="Most recent available EPS surprise percentage (reported vs estimate).",
-        )
-
-        sector_etf_map = {
-            "Medical": "XLV",
-            "Computer and Technology": "XLK",
-            "Finance": "XLF",
-            "Utilities": "XLU",
-            "Consumer Staples": "XLP",
-            "Consumer Discretionary": "XLY",
-            "Basic Materials": "XLB",
-            "Industrial Products": "XLI",
-            "Transportation": "IYT",
-            "Retail-Wholesale": "XRT",
-            "Auto-Tires-Trucks": "CARZ",
-            "Construction": "ITB",
-            "Aerospace": "ITA",
-            "Business Services": "XLI",
-            "Conglomerates": "XLI",
-        }
-
-        # Finance driver series:
-        # - XLF (already via sector_etf_map)
-        # - 10Y2Y spread
-        # - H.8 loans
-        # - delinquency + charge-offs as macro asset quality gauges
-        driver_series_map = {
-            "Finance": [
-                ("FRED:T10Y2Y", "10Y–2Y Treasury Spread (FRED)"),
-                ("FRED:TOTLL", "Bank Loans & Leases (H.8, weekly, FRED)"),
-                ("FRED:DRALACBS", "Delinquency Rate (All Loans, FRED)"),
-                ("FRED:CORALACBS", "Charge-Off Rate (All Loans, FRED)"),
-                ("FRED:DRCCLACBS", "Credit Card Delinquency Rate (FRED)"),
-                ("FRED:CORCCACBS", "Credit Card Charge-Off Rate (FRED)"),
-            ]
-        }
-
-        return {
-            "scalars": pd.DataFrame(scalars),
-            "sector_etf_map": sector_etf_map,
-            "driver_series_map": driver_series_map,
-        }
-
-    # ---------------------------------------------------------
-    # Default (all other sectors): keep your existing logic
-    # ---------------------------------------------------------
     rev_s = _row_get(inc, ["total revenue", "totalrevenue", "revenue"])
     gp_s = _row_get(inc, ["gross profit", "grossprofit"])
     opinc_s = _row_get(inc, ["operating income", "operatingincome"])
@@ -945,16 +1017,48 @@ def fetch_indicator_bundle(ticker: str, sector_name_exact: str = "") -> Dict[str
         definition="Most recent available EPS surprise percentage (reported vs estimate).",
     )
 
+    # Generic Yahoo scalars
     add_scalar("Forward P/E", _to_num(info.get("forwardPE")), unit="x", update="Daily")
     rg = _to_num(info.get("revenueGrowth"))
     add_scalar("Revenue Growth (Yahoo)", rg * 100.0 if np.isfinite(rg) else np.nan, unit="%", update="Daily")
     eg = _to_num(info.get("earningsGrowth"))
     add_scalar("Earnings Growth (Yahoo)", eg * 100.0 if np.isfinite(eg) else np.nan, unit="%", update="Daily")
+
     roe = _to_num(info.get("returnOnEquity"))
     add_scalar("Return on Equity", roe * 100.0 if np.isfinite(roe) else np.nan, unit="%", update="Daily")
     add_scalar("Debt/Equity", _to_num(info.get("debtToEquity")), unit="x", update="Daily")
+
     dy = _to_num(info.get("dividendYield"))
     add_scalar("Dividend Yield", dy * 100.0 if np.isfinite(dy) else np.nan, unit="%", update="Daily")
+
+    pb = _to_num(info.get("priceToBook"))
+    add_scalar("Price/Book", pb if np.isfinite(pb) else np.nan, unit="x", update="Daily")
+
+    # Finance-specific best-effort items (only populate; UI panel uses them only in Finance)
+    tier1 = fetch_tier1_ratio_best_effort(sym)
+    add_scalar(
+        "Tier 1 Capital Ratio",
+        tier1,
+        unit="%",
+        update="Quarterly (best-effort)",
+        source="SEC XBRL companyfacts (best-effort) / Yahoo (if available)",
+        definition="Tier 1 ratio if obtainable from SEC XBRL tags or Yahoo fields (often unavailable).",
+    )
+
+    # (Optional) cashflow-based buyback proxy: if available, users still might like a numeric gauge.
+    # Many firms don't have clean 'Repurchase of Stock' tags in Yahoo cashflow; this may be NaN.
+    rep = _row_get(cfs, ["repurchase of stock", "repurchaseofstock", "repurchase of capital stock"])
+    mc = _to_num(info.get("marketCap"))
+    buyback_yield = np.nan
+    if rep is not None and mc and np.isfinite(mc) and mc > 0:
+        r = rep.dropna().sort_index()
+        if not r.empty:
+            try:
+                # cashflow is usually negative (cash out); convert to positive yield
+                buyback_yield = (abs(float(r.iloc[-1])) * 4.0) / float(mc) * 100.0
+            except Exception:
+                buyback_yield = np.nan
+    add_scalar("Buyback Yield (approx)", buyback_yield, unit="%", update="Quarterly", source="Yahoo cashflow + market cap proxy")
 
     sector_etf_map = {
         "Medical": "XLV",
@@ -974,12 +1078,22 @@ def fetch_indicator_bundle(ticker: str, sector_name_exact: str = "") -> Dict[str
         "Conglomerates": "XLI",
     }
 
+    # Finance: keep series, but remove "(FRED)" and "(H.8, weekly, FRED)" from labels (per request)
     driver_series_map = {
         "Basic Materials": [("HG=F", "Copper Futures"), ("GC=F", "Gold Futures")],
         "Energy": [("CL=F", "WTI Crude"), ("NG=F", "Natural Gas")],
         "Transportation": [("CL=F", "WTI Crude"), ("BZ=F", "Brent Crude")],
         "Aerospace": [("ITA", "Aerospace & Defense ETF")],
         "Construction": [("ITB", "Homebuilders ETF")],
+
+        "Finance": [
+            ("FRED:T10Y2Y", "10Y–2Y Treasury Spread"),
+            ("FRED:TOTLL", "Bank Loans & Leases (H.8)"),
+            ("FRED:DRALACBS", "Delinquency Rate (All Loans)"),
+            ("FRED:CORALACBS", "Charge-Off Rate (All Loans)"),
+            ("FRED:DRCCLACBS", "Credit Card Delinquency Rate"),
+            ("FRED:CORCCACBS", "Credit Card Charge-Off Rate"),
+        ],
     }
 
     return {
@@ -989,7 +1103,7 @@ def fetch_indicator_bundle(ticker: str, sector_name_exact: str = "") -> Dict[str
     }
 
 def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
-    payload = fetch_indicator_bundle(ticker, sector_name_exact=sector_name_exact)
+    payload = fetch_indicator_bundle(ticker)
     scalars = payload["scalars"].copy()
     if scalars is not None and not scalars.empty and "Indicator" in scalars.columns:
         scalars["Indicator"] = scalars["Indicator"].map(strip_trailing_parens)
@@ -998,17 +1112,7 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
 
     def _yf_series(symbol: str, period="5y") -> Optional[pd.DataFrame]:
         try:
-            symb = (symbol or "").strip()
-            if not symb:
-                return None
-
-            # NEW: allow FRED:<SERIES_ID>
-            if symb.upper().startswith("FRED:"):
-                sid = symb.split(":", 1)[1].strip()
-                df = fetch_fred_series(sid)
-                return df if df is not None and not df.empty else None
-
-            px = yf.download(symb, period=period, interval="1d", auto_adjust=True, progress=False, threads=False)
+            px = yf.download(symbol, period=period, interval="1d", auto_adjust=True, progress=False, threads=False)
             if px is None or px.empty or "Close" not in px.columns:
                 return None
             out = px[["Close"]].dropna().reset_index()
@@ -1020,23 +1124,30 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
         except Exception:
             return None
 
+    def _any_series(symbol: str) -> Optional[pd.DataFrame]:
+        s = (symbol or "").strip()
+        if not s:
+            return None
+        if s.upper().startswith("FRED:"):
+            sid = s.split(":", 1)[1].strip()
+            df = fetch_fred_series(sid)
+            if df is None or df.empty:
+                return None
+            return df[["date", "value"]].copy()
+        return _yf_series(s)
+
     etf_map = payload.get("sector_etf_map", {})
     etf = etf_map.get(sector_name_exact)
     if etf:
-        ser = _yf_series(etf)
+        ser = _any_series(etf)
         if ser is not None and not ser.empty:
             series[f"{sector_name_exact} Benchmark ETF ({etf})"] = ser
 
     driver_map = payload.get("driver_series_map", {})
     for sym, label in driver_map.get(sector_name_exact, []):
-        ser = _yf_series(sym)
+        ser = _any_series(sym)
         if ser is not None and not ser.empty:
             series[label] = ser
-
-    if sector_name_exact == "Medical":
-        epu = fetch_fred_epu_healthcare()
-        if epu is not None and not epu.empty:
-            series["U.S. Healthcare Policy Uncertainty Index"] = epu
 
     return scalars, series
 
@@ -1115,161 +1226,6 @@ def extract_ir_news_links(ir_url: str, max_links=10) -> List[Tuple[str, str]]:
         if len(out) >= max_links:
             break
     return out
-
-# =========================
-# SEC EDGAR (robust)
-# =========================
-SEC_BASE = "https://data.sec.gov"
-SEC_TICKER_MAP_URLS = [
-    "https://www.sec.gov/files/company_tickers.json",
-    "https://www.sec.gov/files/company_tickers_exchange.json",
-]
-
-def normalize_sec_ticker(t: str) -> str:
-    return (t or "").upper().strip().replace(".", "-")
-
-def _sec_headers() -> Dict[str, str]:
-    contact = ""
-    try:
-        contact = st.secrets.get("SEC_CONTACT", "")
-    except Exception:
-        contact = ""
-    ua = USER_AGENT
-    if contact and contact not in ua:
-        ua = f"{USER_AGENT} ({contact})"
-    return {
-        "User-Agent": ua,
-        "Accept": "application/json,text/html,*/*",
-        "Accept-Encoding": "gzip, deflate",
-        "Connection": "keep-alive",
-    }
-
-def _sec_get_json(url: str, timeout: int = 25, retries: int = 4, throttle_s: float = 0.12) -> Optional[dict]:
-    for i in range(retries):
-        try:
-            time.sleep(throttle_s)
-            r = SESSION.get(url, headers=_sec_headers(), timeout=timeout)
-            if 200 <= r.status_code < 300:
-                return r.json()
-            if r.status_code in (403, 429, 500, 502, 503, 504):
-                time.sleep(0.6 * (2 ** i))
-                continue
-            return None
-        except Exception:
-            time.sleep(0.6 * (2 ** i))
-            continue
-    return None
-
-@st.cache_data(ttl=24 * 60 * 60)
-def fetch_sec_ticker_map() -> pd.DataFrame:
-    for url in SEC_TICKER_MAP_URLS:
-        data = _sec_get_json(url)
-        if not data:
-            continue
-        rows = []
-        if isinstance(data, dict):
-            for _, obj in data.items():
-                t = str(obj.get("ticker", "")).upper().strip()
-                cik = obj.get("cik_str", obj.get("cik", None))
-                title = obj.get("title", obj.get("name", ""))
-                if t and cik is not None:
-                    rows.append({"ticker": t, "cik": int(cik), "title": title})
-        elif isinstance(data, list):
-            for obj in data:
-                t = str(obj.get("ticker", "")).upper().strip()
-                cik = obj.get("cik_str", obj.get("cik", None))
-                title = obj.get("title", obj.get("name", ""))
-                if t and cik is not None:
-                    rows.append({"ticker": t, "cik": int(cik), "title": title})
-        df = pd.DataFrame(rows).drop_duplicates(subset=["ticker"])
-        if not df.empty:
-            return df
-    return pd.DataFrame(columns=["ticker", "cik", "title"])
-
-def cik10(cik_int: int) -> str:
-    return str(int(cik_int)).zfill(10)
-
-@st.cache_data(ttl=CACHE_TTL_META)
-def fetch_sec_submissions(cik_int: int) -> dict:
-    url = f"{SEC_BASE}/submissions/CIK{cik10(cik_int)}.json"
-    data = _sec_get_json(url)
-    return data or {}
-
-def _sec_index_url(cik_int: int, accession: str) -> str:
-    acc_nodash = accession.replace("-", "")
-    return f"https://www.sec.gov/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{accession}-index.html"
-
-def _sec_primary_url(cik_int: int, accession: str, primary_doc: str) -> str:
-    acc_nodash = accession.replace("-", "")
-    return f"https://www.sec.gov/Archives/edgar/data/{int(cik_int)}/{acc_nodash}/{primary_doc}"
-
-def _resolve_cik_for_ticker(ticker: str) -> Optional[int]:
-    t = (ticker or "").upper().strip()
-    if not t:
-        return None
-
-    overrides = st.session_state.get("CIK_OVERRIDES", {})
-    if isinstance(overrides, dict) and t in overrides:
-        try:
-            return int(overrides[t])
-        except Exception:
-            pass
-
-    m = fetch_sec_ticker_map()
-    if m.empty:
-        return None
-
-    t_norm = normalize_sec_ticker(t)
-    hit = m[m["ticker"] == t_norm].head(1)
-    if hit.empty:
-        hit = m[m["ticker"] == t].head(1)
-
-    if hit.empty:
-        return None
-    return int(hit["cik"].iloc[0])
-
-def get_latest_filings_for_ticker(ticker: str, forms: Optional[List[str]] = None, limit: int = 8) -> pd.DataFrame:
-    cik_int = _resolve_cik_for_ticker(ticker)
-    if cik_int is None:
-        return pd.DataFrame()
-
-    sub = fetch_sec_submissions(cik_int)
-    recent = (((sub or {}).get("filings") or {}).get("recent") or {})
-    if not recent:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(recent)
-    if df.empty:
-        return pd.DataFrame()
-
-    keep = [c for c in [
-        "filingDate", "reportDate", "acceptanceDateTime",
-        "form", "accessionNumber", "primaryDocument",
-        "isXBRL", "isInlineXBRL"
-    ] if c in df.columns]
-
-    df = df[keep].copy()
-    df["filingDate"] = pd.to_datetime(df.get("filingDate"), errors="coerce")
-
-    if forms:
-        df = df[df["form"].isin(forms)]
-    df = df.sort_values("filingDate", ascending=False).head(limit)
-
-    def build_links(row):
-        acc = str(row.get("accessionNumber", "") or "")
-        doc = str(row.get("primaryDocument", "") or "")
-        if not acc:
-            return pd.Series({"index_url": "", "primary_url": ""})
-        index_url = _sec_index_url(cik_int, acc)
-        primary_url = _sec_primary_url(cik_int, acc, doc) if doc else ""
-        return pd.Series({"index_url": index_url, "primary_url": primary_url})
-
-    links = df.apply(build_links, axis=1)
-    df = pd.concat([df, links], axis=1)
-
-    df.insert(0, "ticker", ticker.upper())
-    df.insert(1, "cik", int(cik_int))
-    return df
 
 # =========================
 # Technical indicators
@@ -1527,46 +1483,56 @@ with tab_stock:
             return np.nan
         return pd.to_numeric(hit["Value"].iloc[0], errors="coerce")
 
-    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-    with kpi1:
-        st.metric("Revenue YoY", f"{_scalar_value('Revenue YoY'):.2f}%" if np.isfinite(_scalar_value("Revenue YoY")) else "N/A")
-    with kpi2:
-        st.metric("Operating Margin", f"{_scalar_value('Operating Margin'):.2f}%" if np.isfinite(_scalar_value("Operating Margin")) else "N/A")
-    with kpi3:
-        st.metric("Total Cost Ratio", f"{_scalar_value('Total Cost Ratio'):.2f}%" if np.isfinite(_scalar_value("Total Cost Ratio")) else "N/A")
-    with kpi4:
-        st.metric("EPS Surprise", f"{_scalar_value('EPS Surprise'):.2f}%" if np.isfinite(_scalar_value("EPS Surprise")) else "N/A")
+    # Finance sector: firm-specific panel
+    if sector_exact == "Finance":
+        c1, c2, c3, c4, c5 = st.columns(5)
+        with c1:
+            st.metric(
+                "Tier 1 Ratio",
+                f"{_scalar_value('Tier 1 Capital Ratio'):.2f}%" if np.isfinite(_scalar_value("Tier 1 Capital Ratio")) else "N/A",
+            )
+        with c2:
+            st.metric(
+                "Dividend Yield",
+                f"{_scalar_value('Dividend Yield'):.2f}%" if np.isfinite(_scalar_value("Dividend Yield")) else "N/A",
+            )
+        with c3:
+            st.metric(
+                "Buyback Yield (approx)",
+                f"{_scalar_value('Buyback Yield (approx)'):.2f}%" if np.isfinite(_scalar_value("Buyback Yield (approx)")) else "N/A",
+            )
+        with c4:
+            st.metric(
+                "P/B",
+                f"{_scalar_value('Price/Book'):.2f}x" if np.isfinite(_scalar_value("Price/Book")) else "N/A",
+            )
+        with c5:
+            st.metric(
+                "ROE",
+                f"{_scalar_value('Return on Equity'):.2f}%" if np.isfinite(_scalar_value("Return on Equity")) else "N/A",
+            )
 
-    st.markdown("#### Earnings Surprise History")
-    es = fetch_earnings_surprise_history(ticker_sel, limit=28)
-    if es is None or es.empty:
-        st.info("No earnings surprise history available from Yahoo/yfinance for this ticker.")
-    else:
-        es2 = es.rename(columns={"earnings_date": "date", "surprise_pct": "value"}).copy()
-        es2["date"] = pd.to_datetime(es2["date"], errors="coerce")
-        es2["value"] = pd.to_numeric(es2["value"], errors="coerce")
-        es2 = es2.dropna(subset=["date", "value"]).sort_values("date")
-        fig = px.line(es2, x="date", y="value", title="Earnings Surprise (%)")
-        fig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(fig, use_container_width=True)
-
-    if sector_exact == "Medical":
-        st.markdown("#### Policy + FDA Approvals News")
-        news_window_label = st.selectbox("Medical catalysts news window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="med_news_window")
+        st.markdown("#### Buyback Announcements (News)")
+        news_window_label_fin = st.selectbox(
+            "Buyback news window",
+            ["1w", "2w", "1m", "2m", "3m"],
+            index=0,
+            key="fin_buyback_news_window",
+        )
         days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
-        news_days = days_map.get(news_window_label, 7)
+        fin_days = days_map.get(news_window_label_fin, 7)
 
-        q_policy_fda = (
+        q_buyback = (
             f'({ticker_sel} OR "{co_name}") '
-            f'(FDA approval OR PDUFA OR "complete response letter" OR CRL OR "FDA decision" '
-            f'OR "advisory committee" OR CMS OR Medicare OR Medicaid OR "healthcare policy")'
+            f'("share repurchase" OR "share buyback" OR "repurchase program" OR '
+            f'"repurchase authorization" OR "accelerated share repurchase" OR ASR OR "buyback program")'
         )
-        n1 = fetch_google_news_rss_query(q_policy_fda, days=news_days)
-        if n1 is None or n1.empty:
-            st.write("No recent policy/FDA-related RSS news found.")
+        bb_news = fetch_google_news_rss_query(q_buyback, days=fin_days)
+        if bb_news is None or bb_news.empty:
+            st.info("No recent buyback-announcement RSS headlines found.")
         else:
-            n1 = n1.head(20).copy()
-            for _, n in n1.iterrows():
+            bb_news = bb_news.head(20).copy()
+            for _, n in bb_news.iterrows():
                 t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
                 t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
                 title = str(n.get("title", ""))
@@ -1574,31 +1540,93 @@ with tab_stock:
                 src = str(n.get("source", ""))
                 st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
 
-        st.markdown("#### M&A News")
-        q_ma = (
-            f'({ticker_sel} OR "{co_name}") '
-            f'(acquisition OR acquire OR merger OR "merger agreement" OR "strategic review" '
-            f'OR takeover OR "go-private")'
-        )
-        n2 = fetch_google_news_rss_query(q_ma, days=news_days)
-        if n2 is None or n2.empty:
-            st.write("No recent M&A RSS news found.")
+        st.markdown("#### Earnings Surprise History")
+        es = fetch_earnings_surprise_history(ticker_sel, limit=28)
+        if es is None or es.empty:
+            st.info("No earnings surprise history available from Yahoo/yfinance for this ticker.")
         else:
-            n2 = n2.head(15).copy()
-            for _, n in n2.iterrows():
-                t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
-                t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
-                title = str(n.get("title", ""))
-                link = str(n.get("link", ""))
-                src = str(n.get("source", ""))
-                st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
+            es2 = es.rename(columns={"earnings_date": "date", "surprise_pct": "value"}).copy()
+            es2["date"] = pd.to_datetime(es2["date"], errors="coerce")
+            es2["value"] = pd.to_numeric(es2["value"], errors="coerce")
+            es2 = es2.dropna(subset=["date", "value"]).sort_values("date")
+            fig = px.line(es2, x="date", y="value", title="Earnings Surprise (%)")
+            fig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown("#### FDA Decision Calendar")
-        fda_cal = fetch_fda_calendar(ticker_sel, company_name=co_name)
-        if fda_cal is None or fda_cal.empty:
-            st.info("No FDA calendar rows found (source may be blocked or changed).")
+    # All other sectors: keep original KPIs
+    else:
+        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+        with kpi1:
+            st.metric("Revenue YoY", f"{_scalar_value('Revenue YoY'):.2f}%" if np.isfinite(_scalar_value("Revenue YoY")) else "N/A")
+        with kpi2:
+            st.metric("Operating Margin", f"{_scalar_value('Operating Margin'):.2f}%" if np.isfinite(_scalar_value("Operating Margin")) else "N/A")
+        with kpi3:
+            st.metric("Total Cost Ratio", f"{_scalar_value('Total Cost Ratio'):.2f}%" if np.isfinite(_scalar_value("Total Cost Ratio")) else "N/A")
+        with kpi4:
+            st.metric("EPS Surprise", f"{_scalar_value('EPS Surprise'):.2f}%" if np.isfinite(_scalar_value("EPS Surprise")) else "N/A")
+
+        st.markdown("#### Earnings Surprise History")
+        es = fetch_earnings_surprise_history(ticker_sel, limit=28)
+        if es is None or es.empty:
+            st.info("No earnings surprise history available from Yahoo/yfinance for this ticker.")
         else:
-            st.dataframe(fda_cal, use_container_width=True, height=240)
+            es2 = es.rename(columns={"earnings_date": "date", "surprise_pct": "value"}).copy()
+            es2["date"] = pd.to_datetime(es2["date"], errors="coerce")
+            es2["value"] = pd.to_numeric(es2["value"], errors="coerce")
+            es2 = es2.dropna(subset=["date", "value"]).sort_values("date")
+            fig = px.line(es2, x="date", y="value", title="Earnings Surprise (%)")
+            fig.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+        if sector_exact == "Medical":
+            st.markdown("#### Policy + FDA Approvals News")
+            news_window_label = st.selectbox("Medical catalysts news window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="med_news_window")
+            days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
+            news_days = days_map.get(news_window_label, 7)
+
+            q_policy_fda = (
+                f'({ticker_sel} OR "{co_name}") '
+                f'(FDA approval OR PDUFA OR "complete response letter" OR CRL OR "FDA decision" '
+                f'OR "advisory committee" OR CMS OR Medicare OR Medicaid OR "healthcare policy")'
+            )
+            n1 = fetch_google_news_rss_query(q_policy_fda, days=news_days)
+            if n1 is None or n1.empty:
+                st.write("No recent policy/FDA-related RSS news found.")
+            else:
+                n1 = n1.head(20).copy()
+                for _, n in n1.iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    title = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
+
+            st.markdown("#### M&A News")
+            q_ma = (
+                f'({ticker_sel} OR "{co_name}") '
+                f'(acquisition OR acquire OR merger OR "merger agreement" OR "strategic review" '
+                f'OR takeover OR "go-private")'
+            )
+            n2 = fetch_google_news_rss_query(q_ma, days=news_days)
+            if n2 is None or n2.empty:
+                st.write("No recent M&A RSS news found.")
+            else:
+                n2 = n2.head(15).copy()
+                for _, n in n2.iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    title = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
+
+            st.markdown("#### FDA Decision Calendar")
+            fda_cal = fetch_fda_calendar(ticker_sel, company_name=co_name)
+            if fda_cal is None or fda_cal.empty:
+                st.info("No FDA calendar rows found (source may be blocked or changed).")
+            else:
+                st.dataframe(fda_cal, use_container_width=True, height=240)
 
 # =========================
 # Technical Analysis
