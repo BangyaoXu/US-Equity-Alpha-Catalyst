@@ -498,6 +498,69 @@ def fetch_html(url: str, timeout=12) -> Optional[str]:
         return None
 
 # =========================
+# TradingEconomics Historical API (guest:guest)
+# =========================
+@st.cache_data(ttl=12 * 60 * 60)
+def fetch_tradingeconomics_hist_via_api(country_slug: str, indicator_slug: str) -> pd.DataFrame:
+    """
+    Uses TradingEconomics historical endpoint (guest:guest) and returns df(date,value).
+    country_slug: e.g. 'united-states', 'china'
+    indicator_slug: e.g. 'manufacturing-pmi'
+    """
+    country = (country_slug or "").strip().lower()
+    ind_slug = (indicator_slug or "").strip().lower()
+    if not country or not ind_slug:
+        return pd.DataFrame()
+
+    # Convert slug -> indicator string used by TE API
+    # e.g. 'manufacturing-pmi' -> 'manufacturing pmi'
+    indicator = ind_slug.replace("-", " ").strip()
+
+    # Historical endpoint supports guest:guest and CSV
+    api_url = (
+        "https://api.tradingeconomics.com/historical/"
+        f"country/{requests.utils.quote(country)}/indicator/{requests.utils.quote(indicator)}"
+        "?c=guest:guest&f=csv"
+    )
+
+    txt = _get_text(api_url, timeout=25, retries=3)
+    if not txt:
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(StringIO(txt))
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        # TE CSV typically includes DateTime and Close (or Value)
+        dt_col = None
+        for c in df.columns:
+            if str(c).strip().lower() == "datetime":
+                dt_col = c
+                break
+
+        val_col = None
+        for cand in ["close", "value"]:
+            for c in df.columns:
+                if str(c).strip().lower() == cand:
+                    val_col = c
+                    break
+            if val_col:
+                break
+
+        if not dt_col or not val_col:
+            return pd.DataFrame()
+
+        out = df[[dt_col, val_col]].copy()
+        out.columns = ["date", "value"]
+        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+        out["value"] = pd.to_numeric(out["value"], errors="coerce")
+        out = out.dropna(subset=["date", "value"]).sort_values("date").drop_duplicates(subset=["date"], keep="last")
+        return out
+    except Exception:
+        return pd.DataFrame()
+
+# =========================
 # TradingEconomics (PMI) – best-effort HTML table scrape (used by Basic Materials only)
 # =========================
 @st.cache_data(ttl=12 * 60 * 60)
@@ -1324,6 +1387,17 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
 
         if s.upper().startswith("TE:"):
             url = s.split(":", 1)[1].strip()
+            try:
+                # Expect: https://tradingeconomics.com/<country>/<indicator>
+                m = re.search(r"tradingeconomics\.com/([^/]+)/([^/?#]+)", url, flags=re.I)
+                if m:
+                    country_slug = m.group(1).strip().lower()
+                    indicator_slug = m.group(2).strip().lower()
+                    df_api = fetch_tradingeconomics_hist_via_api(country_slug, indicator_slug)
+                    if df_api is not None and not df_api.empty:
+                        return df_api[["date", "value"]].copy()
+            except Exception:
+                pass
             df = fetch_tradingeconomics_hist_from_page(url)
             if df is None or df.empty:
                 return None
