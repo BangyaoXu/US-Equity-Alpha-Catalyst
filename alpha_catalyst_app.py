@@ -2095,6 +2095,7 @@ with tab_stock:
 
         if sector_exact == "Business Services":
             st.markdown("#### Margins: EBITDA vs Operating")
+            ts = fetch_business_services_fundamentals(ticker_sel)
             opm_df = ts.get("operating_margin_pct", pd.DataFrame())
             ebdm_df = ts.get("ebitda_margin_pct", pd.DataFrame())
 
