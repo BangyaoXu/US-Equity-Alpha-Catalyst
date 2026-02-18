@@ -1309,8 +1309,6 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
             ("GC=F", "Gold Futures"),
             ("HG=F", "Copper Futures"),
             ("DX-Y.NYB", "US Dollar Index (DXY)"),
-            ("TE:https://tradingeconomics.com/united-states/manufacturing-pmi", "US Manufacturing PMI"),
-            ("TE:https://tradingeconomics.com/china/manufacturing-pmi", "China Manufacturing PMI"),
         ],
         "Energy": [("CL=F", "WTI Crude"), ("NG=F", "Natural Gas")],
         "Transportation": [("CL=F", "WTI Crude"), ("BZ=F", "Brent Crude")],
