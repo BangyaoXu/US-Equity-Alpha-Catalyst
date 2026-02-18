@@ -2094,17 +2094,6 @@ with tab_stock:
                 st.dataframe(fda_cal, use_container_width=True, height=240)
 
         if sector_exact == "Business Services":
-            st.markdown("#### Revenue YoY History")
-            ts = fetch_business_services_fundamentals(ticker_sel)
-
-            rev_yoy_df = ts.get("revenue_yoy_pct", pd.DataFrame())
-            if rev_yoy_df is None or rev_yoy_df.empty:
-                st.info("Revenue YoY history unavailable (quarterly revenue series missing).")
-            else:
-                fig_rev = px.line(rev_yoy_df, x="date", y="value", title="Quarterly Revenue YoY (%)")
-                fig_rev.update_layout(height=260, margin=dict(l=10, r=10, t=50, b=10))
-                st.plotly_chart(fig_rev, use_container_width=True, key="bs_rev_yoy")
-
             st.markdown("#### Margins: EBITDA vs Operating")
             opm_df = ts.get("operating_margin_pct", pd.DataFrame())
             ebdm_df = ts.get("ebitda_margin_pct", pd.DataFrame())
@@ -2147,7 +2136,7 @@ with tab_stock:
                     src = str(n.get("source", ""))
                     st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
 
-            st.markdown("#### Book-to-Bill / Backlog / Bookings / Retention (Best-effort)")
+            st.markdown("#### Book-to-Bill / Backlog / Bookings / Retention")
             ops = fetch_business_services_operational_kpis_best_effort(ticker_sel) or {}
 
             def _fmt_num(x, kind="num"):
