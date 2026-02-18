@@ -1660,6 +1660,57 @@ with tab_stock:
             return np.nan
         return pd.to_numeric(hit["Value"].iloc[0], errors="coerce")
 
+    def _fmt_value(ind: str, kind: str) -> str:
+        v = _scalar_value(ind)
+        if not np.isfinite(v):
+            return "N/A"
+        if kind == "pct":
+            return f"{v:.2f}%"
+        if kind == "x":
+            return f"{v:.2f}x"
+        if kind == "usd":
+            # show as dollars, no decimals by default
+            return f"${v:,.0f}"
+        if kind == "num":
+            return f"{v:.2f}"
+        if kind == "days":
+            return f"{v:.0f}d"
+        return str(v)
+
+    def sector_kpi_config(sector: str) -> List[Tuple[str, str, str]]:
+        """
+        Returns list of (label, indicator_name_in_scalars_df, kind)
+        kind in: pct, x, usd, num, days
+        """
+        s = (sector or "").strip()
+
+        if s == "Basic Materials":
+            # REMOVE: Revenue YoY / Operating Margin / Total Cost Ratio / EPS Surprise
+            # Also no "Valuation (Basic Materials)"
+            return [
+                ("Gross Margin", "Gross Margin", "pct"),
+                ("Days Inventory", "Days Inventory", "days"),
+                ("Days Sales Outstanding", "Days Sales Outstanding", "days"),
+                ("Free Cash Flow", "Free Cash Flow", "usd"),
+            ]
+
+        if s == "Medical":
+            # Keep Medical-specific: use more relevant KPIs (and keep the Medical extra sections below)
+            return [
+                ("Revenue YoY", "Revenue YoY", "pct"),
+                ("R&D Intensity", "R&D Intensity", "pct"),
+                ("Gross Margin", "Gross Margin", "pct"),
+                ("EPS Surprise", "EPS Surprise", "pct"),
+            ]
+
+        # Default for other non-Finance sectors (your current behavior)
+        return [
+            ("Revenue YoY", "Revenue YoY", "pct"),
+            ("Operating Margin", "Operating Margin", "pct"),
+            ("Total Cost Ratio", "Total Cost Ratio", "pct"),
+            ("EPS Surprise", "EPS Surprise", "pct"),
+        ]
+    
     if sector_exact == "Finance":
         c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
@@ -1696,26 +1747,15 @@ with tab_stock:
                 st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
 
     else:
-        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-        with kpi1:
-            st.metric("Revenue YoY", f"{_scalar_value('Revenue YoY'):.2f}%" if np.isfinite(_scalar_value("Revenue YoY")) else "N/A")
-        with kpi2:
-            st.metric("Operating Margin", f"{_scalar_value('Operating Margin'):.2f}%" if np.isfinite(_scalar_value("Operating Margin")) else "N/A")
-        with kpi3:
-            st.metric("Total Cost Ratio", f"{_scalar_value('Total Cost Ratio'):.2f}%" if np.isfinite(_scalar_value("Total Cost Ratio")) else "N/A")
-        with kpi4:
-            st.metric("EPS Surprise", f"{_scalar_value('EPS Surprise'):.2f}%" if np.isfinite(_scalar_value("EPS Surprise")) else "N/A")
+        kpis = sector_kpi_config(sector_exact)
 
-        if sector_exact == "Basic Materials":
-            st.markdown("#### Valuation (Basic Materials)")
-            v1, v2, v3 = st.columns(3)
-            with v1:
-                st.metric("P/B", f"{_scalar_value('Price/Book'):.2f}x" if np.isfinite(_scalar_value("Price/Book")) else "N/A")
-            with v2:
-                st.metric("EV/EBITDA", f"{_scalar_value('EV/EBITDA'):.2f}x" if np.isfinite(_scalar_value("EV/EBITDA")) else "N/A")
-            with v3:
-                st.metric("Net Asset Value (proxy, BVPS)", f"{_scalar_value('Net Asset Value (proxy, BVPS)'):.2f}" if np.isfinite(_scalar_value("Net Asset Value (proxy, BVPS)")) else "N/A")
-            st.caption("NAV shown is a **BVPS proxy** from Yahoo fields (not a full NAV model).")
+        # Render KPI row (4 columns if >=4, otherwise fit to size)
+        ncols = max(1, min(4, len(kpis)))
+        cols = st.columns(ncols)
+
+        for i, (label, indicator, kind) in enumerate(kpis):
+            with cols[i % ncols]:
+                st.metric(label, _fmt_value(indicator, kind))
 
         if sector_exact == "Medical":
             st.markdown("#### Earnings Surprise History")
@@ -1732,7 +1772,9 @@ with tab_stock:
                 st.plotly_chart(fig_es, use_container_width=True, key="earn_surprise_med")
 
             st.markdown("#### Policy + FDA Approvals News")
-            news_window_label = st.selectbox("Medical catalysts news window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="med_news_window")
+            news_window_label = st.selectbox(
+                "Medical catalysts news window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="med_news_window"
+            )
             days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
             news_days = days_map.get(news_window_label, 7)
 
