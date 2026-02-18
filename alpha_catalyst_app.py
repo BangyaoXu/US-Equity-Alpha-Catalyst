@@ -1688,12 +1688,12 @@ with tab_stock:
             # REMOVE: Revenue YoY / Operating Margin / Total Cost Ratio / EPS Surprise
             # Also no "Valuation (Basic Materials)"
             return [
-                ("Gross Margin", "Gross Margin", "pct"),
+                ("P/B", "Price/Book", "x"),
+                ("EV/EBITDA", "EV/EBITDA", "x"),
                 ("Days Inventory", "Days Inventory", "days"),
                 ("Days Sales Outstanding", "Days Sales Outstanding", "days"),
-                ("Free Cash Flow", "Free Cash Flow", "usd"),
             ]
-
+        
         if s == "Medical":
             # Keep Medical-specific: use more relevant KPIs (and keep the Medical extra sections below)
             return [
