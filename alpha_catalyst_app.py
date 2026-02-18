@@ -656,6 +656,195 @@ def extract_ir_news_links(ir_url: str, max_links=10) -> List[Tuple[str, str]]:
     return out
 
 # =========================
+# Business Services: fundamentals time series + best-effort operational KPIs
+# =========================
+@st.cache_data(ttl=CACHE_TTL_SECTOR)
+def fetch_business_services_fundamentals(sym: str) -> Dict[str, pd.DataFrame]:
+    """
+    Returns time series dataframes (date,value) for:
+      - revenue_yoy_pct
+      - operating_margin_pct
+      - ebitda_margin_pct (best-effort, may be empty)
+    Uses Yahoo quarterly_financials rows.
+    """
+    sym = normalize_yf_ticker(sym)
+    inc = yf_quarterly_income(sym)
+
+    def _series_to_df(s: Optional[pd.Series]) -> pd.DataFrame:
+        if s is None or not isinstance(s, pd.Series):
+            return pd.DataFrame()
+        x = s.dropna().sort_index()
+        if x.empty:
+            return pd.DataFrame()
+        out = pd.DataFrame({"date": pd.to_datetime(x.index, errors="coerce"), "value": pd.to_numeric(x.values, errors="coerce")})
+        out = out.dropna(subset=["date", "value"]).sort_values("date")
+        return out
+
+    rev_s = _row_get(inc, ["total revenue", "totalrevenue", "revenue"])
+    opinc_s = _row_get(inc, ["operating income", "operatingincome"])
+    ebitda_s = _row_get(inc, ["ebitda"])  # often missing on Yahoo quarterly_financials
+
+    # Revenue YoY (%) series: compare quarter t vs t-4
+    rev_yoy = pd.Series(dtype=float)
+    if rev_s is not None:
+        r = pd.to_numeric(rev_s, errors="coerce").dropna().sort_index()
+        if r.shape[0] >= 5:
+            rev_yoy = (r / r.shift(4) - 1.0) * 100.0
+
+    # Operating margin (%) series
+    op_margin = pd.Series(dtype=float)
+    if opinc_s is not None and rev_s is not None:
+        a = pd.to_numeric(opinc_s, errors="coerce").dropna().sort_index()
+        b = pd.to_numeric(rev_s, errors="coerce").dropna().sort_index()
+        df = pd.concat([a, b], axis=1, join="inner")
+        if not df.empty:
+            op_margin = (df.iloc[:, 0] / df.iloc[:, 1].replace(0, np.nan)) * 100.0
+
+    # EBITDA margin (%) series (best-effort)
+    ebitda_margin = pd.Series(dtype=float)
+    if ebitda_s is not None and rev_s is not None:
+        a = pd.to_numeric(ebitda_s, errors="coerce").dropna().sort_index()
+        b = pd.to_numeric(rev_s, errors="coerce").dropna().sort_index()
+        df = pd.concat([a, b], axis=1, join="inner")
+        if not df.empty:
+            ebitda_margin = (df.iloc[:, 0] / df.iloc[:, 1].replace(0, np.nan)) * 100.0
+
+    return {
+        "revenue_yoy_pct": _series_to_df(rev_yoy),
+        "operating_margin_pct": _series_to_df(op_margin),
+        "ebitda_margin_pct": _series_to_df(ebitda_margin),
+    }
+
+@st.cache_data(ttl=24 * 60 * 60)
+def fetch_business_services_operational_kpis_best_effort(ticker: str) -> Dict[str, float]:
+    """
+    Best-effort extraction from SEC XBRL companyfacts.
+    Many of these are NON-GAAP / not standardized => often unavailable.
+
+    Returns:
+      - backlog_latest
+      - backlog_yoy_pct
+      - bookings_latest
+      - bookings_yoy_pct
+      - book_to_bill
+      - retention_rate_pct
+      - renewal_rate_pct
+    """
+    out = {
+        "backlog_latest": np.nan,
+        "backlog_yoy_pct": np.nan,
+        "bookings_latest": np.nan,
+        "bookings_yoy_pct": np.nan,
+        "book_to_bill": np.nan,
+        "retention_rate_pct": np.nan,
+        "renewal_rate_pct": np.nan,
+    }
+
+    sym = normalize_yf_ticker(ticker)
+    cik_int = _resolve_cik_for_ticker(sym)
+    if cik_int is None:
+        return out
+
+    cf = fetch_sec_companyfacts(int(cik_int))
+
+    # --- Backlog proxies (common-ish tags; not guaranteed) ---
+    backlog_tags = [
+        "TransactionPriceAllocatedToRemainingPerformanceObligations",
+        "RevenueRemainingPerformanceObligation",
+        "RemainingPerformanceObligation",
+        "RemainingPerformanceObligationCurrent",
+        "RemainingPerformanceObligationNoncurrent",
+        "Backlog",
+    ]
+
+    # --- Bookings / orders proxies (rare; not guaranteed) ---
+    bookings_tags = [
+        "Orders",
+        "OrderBacklog",
+        "SalesOrderBacklog",
+        "ContractWithCustomerLiability",  # sometimes used as a pipeline proxy, very imperfect
+    ]
+
+    def _latest_and_yoy(companyfacts: dict, tags: List[str]) -> Tuple[float, float]:
+        """
+        Return (latest_value, yoy_pct) best-effort by scanning all facts units arrays.
+        """
+        if not companyfacts:
+            return (np.nan, np.nan)
+
+        facts = (companyfacts.get("facts") or {})
+        # merge all namespaces to scan (us-gaap first)
+        namespaces = []
+        if "us-gaap" in facts and isinstance(facts["us-gaap"], dict):
+            namespaces.append(("us-gaap", facts["us-gaap"]))
+        for ns, ns_obj in facts.items():
+            if ns == "us-gaap":
+                continue
+            if isinstance(ns_obj, dict):
+                namespaces.append((ns, ns_obj))
+
+        # collect candidate points (end_date_str, value)
+        pts: List[Tuple[str, float]] = []
+        for _, ns_obj in namespaces:
+            for tag in tags:
+                obj = ns_obj.get(tag)
+                if not obj:
+                    continue
+                units = obj.get("units") or {}
+                for _, arr in units.items():
+                    if not isinstance(arr, list):
+                        continue
+                    for it in arr:
+                        v = it.get("val", None)
+                        end = it.get("end", None) or it.get("fy", None) or it.get("fp", None)
+                        if v is None or end is None:
+                            continue
+                        try:
+                            vv = float(v)
+                        except Exception:
+                            continue
+                        if not np.isfinite(vv):
+                            continue
+                        pts.append((str(end), vv))
+
+        if not pts:
+            return (np.nan, np.nan)
+
+        pts.sort(key=lambda x: x[0])
+        latest_key, latest_val = pts[-1]
+        # find ~1y earlier by key prefix match (best-effort string compare)
+        # If keys are ISO dates, just use the last that is <= (latest_year-1)
+        yoy = np.nan
+        try:
+            latest_year = int(latest_key[:4])
+            target_year = latest_year - 1
+            prev_candidates = [p for p in pts if p[0].startswith(str(target_year))]
+            if prev_candidates:
+                prev_key, prev_val = prev_candidates[-1]
+                if np.isfinite(prev_val) and prev_val != 0:
+                    yoy = (latest_val / prev_val - 1.0) * 100.0
+        except Exception:
+            pass
+
+        return (latest_val, yoy)
+
+    backlog_latest, backlog_yoy = _latest_and_yoy(cf, backlog_tags)
+    bookings_latest, bookings_yoy = _latest_and_yoy(cf, bookings_tags)
+
+    out["backlog_latest"] = backlog_latest
+    out["backlog_yoy_pct"] = backlog_yoy
+    out["bookings_latest"] = bookings_latest
+    out["bookings_yoy_pct"] = bookings_yoy
+
+    # Book-to-bill = bookings / revenue (revenue from SEC facts)
+    rev_latest = _latest_fact_value(cf, ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"])
+    if np.isfinite(bookings_latest) and np.isfinite(rev_latest) and rev_latest != 0:
+        out["book_to_bill"] = bookings_latest / rev_latest
+
+    # Retention / renewal: typically not XBRL standardized -> leave NaN unless you add custom tags later
+    return out
+
+# =========================
 # FDA decision calendar scraping (best-effort)
 # =========================
 @st.cache_data(ttl=6 * 60 * 60)
@@ -1194,6 +1383,10 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
     om = _q_margin_pct(opinc_s, rev_s) if opinc_s is not None and rev_s is not None else np.nan
     add_scalar("Operating Margin", om, unit="%", update="Quarterly")
 
+    ebitda_s = _row_get(inc, ["ebitda"])
+    ebitda_margin = _q_margin_pct(ebitda_s, rev_s) if ebitda_s is not None and rev_s is not None else np.nan
+    add_scalar("EBITDA Margin", ebitda_margin, unit="%", update="Quarterly", source="Yahoo Finance via yfinance (quarterly_financials)")
+    
     cost_ratio = (100.0 - om) if np.isfinite(om) else np.nan
     add_scalar("Total Cost Ratio", cost_ratio, unit="%", update="Quarterly")
 
@@ -1775,6 +1968,14 @@ with tab_stock:
                 ("EPS Surprise", "EPS Surprise", "pct"),
             ]
 
+        if s == "Business Services":
+            return [
+                ("Revenue YoY", "Revenue YoY", "pct"),
+                ("EBITDA Margin", "EBITDA Margin", "pct"),   # we'll add this scalar next
+                ("Operating Margin", "Operating Margin", "pct"),
+                ("EV/EBITDA", "EV/EBITDA", "x"),
+            ]
+
         # Default for other non-Finance sectors (your current behavior)
         return [
             ("Revenue YoY", "Revenue YoY", "pct"),
@@ -1891,6 +2092,91 @@ with tab_stock:
                 st.info("No FDA calendar rows found (source may be blocked or changed).")
             else:
                 st.dataframe(fda_cal, use_container_width=True, height=240)
+
+        if sector_exact == "Business Services":
+            st.markdown("#### Revenue YoY History")
+            ts = fetch_business_services_fundamentals(ticker_sel)
+
+            rev_yoy_df = ts.get("revenue_yoy_pct", pd.DataFrame())
+            if rev_yoy_df is None or rev_yoy_df.empty:
+                st.info("Revenue YoY history unavailable (quarterly revenue series missing).")
+            else:
+                fig_rev = px.line(rev_yoy_df, x="date", y="value", title="Quarterly Revenue YoY (%)")
+                fig_rev.update_layout(height=260, margin=dict(l=10, r=10, t=50, b=10))
+                st.plotly_chart(fig_rev, use_container_width=True, key="bs_rev_yoy")
+
+            st.markdown("#### Margins: EBITDA vs Operating")
+            opm_df = ts.get("operating_margin_pct", pd.DataFrame())
+            ebdm_df = ts.get("ebitda_margin_pct", pd.DataFrame())
+
+            mdfs = []
+            if opm_df is not None and not opm_df.empty:
+                a = opm_df.rename(columns={"value": "Operating Margin"}).set_index("date")
+                mdfs.append(a)
+            if ebdm_df is not None and not ebdm_df.empty:
+                b = ebdm_df.rename(columns={"value": "EBITDA Margin"}).set_index("date")
+                mdfs.append(b)
+
+            if not mdfs:
+                st.info("Margin history unavailable (EBITDA and/or operating income series missing).")
+            else:
+                m = pd.concat(mdfs, axis=1).reset_index().sort_values("date")
+                fig_m = px.line(m, x="date", y=[c for c in m.columns if c != "date"], title="Margins (%)")
+                fig_m.update_layout(height=280, margin=dict(l=10, r=10, t=50, b=10))
+                st.plotly_chart(fig_m, use_container_width=True, key="bs_margins")
+
+            st.markdown("#### M&A News")
+            news_window_label_bs = st.selectbox("M&A news window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="bs_ma_news_window")
+            days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
+            bs_days = days_map.get(news_window_label_bs, 7)
+
+            q_bs_ma = (
+                f'({ticker_sel} OR "{co_name}") '
+                f'(acquisition OR acquire OR merger OR "merger agreement" OR "strategic review" '
+                f'OR takeover OR "deal" OR "divestiture" OR "asset sale")'
+            )
+            bs_ma = fetch_google_news_rss_query(q_bs_ma, days=bs_days)
+            if bs_ma is None or bs_ma.empty:
+                st.info("No recent M&A RSS headlines found.")
+            else:
+                for _, n in bs_ma.head(20).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    title = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
+
+            st.markdown("#### Book-to-Bill / Backlog / Bookings / Retention (Best-effort)")
+            ops = fetch_business_services_operational_kpis_best_effort(ticker_sel) or {}
+
+            def _fmt_num(x, kind="num"):
+                try:
+                    x = float(x)
+                except Exception:
+                    return "N/A"
+                if not np.isfinite(x):
+                    return "N/A"
+                if kind == "pct":
+                    return f"{x:.2f}%"
+                if kind == "x":
+                    return f"{x:.2f}x"
+                if kind == "usd":
+                    return f"${x:,.0f}"
+                return f"{x:.2f}"
+
+            ops_tbl = pd.DataFrame([{
+                "Book-to-Bill": _fmt_num(ops.get("book_to_bill", np.nan), "x"),
+                "Backlog (latest)": _fmt_num(ops.get("backlog_latest", np.nan), "usd"),
+                "Backlog YoY": _fmt_num(ops.get("backlog_yoy_pct", np.nan), "pct"),
+                "Bookings (latest)": _fmt_num(ops.get("bookings_latest", np.nan), "usd"),
+                "Bookings YoY": _fmt_num(ops.get("bookings_yoy_pct", np.nan), "pct"),
+                "Client retention": _fmt_num(ops.get("retention_rate_pct", np.nan), "pct"),
+                "Renewal rate": _fmt_num(ops.get("renewal_rate_pct", np.nan), "pct"),
+            }])
+
+            st.dataframe(ops_tbl, use_container_width=True, height=80)
+            st.caption("Note: book-to-bill/backlog/bookings/retention are often non-standard and may not appear in SEC XBRL; N/A is normal.")
 
 # =========================
 # Technical Analysis
