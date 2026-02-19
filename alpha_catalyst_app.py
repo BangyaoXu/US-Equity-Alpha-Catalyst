@@ -1974,25 +1974,6 @@ with tab_sector:
                 st.plotly_chart(fig, use_container_width=True, key=f"sector_series_{sector_exact}_{i}")
             i += 1
 
-        if sector_exact == "Basic Materials":
-            st.markdown("#### Inventories / Supply (Headlines)")
-            q_supply = (
-                '(LME warehouse stocks OR "LME stock" OR "EIA inventories" OR "crude inventories" '
-                'OR gasoline inventories OR "Baker Hughes rig count" OR rig counts) '
-                'AND (metals OR copper OR aluminum OR steel OR oil OR gasoline)'
-            )
-            supp_news = fetch_google_news_rss_query(q_supply, days=30)
-            if supp_news is None or supp_news.empty:
-                st.info("No recent supply/inventory RSS headlines found.")
-            else:
-                for _, n in supp_news.head(12).iterrows():
-                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
-                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
-                    title = str(n.get("title", ""))
-                    link = str(n.get("link", ""))
-                    src = str(n.get("source", ""))
-                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
-
 with tab_stock:
     def _scalar_value(indicator: str) -> float:
         if scalars_df.empty or "Indicator" not in scalars_df.columns:
@@ -2121,6 +2102,34 @@ with tab_stock:
         for i, (label, indicator, kind) in enumerate(kpis):
             with cols[i % ncols]:
                 st.metric(label, _fmt_value(indicator, kind))
+
+        if sector_exact == "Basic Materials":
+            st.markdown("#### Inventories & Supply News")
+
+            bm_window_label = st.selectbox(
+                "Supply news window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="bm_supply_news_window"
+            )
+            days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
+            bm_days = days_map.get(bm_window_label, 7)
+
+            q_supply = (
+                '(LME warehouse stocks OR "LME stock" OR "EIA inventories" OR "crude inventories" '
+                'OR gasoline inventories OR "Baker Hughes rig count" OR rig counts) '
+                'AND (metals OR copper OR aluminum OR steel OR oil OR gasoline)'
+            )
+
+            supp_news = fetch_google_news_rss_query(q_supply, days=bm_days)
+
+            if supp_news is None or supp_news.empty:
+                st.info("No recent supply/inventory RSS headlines found.")
+            else:
+                for _, n in supp_news.head(16).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    title = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
 
         if sector_exact == "Auto-Tires-Trucks":
             st.markdown("#### Affordability & Incentives Headlines")
