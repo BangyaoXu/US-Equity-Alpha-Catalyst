@@ -2212,7 +2212,7 @@ with tab_stock:
                 fig_es.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10))
                 st.plotly_chart(fig_es, use_container_width=True, key="earn_surprise_tech")
 
-            st.markdown("#### Monthly Semiconductor Sales + Semiconductor Book-to-Bill (Headlines)")
+            st.markdown("#### Monthly Semiconductor Sales + Semiconductor Book-to-Bill Headlines")
             # Note: SEMI discontinued the classic monthly NA book-to-bill in 2017; we track via headlines now.
             tech_window_label = st.selectbox(
                 "Semiconductor headlines window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="tech_semi_news_window"
@@ -2236,7 +2236,7 @@ with tab_stock:
                     src = str(n.get("source", ""))
                     st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
 
-            st.markdown("#### Tech News + Research Reports (Product Launch Reception)")
+            st.markdown("#### Tech Research & Product Launch News")
             launch_window_label = st.selectbox(
                 "Product launch news window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="tech_launch_news_window"
             )
@@ -2261,7 +2261,7 @@ with tab_stock:
                     src = str(n.get("source", ""))
                     st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
 
-            st.markdown("#### Cloud Segment Growth + CAPEX Commentary (Headlines)")
+            st.markdown("#### Cloud Segment Growth + CAPEX Commentary")
             cloud_window_label = st.selectbox(
                 "Cloud/CAPEX news window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="tech_cloud_news_window"
             )
