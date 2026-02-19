@@ -1396,6 +1396,18 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
     dinv = _days_inventory(bal, inc)
     add_scalar("Days Inventory", dinv, unit="days", update="Quarterly")
 
+    inv_s = _row_get(bal, ["inventory"])
+    inv_latest = np.nan
+    inv_yoy = np.nan
+    if inv_s is not None:
+        inv_clean = pd.to_numeric(inv_s, errors="coerce").dropna().sort_index()
+        if not inv_clean.empty:
+            inv_latest = float(inv_clean.iloc[-1])
+        inv_yoy = _q_yoy_growth(inv_s)
+
+    add_scalar("Inventory (latest)", inv_latest, unit="USD", update="Quarterly", source="Yahoo Finance via yfinance (quarterly_balance_sheet)")
+    add_scalar("Inventory YoY", inv_yoy, unit="%", update="Quarterly", source="Yahoo Finance via yfinance (quarterly_balance_sheet)")
+    
     dso = _ar_days(bal, inc)
     add_scalar("Days Sales Outstanding", dso, unit="days", update="Quarterly")
 
@@ -1408,6 +1420,12 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
         fcf_latest = np.nan
     add_scalar("Free Cash Flow", fcf_latest, unit="USD", update="Quarterly")
 
+    mc = _to_num(info.get("marketCap"))
+    fcf_yield = np.nan
+    if np.isfinite(fcf_latest) and np.isfinite(mc) and mc > 0:
+        fcf_yield = (fcf_latest * 4.0) / mc * 100.0
+    add_scalar("FCF Yield (annualized)", fcf_yield, unit="%", update="Quarterly", source="Yahoo cashflow + market cap proxy")
+    
     earn = fetch_earnings_dates_yf(sym, limit=24)
     eps_surp = np.nan
     if earn is not None and not earn.empty:
@@ -1502,6 +1520,10 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
             ("GC=F", "Gold Futures"),
             ("HG=F", "Copper Futures"),
             ("DX-Y.NYB", "US Dollar Index (DXY)"),
+        ],
+        "Computer and Technology": [
+            ("FRED:IPG3344S", "Semiconductor Output (US IP, NAICS 3344)"),
+            ("FRED:CAPUTLG3344S", "Semiconductor Capacity Utilization (NAICS 3344)"),
         ],
         "Energy": [("CL=F", "WTI Crude"), ("NG=F", "Natural Gas")],
         "Transportation": [("CL=F", "WTI Crude"), ("BZ=F", "Brent Crude")],
@@ -1975,7 +1997,15 @@ with tab_stock:
                 ("Operating Margin", "Operating Margin", "pct"),
                 ("EV/EBITDA", "EV/EBITDA", "x"),
             ]
-
+        
+        if s == "Computer and Technology":
+            return [
+                ("Revenue YoY", "Revenue YoY", "pct"),
+                ("FCF Yield", "FCF Yield (annualized)", "pct"),
+                ("Inventory YoY", "Inventory YoY", "pct"),
+                ("EV/EBITDA", "EV/EBITDA", "x"),
+            ]
+        
         # Default for other non-Finance sectors (your current behavior)
         return [
             ("Revenue YoY", "Revenue YoY", "pct"),
@@ -2167,6 +2197,93 @@ with tab_stock:
 
             st.dataframe(ops_tbl, use_container_width=True, height=80)
             st.caption("Note: book-to-bill/backlog/bookings/retention are often non-standard and may not appear in SEC XBRL; N/A is normal.")
+
+        if sector_exact == "Computer and Technology":
+            st.markdown("#### Earnings Surprise History")
+            es = fetch_earnings_surprise_history(ticker_sel, limit=28)
+            if es is None or es.empty:
+                st.info("No earnings surprise history available from Yahoo/yfinance for this ticker.")
+            else:
+                es2 = es.rename(columns={"earnings_date": "date", "surprise_pct": "value"}).copy()
+                es2["date"] = pd.to_datetime(es2["date"], errors="coerce")
+                es2["value"] = pd.to_numeric(es2["value"], errors="coerce")
+                es2 = es2.dropna(subset=["date", "value"]).sort_values("date")
+                fig_es = px.line(es2, x="date", y="value", title="Earnings Surprise (%)")
+                fig_es.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(fig_es, use_container_width=True, key="earn_surprise_tech")
+
+            st.markdown("#### Monthly Semiconductor Sales + Semiconductor Book-to-Bill (Headlines)")
+            # Note: SEMI discontinued the classic monthly NA book-to-bill in 2017; we track via headlines now.
+            tech_window_label = st.selectbox(
+                "Semiconductor headlines window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="tech_semi_news_window"
+            )
+            days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
+            tech_days = days_map.get(tech_window_label, 7)
+
+            q_semi_sales_btb = (
+                '("semiconductor sales" OR WSTS OR "SIA semiconductor sales" OR "chip sales") '
+                'OR ("semiconductor" AND ("book-to-bill" OR "book to bill" OR bookings OR billings))'
+            )
+            semi_news = fetch_google_news_rss_query(q_semi_sales_btb, days=tech_days)
+            if semi_news is None or semi_news.empty:
+                st.info("No recent semiconductor sales / book-to-bill RSS headlines found.")
+            else:
+                for _, n in semi_news.head(18).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    title = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
+
+            st.markdown("#### Tech News + Research Reports (Product Launch Reception)")
+            launch_window_label = st.selectbox(
+                "Product launch news window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="tech_launch_news_window"
+            )
+            launch_days = days_map.get(launch_window_label, 7)
+
+            q_launch = (
+                f'({ticker_sel} OR "{co_name}") '
+                f'("product launch" OR "launch event" OR "reviews" OR "hands-on" OR '
+                f'"first impressions" OR "benchmark" OR "unboxing" OR "preorder" OR '
+                f'"sell-through" OR "demand" OR "channel checks" OR "research note" OR '
+                f'"analyst note" OR "downgrade" OR "upgrade")'
+            )
+            launch_news = fetch_google_news_rss_query(q_launch, days=launch_days)
+            if launch_news is None or launch_news.empty:
+                st.info("No recent product-launch/research RSS headlines found.")
+            else:
+                for _, n in launch_news.head(20).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    title = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
+
+            st.markdown("#### Cloud Segment Growth + CAPEX Commentary (Headlines)")
+            cloud_window_label = st.selectbox(
+                "Cloud/CAPEX news window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="tech_cloud_news_window"
+            )
+            cloud_days = days_map.get(cloud_window_label, 7)
+
+            q_cloud_capex = (
+                f'({ticker_sel} OR "{co_name}") '
+                f'("cloud" OR "AI infrastructure" OR "data center" OR datacenter OR "hyperscale" OR '
+                f'"cloud revenue" OR "cloud growth" OR "ARR" OR "subscription") '
+                f'(capex OR "capital expenditures" OR "capital spending" OR "data center capex" OR "GPU capex")'
+            )
+            cloud_news = fetch_google_news_rss_query(q_cloud_capex, days=cloud_days)
+            if cloud_news is None or cloud_news.empty:
+                st.info("No recent cloud-growth/CAPEX RSS headlines found.")
+            else:
+                for _, n in cloud_news.head(20).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    title = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
 
 # =========================
 # Technical Analysis
