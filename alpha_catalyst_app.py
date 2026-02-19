@@ -2096,7 +2096,14 @@ with tab_stock:
                 ("Inventory YoY", "Inventory YoY", "pct"),
                 ("EV/EBITDA", "EV/EBITDA", "x"),
             ]
-        
+
+        if s == "Auto-Tires-Trucks":
+            return [
+                ("Days Inventory", "Days Inventory", "days"),
+                ("R&D Intensity", "R&D Intensity", "pct"),
+                ("Inventory YoY", "Inventory YoY", "pct"),
+                ("EV/EBITDA", "EV/EBITDA", "x"),
+            ]
         # Default for other non-Finance sectors (your current behavior)
         return [
             ("Revenue YoY", "Revenue YoY", "pct"),
