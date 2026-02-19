@@ -1515,12 +1515,12 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
 
     driver_series_map = {
         "Basic Materials": [
-            ("FRED:DCOILWTICO", "WTI Crude (FRED: DCOILWTICO)"),         # WTI spot :contentReference[oaicite:0]{index=0}
-            ("FRED:DHHNGSP", "Henry Hub Natural Gas (FRED: DHHNGSP)"),   # Nat gas spot :contentReference[oaicite:1]{index=1}
-            ("GC=F", "Gold Futures (Yahoo)"),                            # FRED removed the LBMA Gold/Silver fix series in 2022 → keep Yahoo gold future
-            ("FRED:PCOPPUSDM", "Copper (FRED: PCOPPUSDM)"),              # IMF global copper, monthly :contentReference[oaicite:2]{index=2}
-            ("FRED:PALUMUSDM", "Aluminum (FRED: PALUMUSDM)"),            # IMF global aluminum, monthly :contentReference[oaicite:3]{index=3}
-            ("FRED:DTWEXBGS", "Broad USD Index (FRED: DTWEXBGS)"),        # Fed broad USD index (DXY-like) :contentReference[oaicite:4]{index=4}
+            ("FRED:DCOILWTICO", "WTI Crude (FRED: DCOILWTICO)"),
+            ("FRED:DHHNGSP", "Henry Hub Natural Gas (FRED: DHHNGSP)"),
+            ("GC=F", "Gold Futures (Yahoo)"),
+            ("FRED:PCOPPUSDM", "Copper (FRED: PCOPPUSDM)"),
+            ("FRED:PALUMUSDM", "Aluminum (FRED: PALUMUSDM)"),
+            ("FRED:DTWEXBGS", "Broad USD Index (FRED: DTWEXBGS)"),
         ],
         "Computer and Technology": [
             ("FRED:IPG3344S", "Semiconductor Output (US IP, NAICS 3344)"),
@@ -1549,7 +1549,6 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
             # Loan rates / short-term rates
             ("FRED:TERMCBAUTO48NS", "48-Month New Car Loan Rate"),
             ("FRED:TB3MS", "3-Month T-Bill Rate"),
-            ("FRED:SOFR", "SOFR"),
 
             # Commodities: steel, aluminum, copper, palladium, rubber
             ("FRED:WPU1017", "PPI: Steel Mill Products"),
