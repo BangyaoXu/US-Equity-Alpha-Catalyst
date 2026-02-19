@@ -2212,7 +2212,7 @@ with tab_stock:
                 fig_es.update_layout(height=260, margin=dict(l=10, r=10, t=40, b=10))
                 st.plotly_chart(fig_es, use_container_width=True, key="earn_surprise_tech")
 
-            st.markdown("#### Monthly Semiconductor Sales + Semiconductor Book-to-Bill Headlines")
+            st.markdown("#### Semiconductor Sales & Book-to-Bill Headlines")
             # Note: SEMI discontinued the classic monthly NA book-to-bill in 2017; we track via headlines now.
             tech_window_label = st.selectbox(
                 "Semiconductor headlines window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="tech_semi_news_window"
