@@ -2261,7 +2261,7 @@ with tab_stock:
                     src = str(n.get("source", ""))
                     st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
 
-            st.markdown("#### Cloud Segment Growth + CAPEX Commentary")
+            st.markdown("#### Cloud Segment Growth & CAPEX Commentary")
             cloud_window_label = st.selectbox(
                 "Cloud/CAPEX news window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="tech_cloud_news_window"
             )
