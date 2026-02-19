@@ -1993,42 +1993,6 @@ with tab_sector:
                     src = str(n.get("source", ""))
                     st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
 
-        if sector_exact == "Auto-Tires-Trucks":
-            st.markdown("#### Affordability & Incentives Headlines")
-            q_aff = (
-                '("Cox Automotive" OR "Moody\'s" OR affordability OR "vehicle affordability" '
-                'OR incentives OR "transaction price" OR "monthly payment") '
-                'AND (auto OR "new vehicle" OR car OR truck)'
-            )
-            aff_news = fetch_google_news_rss_query(q_aff, days=45)
-            if aff_news is None or aff_news.empty:
-                st.info("No recent affordability/incentives RSS headlines found.")
-            else:
-                for _, n in aff_news.head(14).iterrows():
-                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
-                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
-                    title = str(n.get("title", ""))
-                    link = str(n.get("link", ""))
-                    src = str(n.get("source", ""))
-                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
-
-            st.markdown("#### EV Adoption & Mix Headlines")
-            q_ev = (
-                '("EV adoption" OR "electric vehicle sales" OR "EV share" OR "plug-in" OR BEV OR PHEV '
-                'OR "charging network" OR "battery demand") AND (US OR United States)'
-            )
-            ev_news = fetch_google_news_rss_query(q_ev, days=30)
-            if ev_news is None or ev_news.empty:
-                st.info("No recent EV adoption RSS headlines found.")
-            else:
-                for _, n in ev_news.head(14).iterrows():
-                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
-                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
-                    title = str(n.get("title", ""))
-                    link = str(n.get("link", ""))
-                    src = str(n.get("source", ""))
-                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
-
 with tab_stock:
     def _scalar_value(indicator: str) -> float:
         if scalars_df.empty or "Indicator" not in scalars_df.columns:
@@ -2157,6 +2121,48 @@ with tab_stock:
         for i, (label, indicator, kind) in enumerate(kpis):
             with cols[i % ncols]:
                 st.metric(label, _fmt_value(indicator, kind))
+
+        if sector_exact == "Auto-Tires-Trucks":
+            st.markdown("#### Affordability & Incentives Headlines")
+            auto_window_label = st.selectbox(
+                "Auto headlines window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="auto_headlines_window"
+            )
+            days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
+            auto_days = days_map.get(auto_window_label, 7)
+
+            q_aff = (
+                '("Cox Automotive" OR "Moody\'s" OR affordability OR "vehicle affordability" '
+                'OR incentives OR "transaction price" OR "monthly payment") '
+                'AND (auto OR "new vehicle" OR car OR truck)'
+            )
+            aff_news = fetch_google_news_rss_query(q_aff, days=auto_days)
+            if aff_news is None or aff_news.empty:
+                st.info("No recent affordability/incentives RSS headlines found.")
+            else:
+                for _, n in aff_news.head(14).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    title = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
+
+            st.markdown("#### EV Adoption & Mix Headlines")
+            q_ev = (
+                '("EV adoption" OR "electric vehicle sales" OR "EV share" OR "plug-in" OR BEV OR PHEV '
+                'OR "charging network" OR "battery demand") AND (US OR "United States")'
+            )
+            ev_news = fetch_google_news_rss_query(q_ev, days=auto_days)
+            if ev_news is None or ev_news.empty:
+                st.info("No recent EV adoption RSS headlines found.")
+            else:
+                for _, n in ev_news.head(14).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    title = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
 
         if sector_exact == "Medical":
             st.markdown("#### Earnings Surprise History")
