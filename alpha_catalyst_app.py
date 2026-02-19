@@ -1537,6 +1537,26 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
             ("FRED:DRCCLACBS", "Credit Card Delinquency Rate"),
             ("FRED:CORCCACBS", "Credit Card Charge-Off Rate"),
         ],
+        "Auto-Tires-Trucks": [
+            ("FRED:TOTALSA", "Auto Sales SAAR (Total Vehicle Sales)"),
+            ("FRED:AISRSA", "Auto Inventory/Sales Ratio (Months of Supply)"),
+
+            # Affordability proxy inputs (we'll derive an index below)
+            ("FRED:CUSR0000SETA01", "CPI: New Vehicles"),
+            ("FRED:CES0500000003", "Avg Hourly Earnings (Total Private)"),
+
+            # Loan rates / short-term rates
+            ("FRED:TERMCBAUTO48NS", "48-Month New Car Loan Rate"),
+            ("FRED:TB3MS", "3-Month T-Bill Rate"),
+            ("FRED:SOFR", "SOFR"),
+
+            # Commodities: steel, aluminum, copper, palladium, rubber
+            ("FRED:WPU1017", "PPI: Steel Mill Products"),
+            ("FRED:PALUMUSDM", "Global Aluminum Price (USD/mt)"),
+            ("FRED:PCOPPUSDM", "Global Copper Price (USD/mt)"),
+            ("PA=F", "Palladium Futures"),
+            ("FRED:PRUBBUSDM", "Global Rubber Price (US cents/lb)"),
+        ],
     }
 
     return {
@@ -1657,6 +1677,41 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
         ser = _any_series(sym)
         if ser is not None and not ser.empty:
             series[label] = ser
+
+    if sector_name_exact == "Auto-Tires-Trucks":
+        # Days supply ≈ (months of supply) * 30.4
+        mos = series.get("Auto Inventory/Sales Ratio (Months of Supply)")
+        if mos is not None and not mos.empty and "value" in mos.columns:
+            ds = mos.copy()
+            ds["value"] = pd.to_numeric(ds["value"], errors="coerce") * 30.4
+            ds = ds.dropna(subset=["date", "value"]).sort_values("date")
+            if not ds.empty:
+                series["Days Supply (derived, days)"] = ds
+
+        # Affordability proxy: (New Vehicle CPI / Avg Hourly Earnings), rebased to 100 at first obs
+        cpi = series.get("CPI: New Vehicles")
+        wage = series.get("Avg Hourly Earnings (Total Private)")
+        if (
+            cpi is not None and not cpi.empty and "value" in cpi.columns
+            and wage is not None and not wage.empty and "value" in wage.columns
+        ):
+            a = cpi.copy()
+            b = wage.copy()
+            a["date"] = pd.to_datetime(a["date"], errors="coerce")
+            b["date"] = pd.to_datetime(b["date"], errors="coerce")
+            a["cpi"] = pd.to_numeric(a["value"], errors="coerce")
+            b["wage"] = pd.to_numeric(b["value"], errors="coerce")
+
+            m = pd.merge(a[["date", "cpi"]], b[["date", "wage"]], on="date", how="inner").dropna()
+            if not m.empty:
+                m["ratio"] = m["cpi"] / m["wage"].replace(0, np.nan)
+                m = m.dropna(subset=["ratio"]).sort_values("date")
+                if not m.empty:
+                    base = float(m["ratio"].iloc[0])
+                    if np.isfinite(base) and base != 0:
+                        m["value"] = (m["ratio"] / base) * 100.0
+                        out = m[["date", "value"]].copy()
+                        series["Affordability Proxy (CPI New Vehicles / Wages, indexed)"] = out
 
     return scalars, series
 
@@ -1931,6 +1986,42 @@ with tab_sector:
                 st.info("No recent supply/inventory RSS headlines found.")
             else:
                 for _, n in supp_news.head(12).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    title = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
+
+        if sector_exact == "Auto-Tires-Trucks":
+            st.markdown("#### Affordability & Incentives Headlines")
+            q_aff = (
+                '("Cox Automotive" OR "Moody\'s" OR affordability OR "vehicle affordability" '
+                'OR incentives OR "transaction price" OR "monthly payment") '
+                'AND (auto OR "new vehicle" OR car OR truck)'
+            )
+            aff_news = fetch_google_news_rss_query(q_aff, days=45)
+            if aff_news is None or aff_news.empty:
+                st.info("No recent affordability/incentives RSS headlines found.")
+            else:
+                for _, n in aff_news.head(14).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    title = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
+
+            st.markdown("#### EV Adoption & Mix Headlines")
+            q_ev = (
+                '("EV adoption" OR "electric vehicle sales" OR "EV share" OR "plug-in" OR BEV OR PHEV '
+                'OR "charging network" OR "battery demand") AND (US OR United States)'
+            )
+            ev_news = fetch_google_news_rss_query(q_ev, days=30)
+            if ev_news is None or ev_news.empty:
+                st.info("No recent EV adoption RSS headlines found.")
+            else:
+                for _, n in ev_news.head(14).iterrows():
                     t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
                     t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
                     title = str(n.get("title", ""))
