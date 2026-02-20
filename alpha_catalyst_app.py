@@ -1527,7 +1527,20 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
             ("FRED:CAPUTLG3344S", "Semiconductor Capacity Utilization (NAICS 3344)"),
         ],
         "Energy": [("CL=F", "WTI Crude"), ("NG=F", "Natural Gas")],
-        "Transportation": [("CL=F", "WTI Crude"), ("BZ=F", "Brent Crude")],
+        "Transportation": [
+            ("FRED:TSIFRGHTC", "Freight Transportation Services Index (TSI, FRED: TSIFRGHTC)"),
+            ("FRED:FRGSHPUSM649NCIS", "Cass Freight Index — Shipments (FRED: FRGSHPUSM649NCIS)"),
+            ("FRED:FRGEXPUSM649NCIS", "Cass Freight Index — Expenditures (FRED: FRGEXPUSM649NCIS)"),
+            ("FRED:ISRATIO", "Total Business: Inventories-to-Sales Ratio (FRED: ISRATIO)"),
+            ("FRED:DCOILWTICO", "WTI Crude (FRED: DCOILWTICO)"),
+            ("FRED:WDFUELUSGULF", "ULSD Diesel Spot (US Gulf Coast, FRED: WDFUELUSGULF)"),
+            ("HO=F", "ULSD Futures (NY Harbor, Yahoo: HO=F)"),
+            ("FRED:WJFUELUSGULF", "Jet Fuel Spot (US Gulf Coast, FRED: WJFUELUSGULF)"),
+            ("FRED:NAPMSDI", "ISM PMI: Supplier Deliveries Index (FRED: NAPMSDI)"),
+            ("^DJT", "Dow Jones Transportation Average (Yahoo: ^DJT)"),
+            ("^GSPC", "S&P 500 (Yahoo: ^GSPC)"),
+            ("BDRY", "Dry Bulk Proxy ETF (BDRY, proxy for Baltic Dry direction)"),
+        ],
         "Aerospace": [("ITA", "Aerospace & Defense ETF")],
         "Construction": [("ITB", "Homebuilders ETF")],
         "Finance": [
@@ -1541,16 +1554,10 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
         "Auto-Tires-Trucks": [
             ("FRED:TOTALSA", "Auto Sales SAAR (Total Vehicle Sales)"),
             ("FRED:AISRSA", "Auto Inventory/Sales Ratio (Months of Supply)"),
-
-            # Affordability proxy inputs (we'll derive an index below)
             ("FRED:CUSR0000SETA01", "CPI: New Vehicles"),
             ("FRED:CES0500000003", "Avg Hourly Earnings (Total Private)"),
-
-            # Loan rates / short-term rates
             ("FRED:TERMCBAUTO48NS", "48-Month New Car Loan Rate"),
             ("FRED:TB3MS", "3-Month T-Bill Rate"),
-
-            # Commodities: steel, aluminum, copper, palladium, rubber
             ("FRED:WPU1017", "PPI: Steel Mill Products"),
             ("FRED:PALUMUSDM", "Global Aluminum Price (USD/mt)"),
             ("FRED:PCOPPUSDM", "Global Copper Price (USD/mt)"),
@@ -1677,6 +1684,33 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
         ser = _any_series(sym)
         if ser is not None and not ser.empty:
             series[label] = ser
+
+    if sector_name_exact == "Transportation":
+        # DJTA / S&P 500 ratio (indexed to 100 at first common observation)
+        djt = series.get("Dow Jones Transportation Average (Yahoo: ^DJT)")
+        spx = series.get("S&P 500 (Yahoo: ^GSPC)")
+
+        if (
+            djt is not None and not djt.empty and "value" in djt.columns
+            and spx is not None and not spx.empty and "value" in spx.columns
+        ):
+            a = djt.copy()
+            b = spx.copy()
+            a["date"] = pd.to_datetime(a["date"], errors="coerce")
+            b["date"] = pd.to_datetime(b["date"], errors="coerce")
+            a["djt"] = pd.to_numeric(a["value"], errors="coerce")
+            b["spx"] = pd.to_numeric(b["value"], errors="coerce")
+
+            m = pd.merge(a[["date", "djt"]], b[["date", "spx"]], on="date", how="inner").dropna()
+            if not m.empty:
+                m["ratio"] = m["djt"] / m["spx"].replace(0, np.nan)
+                m = m.dropna(subset=["ratio"]).sort_values("date")
+                if not m.empty:
+                    base = float(m["ratio"].iloc[0])
+                    if np.isfinite(base) and base != 0:
+                        m["value"] = (m["ratio"] / base) * 100.0
+                        out = m[["date", "value"]].copy()
+                        series["DJTA / S&P 500 Ratio (indexed)"] = out
 
     if sector_name_exact == "Auto-Tires-Trucks":
         # Days supply ≈ (months of supply) * 30.4
@@ -2102,7 +2136,27 @@ with tab_stock:
         for i, (label, indicator, kind) in enumerate(kpis):
             with cols[i % ncols]:
                 st.metric(label, _fmt_value(indicator, kind))
-
+        
+        if sector_exact == "Transportation":
+            st.markdown("#### Freight / Rates / Logistics (Headlines)")
+            q_trans = (
+                '("Cass Freight Index" OR "DAT dry van" OR "DAT reefer" OR '
+                '"Baltic Dry Index" OR "BDI" OR "Freightos Baltic Index" OR "FBX" OR '
+                '"Logistics Managers Index" OR "LMI" OR "supplier deliveries" OR '
+                '"spot rates" OR "truckload spot rates" OR "reefer rates")'
+            )
+            trans_news = fetch_google_news_rss_query(q_trans, days=30)
+            if trans_news is None or trans_news.empty:
+                st.info("No recent transportation/freight RSS headlines found.")
+            else:
+                for _, n in trans_news.head(18).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    title = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{title}]({link})  \n  _{src}_")
+    
         if sector_exact == "Basic Materials":
             st.markdown("#### Inventories & Supply News")
 
