@@ -2091,6 +2091,13 @@ with tab_stock:
                 ("Inventory YoY", "Inventory YoY", "pct"),
                 ("EV/EBITDA", "EV/EBITDA", "x"),
             ]
+        if s == "Transportation":
+            return [
+                ("FCF Yield", "FCF Yield (annualized)", "pct"),
+                ("EV/EBITDA", "EV/EBITDA", "x"),
+                ("Debt/Equity", "Debt/Equity", "x"),
+                ("Dividend Yield", "Dividend Yield", "pct"),
+            ]
         # Default for other non-Finance sectors (your current behavior)
         return [
             ("Revenue YoY", "Revenue YoY", "pct"),
