@@ -2291,6 +2291,7 @@ with tab_stock:
                 ("Inventory YoY", "Inventory YoY", "pct"),
                 ("EV/EBITDA", "EV/EBITDA", "x"),
             ]
+        
         if s == "Transportation":
             return [
                 ("Gross Margin", "Gross Margin", "pct"),
@@ -2298,6 +2299,15 @@ with tab_stock:
                 ("FCF Yield", "FCF Yield (annualized)", "pct"),
                 ("Days Sales Outstanding", "Days Sales Outstanding", "days"),
             ]
+
+        if s in ("Oils-Energy", "Energy"):
+            return [
+                ("Net Debt/EBITDA", "Net Debt / EBITDA", "x"),
+                ("EV/EBITDA", "EV/EBITDA", "x"),
+                ("FCF Yield", "FCF Yield (annualized)", "pct"),
+                ("Dividend Yield", "Dividend Yield", "pct"),
+            ]
+        
         # Default for other non-Finance sectors (your current behavior)
         return [
             ("Revenue YoY", "Revenue YoY", "pct"),
