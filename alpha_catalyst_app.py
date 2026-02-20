@@ -397,6 +397,106 @@ def fetch_fred_series(series_id: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 # =========================
+# EIA (best-effort scrapes) – weekly refinery utilization + monthly rig count
+# =========================
+@st.cache_data(ttl=24 * 60 * 60)
+def fetch_eia_pet_weekly_series(series_code: str) -> pd.DataFrame:
+    """
+    Best-effort: EIA weekly petroleum series via LeafHandler.
+    Example: WPULEUS3 = Weekly U.S. Percent Utilization of Refinery Operable Capacity.
+    Returns df(date,value).
+    """
+    code = (series_code or "").strip().upper()
+    if not code:
+        return pd.DataFrame()
+
+    url = f"https://www.eia.gov/dnav/pet/hist/LeafHandler.ashx?f=W&n=PET&s={requests.utils.quote(code)}"
+    html = fetch_html(url, timeout=20)
+    if not html:
+        return pd.DataFrame()
+
+    try:
+        # EIA page usually has a simple two-column table: Date, Value
+        tables = pd.read_html(html)
+        if not tables:
+            return pd.DataFrame()
+
+        # pick the first table that looks like date/value
+        best = None
+        for tb in tables:
+            if tb is None or tb.empty or tb.shape[1] < 2:
+                continue
+            c0 = str(tb.columns[0]).lower()
+            if "date" in c0 or "week" in c0:
+                best = tb
+                break
+        if best is None:
+            best = tables[0]
+
+        df = best.copy()
+        df.columns = ["date", "value"] + [f"c{i}" for i in range(3, df.shape[1] + 1)]
+        df = df[["date", "value"]].copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        df = df.dropna(subset=["date", "value"]).sort_values("date")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=24 * 60 * 60)
+def fetch_eia_ng_monthly_rig_count() -> pd.DataFrame:
+    """
+    Best-effort: EIA monthly 'U.S. Crude Oil and Natural Gas Rotary Rigs in Operation'
+    from EIA dnav table.
+    Returns df(date,value) monthly.
+    """
+    url = "https://www.eia.gov/dnav/ng/hist/e_ertrr0_xr0_nus_cm.htm"
+    html = fetch_html(url, timeout=20)
+    if not html:
+        return pd.DataFrame()
+
+    try:
+        tables = pd.read_html(html)
+        if not tables:
+            return pd.DataFrame()
+
+        # The main table is usually the first large one: Year rows, Jan..Dec columns
+        tb = max(tables, key=lambda t: (0 if t is None else t.size))
+        if tb is None or tb.empty:
+            return pd.DataFrame()
+
+        df = tb.copy()
+        # Expect first col "Year", then months
+        year_col = df.columns[0]
+        df = df.rename(columns={year_col: "Year"})
+        df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
+        df = df.dropna(subset=["Year"])
+
+        # melt months to rows
+        month_cols = [c for c in df.columns if str(c).strip()[:3].lower() in
+                      ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"]]
+        if not month_cols:
+            return pd.DataFrame()
+
+        m = df.melt(id_vars=["Year"], value_vars=month_cols, var_name="Month", value_name="value")
+        m["value"] = pd.to_numeric(m["value"], errors="coerce")
+        m = m.dropna(subset=["value"])
+
+        # build date
+        month_map = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,"jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+        m["m"] = m["Month"].astype(str).str.strip().str[:3].str.lower().map(month_map)
+        m = m.dropna(subset=["m"])
+        m["date"] = pd.to_datetime(
+            m["Year"].astype(int).astype(str) + "-" + m["m"].astype(int).astype(str) + "-01",
+            errors="coerce"
+        )
+        out = m[["date", "value"]].dropna().sort_values("date")
+        return out
+    except Exception:
+        return pd.DataFrame()
+
+# =========================
 # EARNINGS (forecasts/actual/surprises via yfinance)
 # =========================
 @st.cache_data(ttl=CACHE_TTL_EARNINGS)
@@ -1420,6 +1520,26 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
         fcf_latest = np.nan
     add_scalar("Free Cash Flow", fcf_latest, unit="USD", update="Quarterly")
 
+    total_debt = _row_get(bal, ["total debt", "totaldebt", "long term debt", "longtermdebt"])
+    cash = _row_get(bal, ["cash", "cash and cash equivalents", "cashandcashequivalents"])
+    nd_to_ebitda = np.nan
+    try:
+        if total_debt is not None and cash is not None and ebitda_s is not None:
+            d = pd.to_numeric(total_debt, errors="coerce").dropna().sort_index()
+            k = pd.to_numeric(cash, errors="coerce").dropna().sort_index()
+            e = pd.to_numeric(ebitda_s, errors="coerce").dropna().sort_index()
+            df_nd = pd.concat([d, k, e], axis=1, join="inner")
+            if not df_nd.empty:
+                td = float(df_nd.iloc[-1, 0])
+                cs = float(df_nd.iloc[-1, 1])
+                eb = float(df_nd.iloc[-1, 2])
+                if np.isfinite(td) and np.isfinite(cs) and np.isfinite(eb) and eb != 0:
+                    net_debt = td - cs
+                    nd_to_ebitda = net_debt / (eb * 4.0)
+    except Exception:
+        pass
+    add_scalar("Net Debt / EBITDA", nd_to_ebitda, unit="x", update="Quarterly", source="Yahoo quarterly statements")
+    
     mc = _to_num(info.get("marketCap"))
     fcf_yield = np.nan
     if np.isfinite(fcf_latest) and np.isfinite(mc) and mc > 0:
@@ -1511,6 +1631,8 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
         "Aerospace": "ITA",
         "Business Services": "XLI",
         "Conglomerates": "XLI",
+        "Oils-Energy": "XLE",
+        "Energy": "XLE",
     }
 
     driver_series_map = {
@@ -1526,7 +1648,26 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
             ("FRED:IPG3344S", "Semiconductor Output (US IP, NAICS 3344)"),
             ("FRED:CAPUTLG3344S", "Semiconductor Capacity Utilization (NAICS 3344)"),
         ],
-        "Energy": [("CL=F", "WTI Crude"), ("NG=F", "Natural Gas")],
+        "Energy": [
+            ("CL=F", "WTI Crude (Yahoo)"),
+            ("BZ=F", "Brent Crude (Yahoo)"),
+            ("RB=F", "RBOB Gasoline (Yahoo)"),
+            ("HO=F", "ULSD/Heating Oil (Yahoo)"),
+            ("FRED:OVXCLS", "OVX (Crude Oil ETF Volatility, FRED: OVXCLS)"),
+            ("EIA:WPULEUS3", "US Refinery Utilization (EIA: WPULEUS3)"),
+            ("FRED:IPN213111N", "IP: Drilling Oil & Gas Wells (FRED: IPN213111N)"),
+            ("KRBN", "Carbon Allowances (KRBN ETF, Yahoo)"),
+        ],
+        "Oils-Energy": [
+            ("CL=F", "WTI Crude (Yahoo)"),
+            ("BZ=F", "Brent Crude (Yahoo)"),
+            ("RB=F", "RBOB Gasoline (Yahoo)"),
+            ("HO=F", "ULSD/Heating Oil (Yahoo)"),
+            ("FRED:OVXCLS", "OVX (Crude Oil ETF Volatility, FRED: OVXCLS)"),
+            ("EIA:WPULEUS3", "US Refinery Utilization (EIA: WPULEUS3)"),
+            ("FRED:IPN213111N", "IP: Drilling Oil & Gas Wells (FRED: IPN213111N)"),
+            ("KRBN", "Carbon Allowances (KRBN ETF, Yahoo)"),
+        ],
         "Transportation": [
             ("FRED:TSIFRGHTC", "Freight Transportation Services Index (TSI, FRED: TSIFRGHTC)"),
             ("FRED:FRGSHPUSM649NCIS", "Cass Freight Index — Shipments (FRED: FRGSHPUSM649NCIS)"),
@@ -1650,6 +1791,13 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
                 return None
             return df[["date", "value"]].copy()
 
+        if s.upper().startswith("EIA:"):
+            code = s.split(":", 1)[1].strip()
+            df = fetch_eia_pet_weekly_series(code)
+            if df is None or df.empty:
+                return None
+            return df[["date", "value"]].copy()
+        
         out = _yf_series(s)
         if out is not None and not out.empty:
             return out
@@ -1755,6 +1903,41 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
         }
         series = {k: v for k, v in series.items() if k not in hidden}
 
+    if sector_name_exact in ("Energy", "Oils-Energy"):
+        # Brent–WTI spread = Brent - WTI
+        brent = series.get("Brent Crude (Yahoo)")
+        wti = series.get("WTI Crude (Yahoo)")
+        if brent is not None and not brent.empty and wti is not None and not wti.empty:
+            a = brent.rename(columns={"value": "brent"})
+            b = wti.rename(columns={"value": "wti"})
+            m = pd.merge(a[["date", "brent"]], b[["date", "wti"]], on="date", how="inner").dropna()
+            if not m.empty:
+                m["value"] = pd.to_numeric(m["brent"], errors="coerce") - pd.to_numeric(m["wti"], errors="coerce")
+                out = m.dropna(subset=["value"])[["date", "value"]].sort_values("date")
+                if not out.empty:
+                    series["Brent–WTI Spread (Brent - WTI)"] = out
+
+        # 3-2-1 crack (approx) using front-month futures:
+        # crack = (2*RBOB + 1*HO - 3*WTI) / 3
+        rb = series.get("RBOB Gasoline (Yahoo)")
+        ho = series.get("ULSD/Heating Oil (Yahoo)")
+        if rb is not None and not rb.empty and ho is not None and not ho.empty and wti is not None and not wti.empty:
+            a = rb.rename(columns={"value": "rb"})
+            b = ho.rename(columns={"value": "ho"})
+            c = wti.rename(columns={"value": "wti"})
+            m = a.merge(b[["date", "ho"]], on="date", how="inner").merge(c[["date", "wti"]], on="date", how="inner")
+            m = m.dropna()
+            if not m.empty:
+                m["value"] = (2.0 * pd.to_numeric(m["rb"], errors="coerce") + 1.0 * pd.to_numeric(m["ho"], errors="coerce") - 3.0 * pd.to_numeric(m["wti"], errors="coerce")) / 3.0
+                out = m.dropna(subset=["value"])[["date", "value"]].sort_values("date")
+                if not out.empty:
+                    series["Crack Spread (3-2-1 approx)"] = out
+
+        # Optional: show EIA monthly rig count as a series too
+        rigs = fetch_eia_ng_monthly_rig_count()
+        if rigs is not None and not rigs.empty:
+            series["US Rotary Rig Count (EIA, monthly)"] = rigs
+    
     return scalars, series
 
 # =========================
@@ -2143,14 +2326,41 @@ with tab_stock:
 
     else:
         kpis = sector_kpi_config(sector_exact)
-
-        # Render KPI row (4 columns if >=4, otherwise fit to size)
         ncols = max(1, min(4, len(kpis)))
         cols = st.columns(ncols)
 
         for i, (label, indicator, kind) in enumerate(kpis):
             with cols[i % ncols]:
                 st.metric(label, _fmt_value(indicator, kind))
+
+        if sector_exact in ("Energy", "Oils-Energy"):
+            st.markdown("#### Oils–Energy Catalysts")
+
+            energy_window = st.selectbox("Energy headlines window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="energy_headlines_window")
+            days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
+            edays = days_map.get(energy_window, 7)
+
+            queries = {
+                "OPEC+ quota decisions": '(OPEC OR "OPEC+" OR "OPEC plus") AND (quota OR cut OR cuts OR "production target" OR "output policy")',
+                "COT net positioning (oil)": '("CFTC" OR "commitments of traders" OR COT) AND (WTI OR Brent OR crude) AND (net long OR net short OR positioning)',
+                "Spare capacity / surplus capacity": '(spare capacity OR "surplus capacity") AND (OPEC OR crude OR oil)',
+                "Rig count / shale productivity / DUCs": '("rig count" OR "drilling productivity" OR DUC OR "drilled but uncompleted") AND (EIA OR shale OR Permian OR Bakken)',
+                "Carbon pricing": '("carbon price" OR "carbon pricing" OR "EU ETS" OR "cap and trade" OR allowance) AND (oil OR energy OR refinery OR airline)',
+            }
+
+            for title, q in queries.items():
+                st.markdown(f"**{title}**")
+                df_news = fetch_google_news_rss_query(q, days=edays)
+                if df_news is None or df_news.empty:
+                    st.caption("No recent RSS headlines found.")
+                    continue
+                for _, n in df_news.head(8).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    ttl = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{ttl}]({link})  \n  _{src}_")
         
         if sector_exact == "Transportation":
             st.markdown("#### Freight / Rates / Logistics Headlines")
