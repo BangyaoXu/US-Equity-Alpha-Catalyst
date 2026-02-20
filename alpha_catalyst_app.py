@@ -2093,10 +2093,10 @@ with tab_stock:
             ]
         if s == "Transportation":
             return [
+                ("Gross Margin", "Gross Margin", "pct"),
+                ("Operating Margin", "Operating Margin", "pct"),
                 ("FCF Yield", "FCF Yield (annualized)", "pct"),
-                ("EV/EBITDA", "EV/EBITDA", "x"),
-                ("Debt/Equity", "Debt/Equity", "x"),
-                ("Dividend Yield", "Dividend Yield", "pct"),
+                ("Days Sales Outstanding", "Days Sales Outstanding", "days"),
             ]
         # Default for other non-Finance sectors (your current behavior)
         return [
