@@ -1895,14 +1895,6 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
                         out = m[["date", "value"]].copy()
                         series["Affordability Proxy (CPI New Vehicles / Wages, indexed)"] = out
 
-    if sector_name_exact == "Transportation":
-        hidden = {
-            "Dow Jones Transportation Average (Yahoo: ^DJT)",
-            "S&P 500 (Yahoo: ^GSPC)",
-            "ULSD Futures (NY Harbor, Yahoo: HO=F)",
-        }
-        series = {k: v for k, v in series.items() if k not in hidden}
-
     if sector_name_exact in ("Energy", "Oils-Energy"):
         # Brent–WTI spread = Brent - WTI
         brent = series.get("Brent Crude (Yahoo)")
@@ -1937,6 +1929,31 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
         rigs = fetch_eia_ng_monthly_rig_count()
         if rigs is not None and not rigs.empty:
             series["US Rotary Rig Count (EIA, monthly)"] = rigs
+
+    # ============================================
+    # Hide helper / undesired series from charts
+    # ============================================
+    hidden = set()
+
+    # Transportation hidden series
+    if sector_name_exact == "Transportation":
+        hidden.update({
+            "Dow Jones Transportation Average (Yahoo: ^DJT)",
+            "S&P 500 (Yahoo: ^GSPC)",
+            "ULSD Futures (NY Harbor, Yahoo: HO=F)",
+        })
+
+    # Oils-Energy / Energy hidden series (used only for spreads)
+    if sector_name_exact in ("Energy", "Oils-Energy"):
+        hidden.update({
+            "WTI Crude (Yahoo)",
+            "Brent Crude (Yahoo)",
+            "RBOB Gasoline (Yahoo)",
+            "ULSD/Heating Oil (Yahoo)",
+        })
+
+    if hidden:
+        series = {k: v for k, v in series.items() if k not in hidden}
     
     return scalars, series
 
