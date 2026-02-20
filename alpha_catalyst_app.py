@@ -1747,6 +1747,14 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
                         out = m[["date", "value"]].copy()
                         series["Affordability Proxy (CPI New Vehicles / Wages, indexed)"] = out
 
+    if sector_name_exact == "Transportation":
+        hidden = {
+            "Dow Jones Transportation Average (Yahoo: ^DJT)",
+            "S&P 500 (Yahoo: ^GSPC)",
+            "ULSD Futures (NY Harbor, Yahoo: HO=F)",
+        }
+        series = {k: v for k, v in series.items() if k not in hidden}
+
     return scalars, series
 
 # =========================
