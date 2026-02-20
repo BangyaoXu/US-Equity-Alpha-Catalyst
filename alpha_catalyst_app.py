@@ -2146,7 +2146,7 @@ with tab_stock:
                 st.metric(label, _fmt_value(indicator, kind))
         
         if sector_exact == "Transportation":
-            st.markdown("#### Freight / Rates / Logistics (Headlines)")
+            st.markdown("#### Freight / Rates / Logistics Headlines")
             q_trans = (
                 '("Cass Freight Index" OR "DAT dry van" OR "DAT reefer" OR '
                 '"Baltic Dry Index" OR "BDI" OR "Freightos Baltic Index" OR "FBX" OR '
