@@ -1615,6 +1615,54 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
                 buyback_yield = np.nan
     add_scalar("Buyback Yield (approx)", buyback_yield, unit="%", update="Quarterly", source="Yahoo cashflow + market cap proxy")
 
+    inv_to_sales = np.nan
+    try:
+        inv_s2 = _row_get(bal, ["inventory"])
+        rev_s2 = _row_get(inc, ["total revenue", "totalrevenue", "revenue"])
+        if inv_s2 is not None and rev_s2 is not None:
+            invc = pd.to_numeric(inv_s2, errors="coerce").dropna().sort_index()
+            revc = pd.to_numeric(rev_s2, errors="coerce").dropna().sort_index()
+            m = pd.concat([invc, revc], axis=1, join="inner")
+            if not m.empty:
+                inv_last = float(m.iloc[-1, 0])
+                rev_last = float(m.iloc[-1, 1])
+                if np.isfinite(inv_last) and np.isfinite(rev_last) and rev_last != 0:
+                    inv_to_sales = inv_last / rev_last
+    except Exception:
+        pass
+    add_scalar("Inventory-to-Sales Ratio", inv_to_sales, unit="x", update="Quarterly", source="Yahoo quarterly statements (proxy)")
+
+    backlog_latest = np.nan
+    try:
+        cik_int = _resolve_cik_for_ticker(sym)
+        if cik_int is not None:
+            cf = fetch_sec_companyfacts(int(cik_int))
+            backlog_latest = _latest_fact_value(cf, [
+                "Backlog",
+                "OrderBacklog",
+                "SalesOrderBacklog",
+                "RemainingPerformanceObligation",
+                "RevenueRemainingPerformanceObligation",
+                "TransactionPriceAllocatedToRemainingPerformanceObligations",
+            ])
+    except Exception:
+        pass
+    add_scalar("Order Backlog (latest)", backlog_latest, unit="USD", update="Quarterly (best-effort)", source="SEC XBRL companyfacts (best-effort)")
+    
+    book_to_bill = np.nan
+    try:
+        bookings_latest = np.nan
+        cik_int = _resolve_cik_for_ticker(sym)
+        if cik_int is not None:
+            cf = fetch_sec_companyfacts(int(cik_int))
+            bookings_latest = _latest_fact_value(cf, ["Orders"])  # rare
+            rev_latest = _latest_fact_value(cf, ["Revenues", "SalesRevenueNet", "RevenueFromContractWithCustomerExcludingAssessedTax"])
+            if np.isfinite(bookings_latest) and np.isfinite(rev_latest) and rev_latest != 0:
+                book_to_bill = bookings_latest / rev_latest
+    except Exception:
+        pass
+    add_scalar("Book-to-Bill", book_to_bill, unit="x", update="Quarterly (best-effort)", source="SEC XBRL companyfacts (rare tag)")
+    
     sector_etf_map = {
         "Medical": "XLV",
         "Computer and Technology": "XLK",
@@ -1636,6 +1684,11 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
     }
 
     driver_series_map = {
+        "Industrial Products": [
+            ("FRED:NAPMNOI", "ISM PMI: New Orders (FRED: NAPMNOI)"),
+            ("FRED:INDPRO", "Industrial Production Index (FRED: INDPRO)"),
+            ("FRED:NEWORDER", "Nondefense Capital Goods New Orders ex Aircraft (FRED: NEWORDER)"),
+        ],
         "Basic Materials": [
             ("FRED:DCOILWTICO", "WTI Crude (FRED: DCOILWTICO)"),
             ("FRED:DHHNGSP", "Henry Hub Natural Gas (FRED: DHHNGSP)"),
@@ -2249,6 +2302,14 @@ with tab_stock:
         """
         s = (sector or "").strip()
 
+        if s == "Industrial Products":
+            return [
+                ("Book-to-Bill", "Book-to-Bill", "x"),
+                ("Order Backlog", "Order Backlog (latest)", "usd"),
+                ("Inventory/Sales", "Inventory-to-Sales Ratio", "x"),
+                ("EV/EBITDA", "EV/EBITDA", "x"),
+            ]
+        
         if s == "Basic Materials":
             # REMOVE: Revenue YoY / Operating Margin / Total Cost Ratio / EPS Surprise
             # Also no "Valuation (Basic Materials)"
@@ -2360,6 +2421,44 @@ with tab_stock:
             with cols[i % ncols]:
                 st.metric(label, _fmt_value(indicator, kind))
 
+        if sector_exact == "Industrial Products":
+            st.markdown("#### Industrial Products: Order / Production / CAPEX Commentary")
+
+            ip_window = st.selectbox("Industrial Products headlines window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="ip_headlines_window")
+            days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
+            ip_days = days_map.get(ip_window, 7)
+
+            queries = {
+                "Production ramp-ups / capacity adds": (
+                    f'({ticker_sel} OR "{co_name}") '
+                    f'("production ramp" OR ramp-up OR "ramp up" OR "start of production" OR SOP OR '
+                    f'"capacity expansion" OR "capacity add" OR "line rate" OR "throughput")'
+                ),
+                "Order backlog / bookings commentary": (
+                    f'({ticker_sel} OR "{co_name}") '
+                    f'(backlog OR bookings OR "order book" OR "order intake" OR "book-to-bill" OR billings)'
+                ),
+                "Outlooks on capex-driven demand": (
+                    f'({ticker_sel} OR "{co_name}") '
+                    f'(capex OR "capital spending" OR "capital expenditure" OR "industrial demand" OR '
+                    f'"equipment demand" OR "factory automation" OR "maintenance capex")'
+                ),
+            }
+
+            for title, q in queries.items():
+                st.markdown(f"**{title}**")
+                df_news = fetch_google_news_rss_query(q, days=ip_days)
+                if df_news is None or df_news.empty:
+                    st.caption("No recent RSS headlines found.")
+                    continue
+                for _, n in df_news.head(10).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    ttl = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{ttl}]({link})  \n  _{src}_")
+        
         if sector_exact in ("Energy", "Oils-Energy"):
             st.markdown("#### Oils–Energy Catalysts")
 
