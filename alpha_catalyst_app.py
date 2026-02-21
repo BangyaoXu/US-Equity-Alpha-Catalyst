@@ -1662,6 +1662,40 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
     except Exception:
         pass
     add_scalar("Book-to-Bill", book_to_bill, unit="x", update="Quarterly (best-effort)", source="SEC XBRL companyfacts (rare tag)")
+
+    cogs_s = _row_get(inc, ["cost of revenue", "costofrevenue", "cost of goods sold", "costofgoodssold"])
+    inv_s2 = _row_get(bal, ["inventory"])
+    rev_s2 = _row_get(inc, ["total revenue", "totalrevenue", "revenue"])
+
+    inv_turn = np.nan
+    try:
+        if cogs_s is not None and inv_s2 is not None:
+            cogs = pd.to_numeric(cogs_s, errors="coerce").dropna().sort_index()
+            invv = pd.to_numeric(inv_s2, errors="coerce").dropna().sort_index()
+            df_it = pd.concat([cogs, invv], axis=1, join="inner")
+            if df_it.shape[0] >= 2:
+                cogs_last = float(df_it.iloc[-1, 0])
+                inv_avg = float(df_it.iloc[-2:, 1].mean())
+                if np.isfinite(cogs_last) and np.isfinite(inv_avg) and inv_avg != 0:
+                    inv_turn = (abs(cogs_last) * 4.0) / inv_avg
+    except Exception:
+        pass
+    add_scalar("Inventory Turnover (annualized)", inv_turn, unit="x", update="Quarterly", source="Yahoo quarterly (COGS + Inventory)")
+
+    inv_sales = np.nan
+    try:
+        if inv_s2 is not None and rev_s2 is not None:
+            invv = pd.to_numeric(inv_s2, errors="coerce").dropna().sort_index()
+            revv = pd.to_numeric(rev_s2, errors="coerce").dropna().sort_index()
+            df_is = pd.concat([invv, revv], axis=1, join="inner")
+            if not df_is.empty:
+                inv_last = float(df_is.iloc[-1, 0])
+                rev_last = float(df_is.iloc[-1, 1])
+                if np.isfinite(inv_last) and np.isfinite(rev_last) and rev_last != 0:
+                    inv_sales = inv_last / rev_last
+    except Exception:
+        pass
+    add_scalar("Inventory / Sales (latest qtr)", inv_sales, unit="x", update="Quarterly", source="Yahoo quarterly (Inventory / Revenue)")
     
     sector_etf_map = {
         "Medical": "XLV",
@@ -1684,6 +1718,17 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
     }
 
     driver_series_map = {
+        "Retail-Wholesale": [
+            ("FRED:RSAFS", "Advance Retail Sales: Retail & Food Services (FRED: RSAFS)"),
+            ("FRED:RETAILSMSA", "Retailers Sales (FRED: RETAILSMSA)"),
+            ("FRED:RETAILIRSA", "Retailers: Inventories to Sales Ratio (FRED: RETAILIRSA)"),
+            ("FRED:RETAILIMSA", "Retailers Inventories (FRED: RETAILIMSA)"),
+            ("FRED:CONCCONF", "Conference Board Consumer Confidence Index (FRED: CONCCONF)"),
+            ("FRED:UMCSENT", "University of Michigan Consumer Sentiment Index (FRED: UMCSENT)"),
+            ("FRED:MDSIM2MEUSN", "Visa Spending Momentum Index (FRED: MDSIM2MEUSN)"),
+            ("FRED:ECOMPCTSA", "E-commerce as % of total retail sales (FRED: ECOMPCTSA)"),
+            ("FRED:ECOMSA", "U.S. Retail E-Commerce Sales (FRED: ECOMSA)"),
+        ],
         "Industrial Products": [
             ("FRED:NAPMNOI", "ISM PMI: New Orders (FRED: NAPMNOI)"),
             ("FRED:INDPRO", "Industrial Production Index (FRED: INDPRO)"),
@@ -2302,6 +2347,14 @@ with tab_stock:
         """
         s = (sector or "").strip()
 
+        if s == "Retail-Wholesale":
+            return [
+                ("Gross Margin", "Gross Margin", "pct"),
+                ("Inventory Turnover", "Inventory Turnover (annualized)", "x"),
+                ("Inv/Sales", "Inventory / Sales (latest qtr)", "x"),
+                ("EV/EBITDA", "EV/EBITDA", "x"),
+            ]
+        
         if s == "Industrial Products":
             return [
                 ("Book-to-Bill", "Book-to-Bill", "x"),
@@ -2420,7 +2473,51 @@ with tab_stock:
         for i, (label, indicator, kind) in enumerate(kpis):
             with cols[i % ncols]:
                 st.metric(label, _fmt_value(indicator, kind))
+        
+        if sector_exact == "Retail-Wholesale":
+            st.markdown("#### Retail / Wholesale Catalysts")
 
+            rw_window = st.selectbox("Retail headlines window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="rw_headlines_window")
+            days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
+            rwdays = days_map.get(rw_window, 7)
+
+            queries = {
+                "Same-Store Sales (Comp Sales) / Customer Traffic": (
+                    f'({ticker_sel} OR "{co_name}") AND '
+                    '("same-store sales" OR "comparable sales" OR comps OR "customer traffic" OR footfall OR "transactions")'
+                ),
+                "E-commerce YoY / Online Sales Growth": (
+                    f'({ticker_sel} OR "{co_name}") AND '
+                    '("e-commerce" OR "online sales" OR "digital sales") AND (YoY OR "year over year" OR growth)'
+                ),
+                "Inventory / Promotions / Margin Pressure": (
+                    f'({ticker_sel} OR "{co_name}") AND '
+                    '(inventory OR "inventory levels" OR markdowns OR promotions OR "gross margin")'
+                ),
+                "Supply chain / Brand power / Pricing power": (
+                    f'({ticker_sel} OR "{co_name}") AND '
+                    '("supply chain" OR "lead times" OR "in-stock" OR "brand power" OR "pricing power")'
+                ),
+                "Credit card spending (Visa/Mastercard reports)": (
+                    '(Visa OR Mastercard OR "SpendingPulse" OR "spending momentum") AND '
+                    '(consumer spending OR "card spending" OR "credit card spending")'
+                ),
+            }
+
+            for title, q in queries.items():
+                st.markdown(f"**{title}**")
+                df_news = fetch_google_news_rss_query(q, days=rwdays)
+                if df_news is None or df_news.empty:
+                    st.caption("No recent RSS headlines found.")
+                    continue
+                for _, n in df_news.head(10).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    ttl = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{ttl}]({link})  \n  _{src}_")
+        
         if sector_exact == "Industrial Products":
             st.markdown("#### Industrial Products: Order / Production / CAPEX Commentary")
 
