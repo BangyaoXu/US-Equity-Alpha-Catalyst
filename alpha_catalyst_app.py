@@ -2615,7 +2615,7 @@ with tab_stock:
                 st.metric(label, _fmt_value(indicator, kind))
 
         if sector_exact == "Utilities":
-            st.markdown("#### Utilities: Rates / Regulation / Demand / Weather / Capex")
+            st.markdown("#### Rates / Regulation / Demand / Weather / Capex News")
 
             util_window = st.selectbox(
                 "Utilities headlines window", ["1w", "2w", "1m", "2m", "3m"],
@@ -2625,10 +2625,6 @@ with tab_stock:
             util_days = days_map.get(util_window, 7)
 
             queries = {
-                "10Y yield / CPI prints (rate sensitivity + inflation pass-through)": (
-                    '("10-year Treasury" OR "10 year Treasury" OR DGS10 OR yield) '
-                    'AND (CPI OR inflation OR "consumer price index")'
-                ),
                 "State PUC calendars / hearings / procedural schedule": (
                     '("public utility commission" OR PUC OR "utility commission") '
                     'AND (calendar OR agenda OR hearing OR docket OR "procedural schedule")'
