@@ -2566,8 +2566,8 @@ with tab_stock:
         return [
             ("Revenue YoY", "Revenue YoY", "pct"),
             ("Operating Margin", "Operating Margin", "pct"),
-            ("Total Cost Ratio", "Total Cost Ratio", "pct"),
-            ("EPS Surprise", "EPS Surprise", "pct"),
+            ("FCF Yield", "FCF Yield (annualized)", "pct"),
+            ("EV/EBITDA", "EV/EBITDA", "x"),
         ]
     
     if sector_exact == "Finance":
