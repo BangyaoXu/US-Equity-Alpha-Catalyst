@@ -2447,6 +2447,14 @@ with tab_stock:
         """
         s = (sector or "").strip()
 
+        if s == "Conglomerates":
+            return [
+                ("Forward P/E", "Forward P/E", "x"),
+                ("Trailing P/E", "Trailing P/E", "x"),
+                ("EV/EBITDA", "EV/EBITDA", "x"),
+                ("Buyback Yield", "Buyback Yield (approx)", "pct"),
+            ]
+        
         if s == "Utilities":
             return [
                 ("Dividend Yield", "Dividend Yield", "pct"),
@@ -2614,6 +2622,58 @@ with tab_stock:
             with cols[i % ncols]:
                 st.metric(label, _fmt_value(indicator, kind))
 
+        if sector_exact == "Conglomerates":
+            st.markdown("#### Strategic Actions / Activism / Breakups News")
+
+            cong_window = st.selectbox(
+                "Conglomerates headlines window",
+                ["1w", "2w", "1m", "2m", "3m"],
+                index=0,
+                key="cong_headlines_window",
+            )
+            days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
+            cong_days = days_map.get(cong_window, 7)
+
+            queries = {
+                "Strategic review / activist stake": (
+                    f'({ticker_sel} OR "{co_name}") AND '
+                    f'("strategic review" OR activist OR "activist investor" OR '
+                    f'"activist stake" OR "stake" OR "13D" OR "Schedule 13D" OR '
+                    f'"proxy fight" OR "board refresh" OR "nominate directors")'
+                ),
+                "Breakup / spin-off announcements": (
+                    f'({ticker_sel} OR "{co_name}") AND '
+                    f'(breakup OR "break up" OR "separation" OR "separate into" OR '
+                    f'"spin-off" OR spinoff OR "split" OR "split-up" OR "split up" OR '
+                    f'"pure-play" OR "carve-out" OR "carve out")'
+                ),
+                "Asset sales / divestitures": (
+                    f'({ticker_sel} OR "{co_name}") AND '
+                    f'("asset sale" OR divestiture OR divest OR "sell unit" OR '
+                    f'"sale of business" OR "portfolio optimization" OR "dispose" OR disposal)'
+                ),
+                "Large buyback authorization / capital return": (
+                    f'({ticker_sel} OR "{co_name}") AND '
+                    f'("share repurchase" OR "share buyback" OR "repurchase authorization" OR '
+                    f'"buyback authorization" OR "accelerated share repurchase" OR ASR OR '
+                    f'"capital return" OR "return of capital")'
+                ),
+            }
+
+            for title, q in queries.items():
+                st.markdown(f"**{title}**")
+                df_news = fetch_google_news_rss_query(q, days=cong_days)
+                if df_news is None or df_news.empty:
+                    st.caption("No recent RSS headlines found.")
+                    continue
+                for _, n in df_news.head(12).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    ttl = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{ttl}]({link})  \n  _{src}_")
+        
         if sector_exact == "Utilities":
             st.markdown("#### Regulation / Demand / Weather / Capex News")
 
