@@ -2636,19 +2636,19 @@ with tab_stock:
                 ),
             }
     
-        for title, q in queries.items():
-            st.markdown(f"**{title}**")
-            df_news = fetch_google_news_rss_query(q, days=cd_days)
-            if df_news is None or df_news.empty:
-                st.caption("No recent RSS headlines found.")
-                continue
-            for _, n in df_news.head(12).iterrows():
-                t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
-                t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
-                ttl = str(n.get("title", ""))
-                link = str(n.get("link", ""))
-                src = str(n.get("source", ""))
-                st.markdown(f"- **{t_str}** [{ttl}]({link})  \n  _{src}_")
+            for title, q in queries.items():
+                st.markdown(f"**{title}**")
+                df_news = fetch_google_news_rss_query(q, days=cd_days)
+                if df_news is None or df_news.empty:
+                    st.caption("No recent RSS headlines found.")
+                    continue
+                for _, n in df_news.head(12).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    ttl = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{ttl}]({link})  \n  _{src}_")
         
         if sector_exact == "Construction":
             st.markdown("#### Backlog / ABI / Spending / Contract Awards")
