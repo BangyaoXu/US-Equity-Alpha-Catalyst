@@ -1866,6 +1866,25 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
 
         return _remember_last_good_series(cache_key, None)
 
+    @st.cache_data(ttl=60 * 60)
+    def compute_pe_history(ticker: str) -> pd.DataFrame:
+        """Return df(date,value) of P/E history using price / trailing EPS."""
+        try:
+            info = fetch_info_one(normalize_yf_ticker(ticker)) or {}
+            trailing_eps = _to_num(info.get("trailingEps"))
+            if not np.isfinite(trailing_eps) or trailing_eps == 0:
+                return pd.DataFrame()
+    
+            px = _yf_series(normalize_yf_ticker(ticker), period="5y")
+            if px is None or px.empty:
+                return pd.DataFrame()
+    
+            df = px.copy()
+            df["value"] = pd.to_numeric(df["value"], errors="coerce") / trailing_eps
+            return df.dropna(subset=["date", "value"]).sort_values("date")
+        except Exception:
+            return pd.DataFrame()
+    
     def _any_series(symbol: str) -> Optional[pd.DataFrame]:
         s = (symbol or "").strip()
         if not s:
@@ -1964,22 +1983,6 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
                         m["value"] = (m["ratio"] / base) * 100.0
                         out = m[["date", "value"]].copy()
                         series["DJTA / S&P 500 Ratio (indexed)"] = out
-
-    if sector_name_exact == "Consumer Staples":
-        # P/E history (proxy): daily price / trailing EPS (constant from Yahoo info)
-        try:
-            info_local = fetch_info_one(normalize_yf_ticker(ticker)) or {}
-            trailing_eps = _to_num(info_local.get("trailingEps"))
-            if np.isfinite(trailing_eps) and trailing_eps != 0:
-                px_t = _yf_series(normalize_yf_ticker(ticker), period="5y")
-                if px_t is not None and not px_t.empty:
-                    pe = px_t.copy()
-                    pe["value"] = pd.to_numeric(pe["value"], errors="coerce") / trailing_eps
-                    pe = pe.dropna(subset=["date", "value"]).sort_values("date")
-                    if not pe.empty:
-                        series["P/E History (proxy: Price / Trailing EPS)"] = pe
-        except Exception:
-            pass
     
     if sector_name_exact == "Auto-Tires-Trucks":
         # Days supply ≈ (months of supply) * 30.4
@@ -2506,7 +2509,18 @@ with tab_stock:
                 st.metric(label, _fmt_value(indicator, kind))
 
         if sector_exact == "Consumer Staples":
-            st.markdown("#### Consumer Staples Catalysts (Volumes / Input Costs / GLP-1)")
+            st.markdown("#### Valuation: P/E History")
+    
+            pe_hist = compute_pe_history(ticker_sel)
+    
+            if pe_hist is None or pe_hist.empty:
+                st.caption("No P/E history available (missing trailing EPS).")
+            else:
+                fig_pe = px.line(pe_hist, x="date", y="value", title="P/E History (Price / Trailing EPS)")
+                fig_pe.update_layout(height=300, margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(fig_pe, use_container_width=True)
+            
+            st.markdown("#### Catalysts (Volumes / Input Costs / GLP-1)")
 
             cs_window = st.selectbox(
                 "Consumer Staples headlines window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="cs_headlines_window"
