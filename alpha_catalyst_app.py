@@ -1818,6 +1818,65 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
         "driver_series_map": driver_series_map,
     }
 
+@st.cache_data(ttl=60 * 60)
+def compute_pe_history(ticker: str, period: str = "5y") -> pd.DataFrame:
+    """
+    P/E History (proxy): daily price / trailing EPS (EPS is a point-in-time Yahoo field).
+    Returns df(date,value).
+    """
+    sym = normalize_yf_ticker(ticker)
+
+    # trailing EPS from Yahoo info
+    info = fetch_info_one(sym) or {}
+    trailing_eps = _to_num(info.get("trailingEps"))
+    if not np.isfinite(trailing_eps) or trailing_eps == 0:
+        return pd.DataFrame()
+
+    def _to_df(px: pd.DataFrame) -> pd.DataFrame:
+        if px is None or px.empty:
+            return pd.DataFrame()
+        col = "Close" if "Close" in px.columns else ("Adj Close" if "Adj Close" in px.columns else None)
+        if col is None:
+            return pd.DataFrame()
+        out = px[[col]].dropna().reset_index()
+        if out.empty:
+            return pd.DataFrame()
+        out.columns = ["date", "value"]
+        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+        out["value"] = pd.to_numeric(out["value"], errors="coerce")
+        out = out.dropna(subset=["date", "value"]).sort_values("date")
+        return out
+
+    # Use your last-good-series memory key (optional but consistent with the rest of your app)
+    cache_key = f"PEHIST::{sym}::{period}"
+
+    # 1) Try yf.download
+    try:
+        px1 = yf.download(sym, period=period, interval="1d", auto_adjust=True, progress=False, threads=False)
+        df1 = _to_df(px1)
+        if not df1.empty:
+            df1["value"] = df1["value"] / trailing_eps
+            df1 = df1.dropna(subset=["date", "value"]).sort_values("date")
+            return _remember_last_good_series(cache_key, df1)
+    except Exception:
+        pass
+
+    # 2) Try Ticker().history
+    try:
+        t = yf.Ticker(sym)
+        px2 = t.history(period=period, interval="1d", auto_adjust=True)
+        df2 = _to_df(px2)
+        if not df2.empty:
+            df2["value"] = df2["value"] / trailing_eps
+            df2 = df2.dropna(subset=["date", "value"]).sort_values("date")
+            return _remember_last_good_series(cache_key, df2)
+    except Exception:
+        pass
+
+    # fallback: last good value if any
+    prev = _remember_last_good_series(cache_key, None)
+    return prev if isinstance(prev, pd.DataFrame) else pd.DataFrame()
+
 def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
     payload = fetch_indicator_bundle(ticker)
     scalars = payload["scalars"].copy()
@@ -1865,25 +1924,6 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
             pass
 
         return _remember_last_good_series(cache_key, None)
-
-    @st.cache_data(ttl=60 * 60)
-    def compute_pe_history(ticker: str) -> pd.DataFrame:
-        """Return df(date,value) of P/E history using price / trailing EPS."""
-        try:
-            info = fetch_info_one(normalize_yf_ticker(ticker)) or {}
-            trailing_eps = _to_num(info.get("trailingEps"))
-            if not np.isfinite(trailing_eps) or trailing_eps == 0:
-                return pd.DataFrame()
-    
-            px = _yf_series(normalize_yf_ticker(ticker), period="5y")
-            if px is None or px.empty:
-                return pd.DataFrame()
-    
-            df = px.copy()
-            df["value"] = pd.to_numeric(df["value"], errors="coerce") / trailing_eps
-            return df.dropna(subset=["date", "value"]).sort_values("date")
-        except Exception:
-            return pd.DataFrame()
     
     def _any_series(symbol: str) -> Optional[pd.DataFrame]:
         s = (symbol or "").strip()
