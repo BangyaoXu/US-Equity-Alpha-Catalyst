@@ -2434,7 +2434,7 @@ with tab_stock:
         kind in: pct, x, usd, num, days
         """
         s = (sector or "").strip()
-        
+
         if s == "Consumer Discretionary":
             return [
                 ("Revenue YoY", "Revenue YoY", "pct"),
@@ -2442,7 +2442,7 @@ with tab_stock:
                 ("Inventory Turnover", "Inventory Turnover (annualized)", "x"),
                 ("EV/EBITDA", "EV/EBITDA", "x"),
             ]
-
+        
         if s == "Construction":
             return [
                 ("Book-to-Bill", "Book-to-Bill", "x"),
