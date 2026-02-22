@@ -1789,7 +1789,6 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
         ],
         "Aerospace": [("ITA", "Aerospace & Defense ETF")],
         "Construction": [
-            ("ITB", "Homebuilders ETF (ITB, Yahoo)"),
             ("FRED:HOUST", "Housing Starts (FRED: HOUST)"),
             ("FRED:PERMIT", "Building Permits (FRED: PERMIT)"),
             ("FRED:TTLCONS", "Construction Spending: Total (FRED: TTLCONS)"),
