@@ -1572,6 +1572,7 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
     )
 
     add_scalar("Forward P/E", _to_num(info.get("forwardPE")), unit="x", update="Daily")
+    add_scalar("Trailing P/E", _to_num(info.get("trailingPE")), unit="x", update="Daily")
     rg = _to_num(info.get("revenueGrowth"))
     add_scalar("Revenue Growth (Yahoo)", rg * 100.0 if np.isfinite(rg) else np.nan, unit="%", update="Daily")
     eg = _to_num(info.get("earningsGrowth"))
@@ -1718,6 +1719,12 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
     }
 
     driver_series_map = {
+        "Consumer Staples": [
+            ("ZW=F", "Wheat Futures (Yahoo: ZW=F)"),
+            ("ZC=F", "Corn Futures (Yahoo: ZC=F)"),
+            ("SB=F", "Sugar #11 Futures (Yahoo: SB=F)"),
+            ("KC=F", "Coffee Futures (Yahoo: KC=F)"),
+        ],
         "Retail-Wholesale": [
             ("FRED:RSAFS", "Advance Retail Sales: Retail & Food Services (FRED: RSAFS)"),
             ("FRED:RETAILSMSA", "Retailers Sales (FRED: RETAILSMSA)"),
@@ -1958,6 +1965,22 @@ def build_indicator_series(sector_name_exact: str, ticker: str) -> Tuple[pd.Data
                         out = m[["date", "value"]].copy()
                         series["DJTA / S&P 500 Ratio (indexed)"] = out
 
+    if sector_name_exact == "Consumer Staples":
+        # P/E history (proxy): daily price / trailing EPS (constant from Yahoo info)
+        try:
+            info_local = fetch_info_one(normalize_yf_ticker(ticker)) or {}
+            trailing_eps = _to_num(info_local.get("trailingEps"))
+            if np.isfinite(trailing_eps) and trailing_eps != 0:
+                px_t = _yf_series(normalize_yf_ticker(ticker), period="5y")
+                if px_t is not None and not px_t.empty:
+                    pe = px_t.copy()
+                    pe["value"] = pd.to_numeric(pe["value"], errors="coerce") / trailing_eps
+                    pe = pe.dropna(subset=["date", "value"]).sort_values("date")
+                    if not pe.empty:
+                        series["P/E History (proxy: Price / Trailing EPS)"] = pe
+        except Exception:
+            pass
+    
     if sector_name_exact == "Auto-Tires-Trucks":
         # Days supply ≈ (months of supply) * 30.4
         mos = series.get("Auto Inventory/Sales Ratio (Months of Supply)")
@@ -2347,6 +2370,14 @@ with tab_stock:
         """
         s = (sector or "").strip()
 
+        if s == "Consumer Staples":
+            return [
+                ("Gross Margin", "Gross Margin", "pct"),
+                ("Trailing P/E", "Trailing P/E", "x"),
+                ("Dividend Yield", "Dividend Yield", "pct"),
+                ("EV/EBITDA", "EV/EBITDA", "x"),
+            ]
+        
         if s == "Retail-Wholesale":
             return [
                 ("Gross Margin", "Gross Margin", "pct"),
@@ -2473,6 +2504,51 @@ with tab_stock:
         for i, (label, indicator, kind) in enumerate(kpis):
             with cols[i % ncols]:
                 st.metric(label, _fmt_value(indicator, kind))
+
+        if sector_exact == "Consumer Staples":
+            st.markdown("#### Consumer Staples Catalysts (Volumes / Input Costs / GLP-1)")
+
+            cs_window = st.selectbox(
+                "Consumer Staples headlines window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="cs_headlines_window"
+            )
+            days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
+            cs_days = days_map.get(cs_window, 7)
+
+            queries = {
+                "Category volumes / share (Nielsen / IRI / Circana)":
+                    '("Nielsen" OR "IRI" OR "Circana" OR "scanner data" OR "category data" OR "category volumes") '
+                    'AND (snacks OR beverage OR beverages OR soda OR soft drinks OR cereal OR "packaged food" OR "consumer staples")',
+
+                "Company: volumes / price-mix / elasticity":
+                    f'({ticker_sel} OR "{co_name}") AND '
+                    '("volume" OR "volumes" OR "unit sales" OR "price/mix" OR "price mix" OR elasticity OR "trade down" OR "downtrading")',
+
+                "Input costs pass-through (wheat/corn/sugar/coffee)":
+                    f'({ticker_sel} OR "{co_name}") AND '
+                    '(wheat OR corn OR sugar OR coffee OR "input costs" OR "commodity inflation" OR "cost inflation" OR "pricing actions")',
+
+                "Promotions / private label pressure":
+                    f'({ticker_sel} OR "{co_name}") AND '
+                    '(promotion OR promotions OR discounting OR "private label" OR "store brand" OR "price competition")',
+
+                "GLP-1 / anti-obesity drugs (demand shift risk/opportunity)":
+                    '(GLP-1 OR Ozempic OR Wegovy OR Mounjaro OR Zepbound OR "weight loss drug" OR "anti-obesity") '
+                    'AND (snacks OR beverage OR beverages OR soda OR "grocery" OR "food demand" OR "consumer staples")',
+            }
+
+            for title, q in queries.items():
+                st.markdown(f"**{title}**")
+                df_news = fetch_google_news_rss_query(q, days=cs_days)
+                if df_news is None or df_news.empty:
+                    st.caption("No recent RSS headlines found.")
+                    continue
+                for _, n in df_news.head(10).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    ttl = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{ttl}]({link})  \n  _{src}_")
         
         if sector_exact == "Retail-Wholesale":
             st.markdown("#### Retail / Wholesale Catalysts")
