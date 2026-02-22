@@ -1798,7 +1798,11 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
             ("^GSPC", "S&P 500 (Yahoo: ^GSPC)"),
             ("BDRY", "Dry Bulk Proxy ETF (BDRY, proxy for Baltic Dry direction)"),
         ],
-        "Aerospace": [("ITA", "Aerospace & Defense ETF")],
+        "Aerospace": [
+            ("FRED:RPMD11", "US Airlines: Revenue Passenger Miles (FRED: RPMD11)"),
+            ("FRED:G160461A027NBEA", "Federal: National Defense Current Expenditures (FRED: G160461A027NBEA)"),
+            ("FRED:A191RL1Q225SBEA", "Real Federal National Defense Consumption+GI (FRED: A191RL1Q225SBEA)"),
+        ],
         "Construction": [
             ("FRED:HOUST", "Housing Starts (FRED: HOUST)"),
             ("FRED:PERMIT", "Building Permits (FRED: PERMIT)"),
@@ -2435,6 +2439,14 @@ with tab_stock:
         """
         s = (sector or "").strip()
 
+        if s == "Aerospace":
+            return [
+                ("Book-to-Bill", "Book-to-Bill", "x"),
+                ("Order Backlog", "Order Backlog (latest)", "usd"),
+                ("Operating Margin", "Operating Margin", "pct"),
+                ("Net Debt / EBITDA", "Net Debt / EBITDA", "x"),
+            ]
+        
         if s == "Consumer Discretionary":
             return [
                 ("Revenue YoY", "Revenue YoY", "pct"),
@@ -2586,6 +2598,60 @@ with tab_stock:
             with cols[i % ncols]:
                 st.metric(label, _fmt_value(indicator, kind))
 
+        if sector_exact == "Aerospace":
+            st.markdown("#### Aerospace: Backlog / Book-to-Bill / Orders / Budgets / Air Traffic / Production Rates")
+
+            aero_window = st.selectbox(
+                "Aerospace headlines window", ["1w", "2w", "1m", "2m", "3m"],
+                index=0, key="aero_headlines_window"
+            )
+            days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
+            aero_days = days_map.get(aero_window, 7)
+
+            queries = {
+                "Backlog (company filings / quarterly reports)": (
+                    f'({ticker_sel} OR "{co_name}") AND (backlog OR "order backlog" OR "funded backlog" OR "unfunded backlog")'
+                ),
+                "Book-to-bill / bookings / order intake": (
+                    f'({ticker_sel} OR "{co_name}") AND ("book-to-bill" OR "book to bill" OR bookings OR "order intake")'
+                ),
+                "Major air shows (Paris / Farnborough / Dubai) — order totals": (
+                    '("Paris Air Show" OR "Farnborough Airshow" OR "Dubai Airshow") AND (orders OR "order tally" OR "order total" OR commitments)'
+                ),
+                "Big contract wins (DoD / primes / missile defense / space)": (
+                    f'({ticker_sel} OR "{co_name}") AND ("contract award" OR "contract win" OR "IDIQ" OR "option exercised" OR "task order")'
+                ),
+                "US defense budget announcements / NDAA / appropriations": (
+                    '("defense budget" OR NDAA OR "National Defense Authorization Act" OR appropriations) AND (DoD OR Pentagon)'
+                ),
+                "Allied budgets (NATO / EU) announcements": (
+                    '(NATO OR "defense spending" OR "military budget") AND (Germany OR UK OR France OR Poland OR "European Union" OR allies)'
+                ),
+                "Global air traffic (IATA) + airline order headlines": (
+                    '(IATA OR "air traffic" OR "passenger demand" OR RPK OR load factor OR "airline orders" OR "aircraft orders")'
+                ),
+                "TSA checkpoint numbers / US travel demand (headline proxy)": (
+                    '("TSA" OR "checkpoint" OR "passenger volumes" OR "passenger throughput") AND (daily OR week OR record)'
+                ),
+                "Production rate plans / supply chain commentary (FlightGlobal / Aviation Week)": (
+                    '("Aviation Week" OR FlightGlobal OR "production rate" OR "rate increase" OR "line rate" OR "supply chain" OR "engine availability")'
+                ),
+            }
+
+            for title, q in queries.items():
+                st.markdown(f"**{title}**")
+                df_news = fetch_google_news_rss_query(q, days=aero_days)
+                if df_news is None or df_news.empty:
+                    st.caption("No recent RSS headlines found.")
+                    continue
+                for _, n in df_news.head(12).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    ttl = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{ttl}]({link})  \n  _{src}_")
+        
         if sector_exact == "Consumer Discretionary":
             st.markdown("#### Macro / Credit / Policy Catalysts")
         
