@@ -2586,69 +2586,69 @@ with tab_stock:
             with cols[i % ncols]:
                 st.metric(label, _fmt_value(indicator, kind))
 
-    if sector_exact == "Consumer Discretionary":
-        st.markdown("#### Macro / Credit / Policy Catalysts")
+        if sector_exact == "Consumer Discretionary":
+            st.markdown("#### Macro / Credit / Policy Catalysts")
+        
+            cd_window = st.selectbox(
+                "Consumer Discretionary headlines window", ["1w", "2w", "1m", "2m", "3m"],
+                index=0, key="cd_headlines_window"
+            )
+            days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
+            cd_days = days_map.get(cd_window, 7)
+        
+            # Heuristic “key metric” query based on industry text (best-effort)
+            ind_l = (industry or "").lower()
+            if any(k in ind_l for k in ["retail", "apparel", "department", "specialty"]):
+                key_metric_q = f'({ticker_sel} OR "{co_name}") AND ("same-store sales" OR "comparable sales" OR comps OR traffic OR "transactions")'
+                key_metric_title = "Key metric (industry): Same-store sales / traffic"
+            elif any(k in ind_l for k in ["auto", "automobile", "vehicle", "dealership"]):
+                key_metric_q = f'({ticker_sel} OR "{co_name}") AND (deliveries OR "unit sales" OR incentives OR "days supply" OR "transaction price")'
+                key_metric_title = "Key metric (industry): Units / deliveries / incentives"
+            elif any(k in ind_l for k in ["travel", "leisure", "hotel", "airline", "cruise"]):
+                key_metric_q = f'({ticker_sel} OR "{co_name}") AND (booking OR bookings OR demand OR occupancy OR RevPAR OR load\ factor)'
+                key_metric_title = "Key metric (industry): Bookings / occupancy / RevPAR"
+            else:
+                key_metric_q = f'({ticker_sel} OR "{co_name}") AND (demand OR "consumer spending" OR "discretionary spending" OR "big ticket")'
+                key_metric_title = "Key metric (industry): Demand / discretionary spend signals"
+        
+            queries = {
+                "Consumer confidence / sentiment (survey read-through)": (
+                    '(University of Michigan OR "consumer sentiment" OR "consumer confidence") '
+                    'AND ("big-ticket" OR "big ticket" OR "major purchase" OR "large purchase" OR durable OR "buying conditions")'
+                ),
+                "Labor market (jobs / unemployment / wage prints + revisions)": (
+                    '(nonfarm payrolls OR NFP OR unemployment OR jobless OR "wage growth" OR "average hourly earnings") '
+                    'AND (BLS OR "Bureau of Labor Statistics")'
+                ),
+                "Rates / consumer credit (auto loans, long-end yields)": (
+                    '("10-year yield" OR "10 year yield" OR Treasury) AND (auto loan OR "consumer credit" OR "loan rates")'
+                ),
+                "Senior Loan Officer Opinion Survey (credit tightening/loosening)": (
+                    '(SLOOS OR "Senior Loan Officer" OR "lending standards") AND (consumer OR credit\ card OR auto)'
+                ),
+                "FOMC calendar / Fed policy headlines": (
+                    '(FOMC OR "Fed meeting" OR "Federal Reserve") AND (calendar OR decision OR minutes OR dot\ plot OR "rate cut" OR "rate hike")'
+                ),
+                key_metric_title: key_metric_q,
+                "Trade agreements / tariffs (policy risk to discretionary demand & imports)": (
+                    '(tariff OR tariffs OR "trade agreement" OR "trade deal" OR "Section 301" OR "import duties") '
+                    'AND (retail OR apparel OR consumer OR "consumer goods" OR automobiles)'
+                ),
+            }
     
-        cd_window = st.selectbox(
-            "Consumer Discretionary headlines window", ["1w", "2w", "1m", "2m", "3m"],
-            index=0, key="cd_headlines_window"
-        )
-        days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
-        cd_days = days_map.get(cd_window, 7)
-    
-        # Heuristic “key metric” query based on industry text (best-effort)
-        ind_l = (industry or "").lower()
-        if any(k in ind_l for k in ["retail", "apparel", "department", "specialty"]):
-            key_metric_q = f'({ticker_sel} OR "{co_name}") AND ("same-store sales" OR "comparable sales" OR comps OR traffic OR "transactions")'
-            key_metric_title = "Key metric (industry): Same-store sales / traffic"
-        elif any(k in ind_l for k in ["auto", "automobile", "vehicle", "dealership"]):
-            key_metric_q = f'({ticker_sel} OR "{co_name}") AND (deliveries OR "unit sales" OR incentives OR "days supply" OR "transaction price")'
-            key_metric_title = "Key metric (industry): Units / deliveries / incentives"
-        elif any(k in ind_l for k in ["travel", "leisure", "hotel", "airline", "cruise"]):
-            key_metric_q = f'({ticker_sel} OR "{co_name}") AND (booking OR bookings OR demand OR occupancy OR RevPAR OR load\ factor)'
-            key_metric_title = "Key metric (industry): Bookings / occupancy / RevPAR"
-        else:
-            key_metric_q = f'({ticker_sel} OR "{co_name}") AND (demand OR "consumer spending" OR "discretionary spending" OR "big ticket")'
-            key_metric_title = "Key metric (industry): Demand / discretionary spend signals"
-    
-        queries = {
-            "Consumer confidence / sentiment (survey read-through)": (
-                '(University of Michigan OR "consumer sentiment" OR "consumer confidence") '
-                'AND ("big-ticket" OR "big ticket" OR "major purchase" OR "large purchase" OR durable OR "buying conditions")'
-            ),
-            "Labor market (jobs / unemployment / wage prints + revisions)": (
-                '(nonfarm payrolls OR NFP OR unemployment OR jobless OR "wage growth" OR "average hourly earnings") '
-                'AND (BLS OR "Bureau of Labor Statistics")'
-            ),
-            "Rates / consumer credit (auto loans, long-end yields)": (
-                '("10-year yield" OR "10 year yield" OR Treasury) AND (auto loan OR "consumer credit" OR "loan rates")'
-            ),
-            "Senior Loan Officer Opinion Survey (credit tightening/loosening)": (
-                '(SLOOS OR "Senior Loan Officer" OR "lending standards") AND (consumer OR credit\ card OR auto)'
-            ),
-            "FOMC calendar / Fed policy headlines": (
-                '(FOMC OR "Fed meeting" OR "Federal Reserve") AND (calendar OR decision OR minutes OR dot\ plot OR "rate cut" OR "rate hike")'
-            ),
-            key_metric_title: key_metric_q,
-            "Trade agreements / tariffs (policy risk to discretionary demand & imports)": (
-                '(tariff OR tariffs OR "trade agreement" OR "trade deal" OR "Section 301" OR "import duties") '
-                'AND (retail OR apparel OR consumer OR "consumer goods" OR automobiles)'
-            ),
-        }
-
-    for title, q in queries.items():
-        st.markdown(f"**{title}**")
-        df_news = fetch_google_news_rss_query(q, days=cd_days)
-        if df_news is None or df_news.empty:
-            st.caption("No recent RSS headlines found.")
-            continue
-        for _, n in df_news.head(12).iterrows():
-            t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
-            t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
-            ttl = str(n.get("title", ""))
-            link = str(n.get("link", ""))
-            src = str(n.get("source", ""))
-            st.markdown(f"- **{t_str}** [{ttl}]({link})  \n  _{src}_")
+        for title, q in queries.items():
+            st.markdown(f"**{title}**")
+            df_news = fetch_google_news_rss_query(q, days=cd_days)
+            if df_news is None or df_news.empty:
+                st.caption("No recent RSS headlines found.")
+                continue
+            for _, n in df_news.head(12).iterrows():
+                t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                ttl = str(n.get("title", ""))
+                link = str(n.get("link", ""))
+                src = str(n.get("source", ""))
+                st.markdown(f"- **{t_str}** [{ttl}]({link})  \n  _{src}_")
         
         if sector_exact == "Construction":
             st.markdown("#### Backlog / ABI / Spending / Contract Awards")
