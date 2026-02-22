@@ -1585,6 +1585,9 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
     dy = _to_num(info.get("dividendYield"))
     add_scalar("Dividend Yield", dy * 100.0 if np.isfinite(dy) else np.nan, unit="%", update="Daily")
 
+    pr = _to_num(info.get("payoutRatio"))
+    add_scalar("Payout Ratio", pr * 100.0 if np.isfinite(pr) else np.nan, unit="%", update="Daily")
+    
     pb = _to_num(info.get("priceToBook"))
     add_scalar("Price/Book", pb if np.isfinite(pb) else np.nan, unit="x", update="Daily")
 
@@ -1719,6 +1722,11 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
     }
 
     driver_series_map = {
+        "Utilities": [
+            ("FRED:DGS10", "10Y Treasury Yield (FRED: DGS10)"),
+            ("FRED:CPIAUCSL", "CPI (FRED: CPIAUCSL)"),
+            ("FRED:IPUTIL", "Industrial Production: Electric & Gas Utilities (FRED: IPUTIL)"),
+        ],
         "Consumer Discretionary": [
             ("FRED:UMCSENT", "UMich Consumer Sentiment (FRED: UMCSENT)"),
             ("FRED:CONCCONF", "Conference Board Consumer Confidence (FRED: CONCCONF)"),
@@ -2439,6 +2447,14 @@ with tab_stock:
         """
         s = (sector or "").strip()
 
+        if s == "Utilities":
+            return [
+                ("Dividend Yield", "Dividend Yield", "pct"),
+                ("Payout Ratio", "Payout Ratio", "pct"),
+                ("Net Debt/EBITDA", "Net Debt / EBITDA", "x"),
+                ("EV/EBITDA", "EV/EBITDA", "x"),
+            ]
+        
         if s == "Aerospace":
             return [
                 ("Book-to-Bill", "Book-to-Bill", "x"),
@@ -2598,6 +2614,61 @@ with tab_stock:
             with cols[i % ncols]:
                 st.metric(label, _fmt_value(indicator, kind))
 
+        if sector_exact == "Utilities":
+            st.markdown("#### Utilities: Rates / Regulation / Demand / Weather / Capex")
+
+            util_window = st.selectbox(
+                "Utilities headlines window", ["1w", "2w", "1m", "2m", "3m"],
+                index=0, key="util_headlines_window"
+            )
+            days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
+            util_days = days_map.get(util_window, 7)
+
+            queries = {
+                "10Y yield / CPI prints (rate sensitivity + inflation pass-through)": (
+                    '("10-year Treasury" OR "10 year Treasury" OR DGS10 OR yield) '
+                    'AND (CPI OR inflation OR "consumer price index")'
+                ),
+                "State PUC calendars / hearings / procedural schedule": (
+                    '("public utility commission" OR PUC OR "utility commission") '
+                    'AND (calendar OR agenda OR hearing OR docket OR "procedural schedule")'
+                ),
+                "Constructive rate case outcome / settlement / allowed ROE": (
+                    '("rate case" OR "base rate" OR "general rate case" OR settlement OR "allowed ROE" OR "return on equity") '
+                    'AND (approved OR approval OR order OR decision OR "final order")'
+                ),
+                "Monthly electricity generation / demand / load commentary": (
+                    '(electricity generation OR power demand OR "electricity consumption" OR "system load" OR "peak load") '
+                    'AND (monthly OR report OR data)'
+                ),
+                "Short-term weather fluctuations (load drivers)": (
+                    '(cold snap OR heat wave OR "degree days" OR storm OR hurricane OR "extreme weather") '
+                    'AND (electricity demand OR power demand OR grid OR "system load")'
+                ),
+                "Investor presentations: capex + rate base growth": (
+                    f'({ticker_sel} OR "{co_name}") AND '
+                    '("investor presentation" OR "rate base" OR "capital expenditure" OR capex OR "multi-year plan")'
+                ),
+                "Scale of capex plans (project pipeline / grid spend)": (
+                    f'({ticker_sel} OR "{co_name}") AND '
+                    '(capex OR "capital plan" OR "grid modernization" OR transmission OR distribution OR "generation investments")'
+                ),
+            }
+
+            for title, q in queries.items():
+                st.markdown(f"**{title}**")
+                df_news = fetch_google_news_rss_query(q, days=util_days)
+                if df_news is None or df_news.empty:
+                    st.caption("No recent RSS headlines found.")
+                    continue
+                for _, n in df_news.head(12).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    ttl = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{ttl}]({link})  \n  _{src}_")
+        
         if sector_exact == "Aerospace":
             st.markdown("#### Backlog / Book-to-Bill / Orders / Budgets / Air Traffic / Production Rates Catalysts")
 
