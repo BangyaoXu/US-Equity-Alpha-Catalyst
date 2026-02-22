@@ -2599,7 +2599,7 @@ with tab_stock:
                 st.metric(label, _fmt_value(indicator, kind))
 
         if sector_exact == "Aerospace":
-            st.markdown("#### Aerospace: Backlog / Book-to-Bill / Orders / Budgets / Air Traffic / Production Rates")
+            st.markdown("#### Backlog / Book-to-Bill / Orders / Budgets / Air Traffic / Production Rates Catalysts")
 
             aero_window = st.selectbox(
                 "Aerospace headlines window", ["1w", "2w", "1m", "2m", "3m"],
