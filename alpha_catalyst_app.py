@@ -1788,7 +1788,19 @@ def fetch_indicator_bundle(ticker: str) -> Dict[str, object]:
             ("BDRY", "Dry Bulk Proxy ETF (BDRY, proxy for Baltic Dry direction)"),
         ],
         "Aerospace": [("ITA", "Aerospace & Defense ETF")],
-        "Construction": [("ITB", "Homebuilders ETF")],
+        "Construction": [
+            ("ITB", "Homebuilders ETF (ITB, Yahoo)"),
+            ("FRED:HOUST", "Housing Starts (FRED: HOUST)"),
+            ("FRED:PERMIT", "Building Permits (FRED: PERMIT)"),
+            ("FRED:TTLCONS", "Construction Spending: Total (FRED: TTLCONS)"),
+            ("FRED:WPUFD4", "PPI: Final Demand Construction (FRED: WPUFD4)"),
+            ("FRED:WPU1017", "PPI: Steel Mill Products (FRED: WPU1017)"),
+            ("LBS=F", "Lumber Futures (Yahoo: LBS=F)"),
+            ("FRED:WDFUELUSGULF", "ULSD Diesel Spot (US Gulf Coast, FRED: WDFUELUSGULF)"),
+            ("FRED:CES2000000001", "All Employees: Construction (FRED: CES2000000001)"),
+            ("FRED:JTS2300JOL", "JOLTS: Job Openings — Construction (FRED: JTS2300JOL)"),
+            ("FRED:JTS2300HIL", "JOLTS: Hires — Construction (FRED: JTS2300HIL)"),
+        ],
         "Finance": [
             ("FRED:T10Y2Y", "10Y–2Y Treasury Spread"),
             ("FRED:TOTLL", "Bank Loans & Leases (H.8)"),
@@ -2413,6 +2425,14 @@ with tab_stock:
         """
         s = (sector or "").strip()
 
+        if s == "Construction":
+            return [
+                ("Book-to-Bill", "Book-to-Bill", "x"),
+                ("Order Backlog", "Order Backlog (latest)", "usd"),
+                ("Operating Margin", "Operating Margin", "pct"),
+                ("EV/EBITDA", "EV/EBITDA", "x"),
+            ]
+        
         if s == "Consumer Staples":
             return [
                 ("Gross Margin", "Gross Margin", "pct"),
@@ -2548,6 +2568,60 @@ with tab_stock:
             with cols[i % ncols]:
                 st.metric(label, _fmt_value(indicator, kind))
 
+        if sector_exact == "Construction":
+            st.markdown("#### Backlog / ABI / Spending / Contract Awards")
+
+            cons_window = st.selectbox(
+                "Construction headlines window", ["1w", "2w", "1m", "2m", "3m"], index=0, key="cons_headlines_window"
+            )
+            days_map = {"1w": 7, "2w": 14, "1m": 30, "2m": 60, "3m": 90}
+            cons_days = days_map.get(cons_window, 7)
+
+            queries = {
+                "ABC Construction Backlog Indicator (CBI) / industry survey": (
+                    '("Associated Builders and Contractors" OR ABC) AND '
+                    '("Construction Backlog Indicator" OR CBI OR backlog) '
+                    'AND (monthly OR survey OR report)'
+                ),
+                "ABI (Architectural Billings Index) — AIA": (
+                    '("Architectural Billings Index" OR ABI) AND '
+                    '("American Institute of Architects" OR AIA)'
+                ),
+                "Construction spending / demand commentary": (
+                    '(construction spending OR "nonresidential construction" OR "residential construction" '
+                    'OR "infrastructure spending")'
+                ),
+                "Major contract awards (DOT / DoD / government)": (
+                    '("contract award" OR "awarded contract" OR "design-build" OR "IDIQ") AND '
+                    '(DOT OR "Department of Transportation" OR DoD OR "Department of Defense" OR '
+                    '"Army Corps of Engineers" OR FHWA OR FAA OR "General Services Administration" OR GSA)'
+                ),
+                "Single big contract win (company-specific)": (
+                    f'({ticker_sel} OR "{co_name}") AND '
+                    '("contract award" OR "awarded" OR "selected" OR "wins" OR "winning bidder" OR '
+                    '"lowest responsible bidder" OR "notice to proceed" OR NTP OR "project award")'
+                ),
+                "Input costs / ENR cost reports (headline proxy)": (
+                    '("Engineering News-Record" OR ENR) AND '
+                    '("construction cost" OR "cost index" OR "materials prices" OR "labor costs")'
+                ),
+            }
+
+            for title, q in queries.items():
+                st.markdown(f"**{title}**")
+                df_news = fetch_google_news_rss_query(q, days=cons_days)
+                if df_news is None or df_news.empty:
+                    st.caption("No recent RSS headlines found.")
+                    continue
+
+                for _, n in df_news.head(12).iterrows():
+                    t = pd.to_datetime(n.get("time"), utc=True, errors="coerce")
+                    t_str = t.strftime("%Y-%m-%d") if pd.notna(t) else ""
+                    ttl = str(n.get("title", ""))
+                    link = str(n.get("link", ""))
+                    src = str(n.get("source", ""))
+                    st.markdown(f"- **{t_str}** [{ttl}]({link})  \n  _{src}_")
+        
         if sector_exact == "Consumer Staples":
             st.markdown("#### Valuation: P/E History")
     
