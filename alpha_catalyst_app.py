@@ -2615,7 +2615,7 @@ with tab_stock:
                 st.metric(label, _fmt_value(indicator, kind))
 
         if sector_exact == "Utilities":
-            st.markdown("#### Rates / Regulation / Demand / Weather / Capex News")
+            st.markdown("#### Regulation / Demand / Weather / Capex News")
 
             util_window = st.selectbox(
                 "Utilities headlines window", ["1w", "2w", "1m", "2m", "3m"],
